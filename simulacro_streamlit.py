@@ -1,592 +1,577 @@
+# ============================================================
+#  simulacro_streamlit.py  —  Face & Eye Tracking 3D + Heatmap
+#  Compatível com mediapipe >= 0.10.30 (Tasks API) + Python 3.13
+#  Deps: streamlit, streamlit-webrtc, mediapipe, opencv-python-headless,
+#        plotly, matplotlib, reportlab, scipy, av
+# ============================================================
+
+import os, io, time, threading, urllib.request
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import cv2
 import streamlit as st
-import streamlit.components.v1 as components
+import av
 
-st.set_page_config(page_title="Simulacro — Cubo 3D com Eye Tracking Real", page_icon="👁️", layout="wide")
+import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision
+from mediapipe.tasks.python.vision import (
+    FaceLandmarker, FaceLandmarkerOptions, RunningMode
+)
 
-with st.sidebar:
-    st.header("Controles")
-    cube_size = st.slider("Tamanho do cubo", 140, 420, 260)
-    points_per_axis = st.slider("Pontos por eixo", 6, 18, 10)
-    depth_layers = st.slider("Camadas de profundidade", 6, 18, 10)
-    optical_strength = st.slider("Força da ilusão óptica", 0.0, 1.2, 0.45, 0.01)
-    follow_strength = st.slider("Força de seguimento do olhar", 0.0, 1.5, 0.85, 0.01)
-    quat_strength = st.slider("Força da rotação quaternion", 0.0, 2.0, 0.75, 0.01)
-    point_size = st.slider("Tamanho dos microspontos", 1, 8, 3)
-    heat_decay = st.slider("Decaimento do calor", 0.900, 0.999, 0.985, 0.001)
-    tracking_smoothing = st.slider("Suavização do tracking", 0.01, 0.50, 0.14, 0.01)
-    st.markdown("---")
-    st.markdown("**Como usar**")
-    st.markdown("1. Clique em **Iniciar tracking**")
-    st.markdown("2. Permita a câmera")
-    st.markdown("3. Faça a calibração olhando para os 5 pontos")
-    st.markdown("4. Observe o cubo reagindo ao olhar")
-    st.markdown("5. Gere o PDF no botão interno da cena")
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoProcessorBase
 
-html = f"""
-<!DOCTYPE html>
-<html lang=\"pt-br\">
-<head>
-<meta charset=\"UTF-8\" />
-<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />
-<title>Simulacro</title>
+import plotly.graph_objects as go
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from scipy.ndimage import gaussian_filter
+
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import cm
+from reportlab.lib import colors
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Image as RLImage, Spacer, Table, TableStyle
+)
+from reportlab.lib.styles import getSampleStyleSheet
+
+# ───────────────────────── Configurações ─────────────────────
+MODEL_URL  = (
+    "https://storage.googleapis.com/mediapipe-models/"
+    "face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+)
+MODEL_PATH = "face_landmarker.task"
+
+W, H            = 640, 480
+HEATMAP_SIGMA   = 25   # suavização gaussiana (pixels)
+REFRESH_INTERVAL = 1.0  # segundos entre reruns automáticos
+
+# Índices de pontos-chave do Face Mesh (478 pts)
+FACE_OVAL = [
+    10,338,297,332,284,251,389,356,454,323,361,288,
+    397,365,379,378,400,377,152,148,176,149,150,136,
+    172,58,132,93,234,127,162,21,54,103,67,109
+]
+RIGHT_EYE = [33,7,163,144,145,153,154,155,133,173,157,158,159,160,161,246]
+LEFT_EYE  = [362,382,381,380,374,373,390,249,263,466,388,387,386,385,384,398]
+# Índice 468 = iris direito centro, 473 = iris esquerdo centro
+RIGHT_IRIS, LEFT_IRIS = 468, 473
+
+# ───────────────────── Carrega modelo (cache) ─────────────────
+@st.cache_resource(show_spinner="Baixando modelo MediaPipe…")
+def load_landmarker():
+    if not os.path.exists(MODEL_PATH):
+        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+    opts = FaceLandmarkerOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=MODEL_PATH),
+        running_mode=RunningMode.IMAGE,
+        num_faces=1,
+        min_face_detection_confidence=0.5,
+        min_face_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+        output_face_blendshapes=False,
+        output_facial_transformation_matrixes=False,
+    )
+    return FaceLandmarker.create_from_options(opts)
+
+# ──────────────────── Processador de vídeo ───────────────────
+class FaceTrackingProcessor(VideoProcessorBase):
+
+    def __init__(self):
+        self._lm  = load_landmarker()
+        self.lock = threading.Lock()
+        # dados acumulados
+        self.gaze_points: list[tuple[float, float]] = []
+        self.latest_landmarks: list[tuple[float,float,float]] | None = None
+        self.face_detected  = False
+        self.frame_count    = 0
+        self.active         = False   # controlado pela UI
+
+    # ── processa cada frame ───────────────────────────────────
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        img = frame.to_ndarray(format="bgr24")
+        h, w = img.shape[:2]
+        rgb  = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+        result = self._lm.detect(mp_img)
+
+        if not result.face_landmarks:
+            cv2.putText(img, "ROSTO NAO DETECTADO", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
+            with self.lock:
+                self.face_detected = False
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+        raw = result.face_landmarks[0]
+        n   = len(raw)
+        lms = [(lm.x, lm.y, lm.z) for lm in raw]
+
+        # ── desenha micropontos ──────────────────────────────
+        for lm in raw:
+            px, py = int(lm.x * w), int(lm.y * h)
+            cv2.circle(img, (px, py), 1, (0, 255, 100), -1)
+
+        # ── contorno do rosto ───────────────────────────────
+        oval_pts = np.array(
+            [(int(raw[i].x * w), int(raw[i].y * h))
+             for i in FACE_OVAL if i < n], dtype=np.int32
+        )
+        if len(oval_pts) > 2:
+            cv2.polylines(img, [oval_pts], True, (0, 220, 255), 1)
+
+        # ── olhos ───────────────────────────────────────────
+        for idx_list, col in [(RIGHT_EYE, (255,120,0)), (LEFT_EYE, (255,120,0))]:
+            eye_pts = np.array(
+                [(int(raw[i].x * w), int(raw[i].y * h))
+                 for i in idx_list if i < n], dtype=np.int32
+            )
+            if len(eye_pts) > 2:
+                cv2.polylines(img, [eye_pts], True, col, 1)
+
+        # ── iris / gaze ─────────────────────────────────────
+        gaze = None
+        if n >= 478:
+            ri = raw[RIGHT_IRIS]
+            li = raw[LEFT_IRIS]
+            gaze = ((ri.x + li.x) / 2, (ri.y + li.y) / 2)
+
+            # desenha iris
+            for iris in (ri, li):
+                cv2.circle(img,
+                           (int(iris.x * w), int(iris.y * h)),
+                           8, (50, 50, 255), 2)
+
+            # mira do olhar
+            gx, gy = int(gaze[0] * w), int(gaze[1] * h)
+            cv2.drawMarker(img, (gx, gy), (0, 0, 255),
+                           cv2.MARKER_CROSS, 24, 2)
+            cv2.circle(img, (gx, gy), 12, (255, 255, 0), 1)
+        elif n > 0:
+            # fallback: ponto do nariz
+            nose = raw[1]
+            gaze = (nose.x, nose.y)
+
+        # ── HUD ─────────────────────────────────────────────
+        status = "TRACKING ATIVO" if self.active else "PAUSADO"
+        col_hud = (0, 255, 100) if self.active else (0, 150, 255)
+        cv2.putText(img, status, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, col_hud, 2)
+        cv2.putText(img, f"Pts: {len(self.gaze_points)}", (10, 58),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+        # ── acumula dados ────────────────────────────────────
+        with self.lock:
+            self.face_detected = True
+            self.latest_landmarks = lms
+            self.frame_count += 1
+            if self.active and gaze:
+                self.gaze_points.append(gaze)
+
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+
+# ──────────────────────── Heatmap ────────────────────────────
+def make_heatmap_array(gaze_points: list, w=W, h=H, sigma=HEATMAP_SIGMA):
+    grid = np.zeros((h, w), dtype=np.float32)
+    for (nx, ny) in gaze_points:
+        px = int(np.clip(nx * w, 0, w - 1))
+        py = int(np.clip(ny * h, 0, h - 1))
+        grid[py, px] += 1.0
+    grid = gaussian_filter(grid, sigma=sigma)
+    return grid
+
+
+def plot_heatmap(gaze_points: list, title="Mapa de Calor do Olhar") -> plt.Figure:
+    fig, ax = plt.subplots(figsize=(7, 5.5), facecolor="#0e0e1a")
+    ax.set_facecolor("#0e0e1a")
+
+    if gaze_points:
+        grid = make_heatmap_array(gaze_points)
+        vmax = grid.max() or 1
+        ax.imshow(
+            grid, cmap="inferno", origin="upper",
+            extent=[0, 1, 1, 0], aspect="auto",
+            vmin=0, vmax=vmax, alpha=0.92
+        )
+        # pontos brutos
+        xs = [p[0] for p in gaze_points[-200:]]  # últimos 200
+        ys = [p[1] for p in gaze_points[-200:]]
+        ax.scatter(xs, ys, s=3, c="white", alpha=0.25, linewidths=0)
+
+        # centróide
+        cx, cy = np.mean(xs), np.mean(ys)
+        ax.plot(cx, cy, "o", ms=12, mec="cyan", mfc="none", mew=2, label="Centróide")
+        ax.legend(facecolor="#1a1a2e", labelcolor="white", fontsize=9)
+
+    ax.set_xlim(0, 1); ax.set_ylim(1, 0)
+    ax.set_xlabel("X normalizado", color="white", fontsize=10)
+    ax.set_ylabel("Y normalizado", color="white", fontsize=10)
+    ax.set_title(title, color="white", fontsize=13, pad=10)
+    ax.tick_params(colors="white")
+    for sp in ax.spines.values():
+        sp.set_edgecolor("#444")
+    plt.tight_layout()
+    return fig
+
+
+# ──────────────────── Mapa 3D de landmarks ───────────────────
+def plot_3d_landmarks(landmarks: list) -> go.Figure:
+    xs = [l[0] for l in landmarks]
+    ys = [-l[1] for l in landmarks]          # flip Y
+    zs = [-l[2] for l in landmarks]
+
+    zmin, zmax = min(zs), max(zs)
+    znorm = [(z - zmin) / (zmax - zmin + 1e-9) for z in zs]
+
+    # separa iris (se existirem)
+    n = len(landmarks)
+    traces = []
+
+    # micropontos principais
+    traces.append(go.Scatter3d(
+        x=xs[:468], y=zs[:468], z=ys[:468],
+        mode="markers",
+        marker=dict(size=2, color=znorm[:468],
+                    colorscale="Viridis", opacity=0.85,
+                    colorbar=dict(title="Prof.", thickness=10)),
+        name="Face mesh",
+        hovertemplate="x:%{x:.3f}  y:%{z:.3f}  z:%{y:.3f}<extra></extra>"
+    ))
+
+    # iris (vermelho)
+    if n >= 478:
+        ix = [xs[468], xs[473]]
+        iy = [ys[468], ys[473]]
+        iz = [zs[468], zs[473]]
+        traces.append(go.Scatter3d(
+            x=ix, y=iz, z=iy,
+            mode="markers+text",
+            marker=dict(size=7, color="red", symbol="circle"),
+            text=["Iris D", "Iris E"],
+            textfont=dict(color="red", size=10),
+            name="Iris",
+        ))
+
+    fig = go.Figure(data=traces)
+    fig.update_layout(
+        scene=dict(
+            xaxis=dict(title="X", showbackground=False, color="white"),
+            yaxis=dict(title="Profund.", showbackground=False, color="white"),
+            zaxis=dict(title="Y", showbackground=False, color="white"),
+            bgcolor="rgba(0,0,0,0)",
+            camera=dict(eye=dict(x=0, y=-1.8, z=0.5))
+        ),
+        paper_bgcolor="rgba(14,14,26,1)",
+        font_color="white",
+        title=dict(text="Mapa 3D de Landmarks Faciais", font=dict(size=14)),
+        legend=dict(bgcolor="rgba(30,30,50,0.8)"),
+        margin=dict(l=0, r=0, b=0, t=50),
+        height=500,
+    )
+    return fig
+
+
+# ────────────────────── Relatório PDF ────────────────────────
+def generate_pdf(gaze_points, session_start, frame_count) -> io.BytesIO:
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=2*cm, rightMargin=2*cm,
+        topMargin=2*cm, bottomMargin=2*cm
+    )
+    styles = getSampleStyleSheet()
+    story  = []
+
+    # ── cabeçalho ─────────────────────────────────────────
+    story.append(Paragraph("Relatório de Rastreamento Ocular", styles["Title"]))
+    story.append(Spacer(1, 0.4*cm))
+    story.append(Paragraph(
+        f"Gerado em: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}",
+        styles["Normal"]
+    ))
+    story.append(Spacer(1, 0.6*cm))
+
+    # ── informações da sessão ─────────────────────────────
+    story.append(Paragraph("Informações da Sessão", styles["Heading2"]))
+    story.append(Spacer(1, 0.2*cm))
+
+    dur = 0
+    if session_start:
+        dur = max(0, (datetime.now() - session_start).seconds)
+
+    session_data = [
+        ["Campo", "Valor"],
+        ["Início da sessão", session_start.strftime("%H:%M:%S") if session_start else "—"],
+        ["Duração (s)",        str(dur)],
+        ["Frames analisados",  str(frame_count)],
+        ["Pontos de olhar",    str(len(gaze_points))],
+        ["Taxa de captura",    f"{len(gaze_points)/max(dur,1):.1f} pts/s"],
+    ]
+    t = Table(session_data, colWidths=[7*cm, 10*cm])
+    t.setStyle(TableStyle([
+        ("BACKGROUND",  (0, 0), (-1, 0), colors.HexColor("#1a1a4e")),
+        ("TEXTCOLOR",   (0, 0), (-1, 0), colors.white),
+        ("FONTNAME",    (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTNAME",    (0, 1), (0, -1), "Helvetica-Bold"),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#f4f4f8")]),
+        ("GRID",        (0, 0), (-1, -1), 0.4, colors.HexColor("#aaaacc")),
+        ("TOPPADDING",  (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING",(0,0), (-1, -1), 5),
+    ]))
+    story.append(t)
+    story.append(Spacer(1, 0.8*cm))
+
+    # ── heatmap ───────────────────────────────────────────
+    story.append(Paragraph("Mapa de Calor do Olhar", styles["Heading2"]))
+    story.append(Spacer(1, 0.2*cm))
+
+    hm_fig = plot_heatmap(gaze_points, title="Mapa de Calor — Sessão Completa")
+    img_buf = io.BytesIO()
+    hm_fig.savefig(img_buf, format="png", dpi=120, bbox_inches="tight",
+                   facecolor="#0e0e1a")
+    plt.close(hm_fig)
+    img_buf.seek(0)
+    story.append(RLImage(img_buf, width=15*cm, height=11.5*cm))
+    story.append(Spacer(1, 0.8*cm))
+
+    # ── estatísticas ──────────────────────────────────────
+    if gaze_points:
+        story.append(Paragraph("Estatísticas Descritivas", styles["Heading2"]))
+        story.append(Spacer(1, 0.2*cm))
+        xs = [p[0] for p in gaze_points]
+        ys = [p[1] for p in gaze_points]
+
+        # Quadrantes (dividido em 4)
+        q1 = sum(1 for x,y in gaze_points if x<=0.5 and y<=0.5)
+        q2 = sum(1 for x,y in gaze_points if x> 0.5 and y<=0.5)
+        q3 = sum(1 for x,y in gaze_points if x<=0.5 and y> 0.5)
+        q4 = sum(1 for x,y in gaze_points if x> 0.5 and y> 0.5)
+        total = len(gaze_points)
+
+        stats_data = [
+            ["Métrica", "X", "Y"],
+            ["Média",          f"{np.mean(xs):.3f}",  f"{np.mean(ys):.3f}"],
+            ["Desvio padrão",  f"{np.std(xs):.3f}",   f"{np.std(ys):.3f}"],
+            ["Mínimo",         f"{np.min(xs):.3f}",   f"{np.min(ys):.3f}"],
+            ["Máximo",         f"{np.max(xs):.3f}",   f"{np.max(ys):.3f}"],
+            ["Mediana",        f"{np.median(xs):.3f}", f"{np.median(ys):.3f}"],
+        ]
+        ts = Table(stats_data, colWidths=[7*cm, 4.5*cm, 4.5*cm])
+        ts.setStyle(TableStyle([
+            ("BACKGROUND",  (0,0), (-1,0), colors.HexColor("#1a1a4e")),
+            ("TEXTCOLOR",   (0,0), (-1,0), colors.white),
+            ("FONTNAME",    (0,0), (-1,0), "Helvetica-Bold"),
+            ("FONTNAME",    (0,1), (0,-1), "Helvetica-Bold"),
+            ("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white, colors.HexColor("#f4f4f8")]),
+            ("GRID",        (0,0), (-1,-1), 0.4, colors.HexColor("#aaaacc")),
+            ("ALIGN",       (1,0), (-1,-1), "CENTER"),
+            ("TOPPADDING",  (0,0), (-1,-1), 5),
+            ("BOTTOMPADDING",(0,0),(-1,-1), 5),
+        ]))
+        story.append(ts)
+        story.append(Spacer(1, 0.5*cm))
+
+        # distribuição por quadrante
+        story.append(Paragraph("Distribuição por Quadrante", styles["Heading3"]))
+        story.append(Spacer(1, 0.2*cm))
+        quad_data = [
+            ["Quadrante",      "Superior Esq.", "Superior Dir.", "Inferior Esq.", "Inferior Dir."],
+            ["Pontos (n)",     str(q1), str(q2), str(q3), str(q4)],
+            ["Percentual (%)", f"{100*q1/total:.1f}", f"{100*q2/total:.1f}",
+                               f"{100*q3/total:.1f}", f"{100*q4/total:.1f}"],
+        ]
+        qt = Table(quad_data, colWidths=[4*cm, 3.5*cm, 3.5*cm, 3.5*cm, 3.5*cm])
+        qt.setStyle(TableStyle([
+            ("BACKGROUND",  (0,0), (-1,0), colors.HexColor("#1a1a4e")),
+            ("TEXTCOLOR",   (0,0), (-1,0), colors.white),
+            ("FONTNAME",    (0,0), (-1,0), "Helvetica-Bold"),
+            ("FONTNAME",    (0,1), (0,-1), "Helvetica-Bold"),
+            ("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white, colors.HexColor("#f4f4f8")]),
+            ("GRID",        (0,0), (-1,-1), 0.4, colors.HexColor("#aaaacc")),
+            ("ALIGN",       (1,0), (-1,-1), "CENTER"),
+            ("TOPPADDING",  (0,0), (-1,-1), 5),
+            ("BOTTOMPADDING",(0,0),(-1,-1), 5),
+        ]))
+        story.append(qt)
+
+    # ── rodapé ────────────────────────────────────────────
+    story.append(Spacer(1, 1*cm))
+    story.append(Paragraph(
+        "Este relatório foi gerado automaticamente pelo sistema de Eye Tracking 3D.",
+        styles["Italic"]
+    ))
+
+    doc.build(story)
+    buf.seek(0)
+    return buf
+
+
+# ═══════════════════════════ UI ══════════════════════════════
+st.set_page_config(
+    page_title="Eye Tracking 3D",
+    page_icon="👁️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+st.markdown("""
 <style>
-  * {{ box-sizing: border-box; }}
-  body {{
-    margin: 0; padding: 0; background: #070b14; color: #dfe9ff;
-    font-family: Inter, Segoe UI, Arial, sans-serif;
-  }}
-  #app {{ padding: 10px; }}
-  #topbar {{
-    display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px;
-    background: rgba(10,16,30,.9); border: 1px solid rgba(90,150,255,.25);
-    padding: 10px; border-radius: 14px;
-  }}
-  button {{
-    background: linear-gradient(135deg,#1d4ed8,#2563eb); color: white; border: 0;
-    border-radius: 10px; padding: 10px 14px; cursor: pointer; font-weight: 600;
-  }}
-  button.secondary {{ background: linear-gradient(135deg,#0f172a,#1e293b); border:1px solid #334155; }}
-  button.warn {{ background: linear-gradient(135deg,#7c2d12,#b45309); }}
-  #status {{ padding: 8px 12px; border-radius: 10px; background:#0f172a; border:1px solid #334155; }}
-  #layout {{ display:grid; grid-template-columns: 1.45fr .9fr; gap: 12px; }}
-  #sceneWrap {{
-    position: relative; height: 760px; border-radius: 18px; overflow: hidden;
-    border: 1px solid rgba(96,165,250,.25); background:
-      radial-gradient(circle at 50% 15%, rgba(30,64,175,.22), transparent 25%),
-      radial-gradient(circle at 50% 120%, rgba(14,165,233,.12), transparent 40%),
-      linear-gradient(180deg,#040812,#08101e 60%, #060b16 100%);
-    box-shadow: 0 0 60px rgba(37,99,235,.10), inset 0 0 40px rgba(59,130,246,.08);
-  }}
-  #threeCanvas, #heatCanvas, #hudCanvas {{ position:absolute; inset:0; width:100%; height:100%; display:block; }}
-  #heatCanvas, #hudCanvas {{ pointer-events:none; }}
-  #videoPanel {{
-    background: rgba(10,16,30,.92); border: 1px solid rgba(96,165,250,.25);
-    border-radius: 18px; padding: 10px;
-  }}
-  #video {{ width:100%; border-radius: 14px; background:#000; aspect-ratio: 4/3; object-fit: cover; }}
-  #metrics {{ display:grid; grid-template-columns: repeat(2,1fr); gap:8px; margin-top:10px; }}
-  .metric {{ background:#0f172a; border:1px solid #334155; border-radius: 12px; padding: 10px; }}
-  .metric b {{ display:block; font-size: 1.1rem; color:#fff; margin-top: 4px; }}
-  #log {{
-    margin-top: 10px; padding: 10px; min-height: 120px; white-space: pre-wrap; line-height: 1.4;
-    background:#09111f; border:1px solid #1f2d44; border-radius:12px; font-size: .92rem;
-  }}
-  #calib {{
-    position:absolute; inset:0; display:none; align-items:center; justify-content:center; z-index:10;
-    background: rgba(3,8,18,.45); backdrop-filter: blur(2px);
-  }}
-  .calib-point {{
-    position:absolute; width:22px; height:22px; border-radius:50%; border:2px solid #fff;
-    background: rgba(59,130,246,.55); box-shadow: 0 0 18px rgba(96,165,250,.85);
-    transform: translate(-50%,-50%);
-  }}
-  #legend {{ margin-top:8px; font-size:.9rem; color:#b7c9f8; }}
+  .block-container { padding-top: 1.2rem; }
+  .stMetric label { font-size: .8rem; }
 </style>
-</head>
-<body>
-<div id=\"app\">
-  <div id=\"topbar\">
-    <button id=\"startBtn\">Iniciar tracking</button>
-    <button id=\"calibBtn\" class=\"secondary\">Calibrar 5 pontos</button>
-    <button id=\"resetHeatBtn\" class=\"secondary\">Resetar calor</button>
-    <button id=\"pdfBtn\" class=\"warn\">Baixar PDF</button>
-    <div id=\"status\">Aguardando início…</div>
-  </div>
-
-  <div id=\"layout\">
-    <div id=\"sceneWrap\">
-      <canvas id=\"threeCanvas\"></canvas>
-      <canvas id=\"heatCanvas\"></canvas>
-      <canvas id=\"hudCanvas\"></canvas>
-      <div id=\"calib\"></div>
-    </div>
-
-    <div id=\"videoPanel\">
-      <video id=\"video\" autoplay playsinline muted></video>
-      <div id=\"metrics\">
-        <div class=\"metric\">Tracking<b id=\"mTracking\">OFF</b></div>
-        <div class=\"metric\">Amostras<b id=\"mSamples\">0</b></div>
-        <div class=\"metric\">Gaze X/Y<b id=\"mGaze\">0.00 / 0.00</b></div>
-        <div class=\"metric\">Depth voxel<b id=\"mDepth\">0</b></div>
-        <div class=\"metric\">Ponto pico<b id=\"mPeak\">-</b></div>
-        <div class=\"metric\">Calibração<b id=\"mCalib\">Não</b></div>
-      </div>
-      <div id=\"legend\">
-        Tracking no navegador + cubo volumétrico + calor em profundidade + quaternions.
-      </div>
-      <div id=\"log\">Pronto para iniciar.</div>
-    </div>
-  </div>
-</div>
-
-<script src=\"https://cdn.jsdelivr.net/npm/three@0.161.0/build/three.min.js\"></script>
-<script src=\"https://cdn.jsdelivr.net/npm/webgazer@2.0.1/dist/webgazer.min.js\"></script>
-<script src=\"https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js\"></script>
-<script>
-(() => {{
-  const CFG = {{
-    cubeSize: {cube_size},
-    pointsPerAxis: {points_per_axis},
-    depthLayers: {depth_layers},
-    opticalStrength: {optical_strength},
-    followStrength: {follow_strength},
-    quatStrength: {quat_strength},
-    pointSize: {point_size},
-    heatDecay: {heat_decay},
-    trackingSmoothing: {tracking_smoothing}
-  }};
-
-  const sceneWrap = document.getElementById('sceneWrap');
-  const threeCanvas = document.getElementById('threeCanvas');
-  const heatCanvas = document.getElementById('heatCanvas');
-  const hudCanvas = document.getElementById('hudCanvas');
-  const heatCtx = heatCanvas.getContext('2d');
-  const hudCtx = hudCanvas.getContext('2d');
-  const video = document.getElementById('video');
-  const statusEl = document.getElementById('status');
-  const logEl = document.getElementById('log');
-  const calibEl = document.getElementById('calib');
-
-  const mTracking = document.getElementById('mTracking');
-  const mSamples = document.getElementById('mSamples');
-  const mGaze = document.getElementById('mGaze');
-  const mDepth = document.getElementById('mDepth');
-  const mPeak = document.getElementById('mPeak');
-  const mCalib = document.getElementById('mCalib');
-
-  let W = sceneWrap.clientWidth;
-  let H = sceneWrap.clientHeight;
-  threeCanvas.width = heatCanvas.width = hudCanvas.width = W * devicePixelRatio;
-  threeCanvas.height = heatCanvas.height = hudCanvas.height = H * devicePixelRatio;
-  heatCtx.scale(devicePixelRatio, devicePixelRatio);
-  hudCtx.scale(devicePixelRatio, devicePixelRatio);
-
-  const renderer = new THREE.WebGLRenderer({{ canvas: threeCanvas, antialias: true, alpha: true }});
-  renderer.setPixelRatio(window.devicePixelRatio || 1);
-  renderer.setSize(W, H, false);
-  renderer.setClearColor(0x000000, 0);
-
-  const scene = new THREE.Scene();
-  const camera = new THREE.PerspectiveCamera(45, W / H, 0.1, 2000);
-  camera.position.set(0, 0, 640);
-
-  const ambient = new THREE.AmbientLight(0x88aaff, 0.9);
-  const dir = new THREE.DirectionalLight(0xbfd7ff, 1.15);
-  dir.position.set(220, 280, 360);
-  scene.add(ambient, dir);
-
-  const cubeGroup = new THREE.Group();
-  scene.add(cubeGroup);
-
-  const pts = [];
-  const base = [];
-  const pointPositions = [];
-  const colors = [];
-  const heat3D = [];
-  const dims = [CFG.pointsPerAxis, CFG.pointsPerAxis, CFG.depthLayers];
-
-  const sx = CFG.cubeSize;
-  const sy = CFG.cubeSize;
-  const sz = CFG.cubeSize;
-
-  function idx3(x,y,z) {{ return z * dims[0] * dims[1] + y * dims[0] + x; }}
-
-  for (let z = 0; z < dims[2]; z++) {{
-    for (let y = 0; y < dims[1]; y++) {{
-      for (let x = 0; x < dims[0]; x++) {{
-        const px = (x / (dims[0] - 1) - 0.5) * sx;
-        const py = (y / (dims[1] - 1) - 0.5) * sy;
-        const pz = (z / (dims[2] - 1) - 0.5) * sz;
-        base.push([px, py, pz]);
-        pointPositions.push(px, py, pz);
-        colors.push(0.18, 0.45, 1.00);
-        heat3D.push(0);
-      }}
-    }}
-  }}
-
-  const geom = new THREE.BufferGeometry();
-  geom.setAttribute('position', new THREE.Float32BufferAttribute(pointPositions, 3));
-  geom.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
-
-  const mat = new THREE.PointsMaterial({{
-    size: CFG.pointSize,
-    vertexColors: true,
-    transparent: true,
-    opacity: 0.92,
-    depthWrite: false,
-    blending: THREE.AdditiveBlending,
-  }});
-
-  const points = new THREE.Points(geom, mat);
-  cubeGroup.add(points);
-
-  const box = new THREE.BoxHelper(new THREE.Mesh(new THREE.BoxGeometry(sx, sy, sz)), 0x77aaff);
-  box.material.transparent = true;
-  box.material.opacity = 0.35;
-  cubeGroup.add(box);
-
-  let isTracking = false;
-  let calibrated = false;
-  let calibrationData = [];
-  let gazeSmooth = {{ x: 0.5, y: 0.5 }};
-  let gazeRaw = {{ x: 0.5, y: 0.5 }};
-  let faceFollow = {{ x: 0, y: 0 }};
-  let samples = [];
-
-  let heat2D = Array.from({{ length: dims[1] }}, () => Array(dims[0]).fill(0));
-
-  function log(msg) {{
-    logEl.textContent = msg + "\n" + logEl.textContent.slice(0, 2500);
-  }}
-
-  function setStatus(msg) {{
-    statusEl.textContent = msg;
-  }}
-
-  function resize() {{
-    W = sceneWrap.clientWidth; H = sceneWrap.clientHeight;
-    renderer.setSize(W, H, false);
-    camera.aspect = W / H; camera.updateProjectionMatrix();
-    threeCanvas.width = heatCanvas.width = hudCanvas.width = W * devicePixelRatio;
-    threeCanvas.height = heatCanvas.height = hudCanvas.height = H * devicePixelRatio;
-    heatCtx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);
-    hudCtx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);
-  }}
-  window.addEventListener('resize', resize);
-
-  function createCalibrationPoints() {{
-    calibEl.innerHTML = '';
-    const pts = [
-      [0.5, 0.5], [0.15, 0.15], [0.85, 0.15], [0.15, 0.85], [0.85, 0.85]
-    ];
-    pts.forEach((p, i) => {{
-      const d = document.createElement('div');
-      d.className = 'calib-point';
-      d.style.left = (p[0] * 100) + '%';
-      d.style.top = (p[1] * 100) + '%';
-      d.dataset.x = p[0];
-      d.dataset.y = p[1];
-      d.dataset.i = i;
-      d.addEventListener('click', () => {{
-        calibrationData.push({{
-          targetX: parseFloat(d.dataset.x),
-          targetY: parseFloat(d.dataset.y),
-          rawX: gazeRaw.x,
-          rawY: gazeRaw.y,
-        }});
-        d.style.background = 'rgba(16,185,129,.75)';
-        d.style.boxShadow = '0 0 20px rgba(16,185,129,.95)';
-        log('Ponto de calibração registrado: ' + (i + 1));
-        if (calibrationData.length >= 5) {{
-          calibrated = true;
-          mCalib.textContent = 'Sim';
-          calibEl.style.display = 'none';
-          setStatus('Calibração concluída');
-          log('Calibração concluída com 5 pontos.');
-        }}
-      }});
-      calibEl.appendChild(d);
-    }});
-  }}
-
-  function applyCalibration(x, y) {{
-    if (!calibrated || calibrationData.length < 2) return {{ x, y }};
-    const rawXs = calibrationData.map(p => p.rawX);
-    const rawYs = calibrationData.map(p => p.rawY);
-    const minX = Math.min(...rawXs), maxX = Math.max(...rawXs);
-    const minY = Math.min(...rawYs), maxY = Math.max(...rawYs);
-    const nx = Math.min(1, Math.max(0, (x - minX) / Math.max(1e-6, (maxX - minX))));
-    const ny = Math.min(1, Math.max(0, (y - minY) / Math.max(1e-6, (maxY - minY))));
-    return {{ x: nx, y: ny }};
-  }}
-
-  function heatColor(v) {{
-    const t = Math.max(0, Math.min(1, v));
-    const r = Math.min(1, Math.max(0, 1.5 * t));
-    const g = Math.min(1, Math.max(0, 1.4 * (1 - Math.abs(t - 0.5) * 2)));
-    const b = Math.min(1, Math.max(0, 1.3 * (1 - t)));
-    return [r, g, b];
-  }}
-
-  function stampHeat3D(nx, ny) {{
-    const gx = nx * (dims[0] - 1);
-    const gy = (1 - ny) * (dims[1] - 1);
-    const gz = Math.round((1 - Math.sqrt((nx - 0.5)**2 + (ny - 0.5)**2) / 0.707) * (dims[2] - 1));
-
-    for (let z = 0; z < dims[2]; z++) {{
-      for (let y = 0; y < dims[1]; y++) {{
-        for (let x = 0; x < dims[0]; x++) {{
-          const d2 = (x - gx) ** 2 + (y - gy) ** 2 + ((z - gz) * 1.25) ** 2;
-          const amp = Math.exp(-d2 / 5.0);
-          const id = idx3(x, y, z);
-          heat3D[id] += amp;
-        }}
-      }}
-    }}
-    return gz;
-  }}
-
-  function decayHeat() {{
-    for (let i = 0; i < heat3D.length; i++) heat3D[i] *= CFG.heatDecay;
-  }}
-
-  function updatePointCloud() {{
-    const pos = geom.attributes.position.array;
-    const col = geom.attributes.color.array;
-
-    const gx = (gazeSmooth.x - 0.5) * 2;
-    const gy = -(gazeSmooth.y - 0.5) * 2;
-
-    const qx = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1,0,0), gy * CFG.quatStrength * 0.35);
-    const qy = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,1,0), gx * CFG.quatStrength * 0.35);
-    const qz = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,0,1), faceFollow.x * 0.08);
-    const qq = new THREE.Quaternion();
-    qq.multiply(qz).multiply(qy).multiply(qx);
-
-    const tmp = new THREE.Vector3();
-
-    let peakVal = -1;
-    let peakIdx = 0;
-
-    for (let i = 0; i < base.length; i++) {{
-      let [x, y, z] = base[i];
-      const rr = Math.sqrt((x/sx)**2 + (y/sy)**2 + (z/sz)**2);
-      const optical = (1 - Math.min(1, rr * 1.55)) * CFG.opticalStrength;
-
-      x += gx * optical * 38 * (1 - Math.abs(x) / (sx * 0.6));
-      y += gy * optical * 38 * (1 - Math.abs(y) / (sy * 0.6));
-      z += (1 - Math.abs(gx) - Math.abs(gy)) * optical * 26;
-
-      tmp.set(x, y, z).applyQuaternion(qq);
-
-      const id3 = i * 3;
-      pos[id3 + 0] = tmp.x;
-      pos[id3 + 1] = tmp.y;
-      pos[id3 + 2] = tmp.z;
-
-      const hv = Math.min(1, heat3D[i] / 10);
-      const [r,g,b] = heatColor(hv);
-      col[id3 + 0] = 0.18 + r * 0.82;
-      col[id3 + 1] = 0.35 + g * 0.65;
-      col[id3 + 2] = 0.85 * b + 0.15;
-
-      if (heat3D[i] > peakVal) {{ peakVal = heat3D[i]; peakIdx = i; }}
-    }}
-
-    geom.attributes.position.needsUpdate = true;
-    geom.attributes.color.needsUpdate = true;
-
-    const pz = Math.floor(peakIdx / (dims[0] * dims[1]));
-    const py = Math.floor((peakIdx % (dims[0] * dims[1])) / dims[0]);
-    const px = peakIdx % dims[0];
-    mPeak.textContent = `${{px+1}},${{py+1}},${{pz+1}}`;
-  }}
-
-  function drawHUD() {{
-    heatCtx.clearRect(0,0,W,H);
-    hudCtx.clearRect(0,0,W,H);
-
-    const gx = gazeSmooth.x * W;
-    const gy = gazeSmooth.y * H;
-
-    const grad = heatCtx.createRadialGradient(gx, gy, 0, gx, gy, 90);
-    grad.addColorStop(0, 'rgba(255,80,60,0.48)');
-    grad.addColorStop(0.35, 'rgba(255,170,60,0.22)');
-    grad.addColorStop(1, 'rgba(255,170,60,0)');
-    heatCtx.fillStyle = grad;
-    heatCtx.beginPath();
-    heatCtx.arc(gx, gy, 90, 0, Math.PI*2);
-    heatCtx.fill();
-
-    hudCtx.strokeStyle = 'rgba(180,220,255,.85)';
-    hudCtx.lineWidth = 1.2;
-    hudCtx.beginPath();
-    hudCtx.arc(gx, gy, 16, 0, Math.PI*2);
-    hudCtx.stroke();
-    hudCtx.beginPath();
-    hudCtx.moveTo(gx - 26, gy); hudCtx.lineTo(gx + 26, gy);
-    hudCtx.moveTo(gx, gy - 26); hudCtx.lineTo(gx, gy + 26);
-    hudCtx.stroke();
-  }}
-
-  function sampleGaze() {{
-    if (!window.webgazer) return;
-    const pred = webgazer.getCurrentPrediction();
-    if (!pred) return;
-
-    gazeRaw.x = pred.x / window.innerWidth;
-    gazeRaw.y = pred.y / window.innerHeight;
-    const cal = applyCalibration(gazeRaw.x, gazeRaw.y);
-
-    gazeSmooth.x += (cal.x - gazeSmooth.x) * CFG.trackingSmoothing;
-    gazeSmooth.y += (cal.y - gazeSmooth.y) * CFG.trackingSmoothing;
-
-    gazeSmooth.x = Math.max(0, Math.min(1, gazeSmooth.x));
-    gazeSmooth.y = Math.max(0, Math.min(1, gazeSmooth.y));
-
-    faceFollow.x += ((gazeSmooth.x - 0.5) * 2 - faceFollow.x) * 0.12;
-    faceFollow.y += ((gazeSmooth.y - 0.5) * 2 - faceFollow.y) * 0.12;
-
-    const depthLayer = stampHeat3D(gazeSmooth.x, gazeSmooth.y);
-
-    samples.push({{
-      t: performance.now(),
-      gazeX: gazeSmooth.x,
-      gazeY: gazeSmooth.y,
-      depthLayer,
-    }});
-    if (samples.length > 12000) samples.shift();
-
-    mSamples.textContent = String(samples.length);
-    mGaze.textContent = `${{(gazeSmooth.x*2-1).toFixed(2)}} / ${{(-(gazeSmooth.y*2-1)).toFixed(2)}}`;
-    mDepth.textContent = String(depthLayer + 1);
-  }}
-
-  function animate() {{
-    requestAnimationFrame(animate);
-    if (isTracking) {{
-      decayHeat();
-      sampleGaze();
-    }}
-
-    cubeGroup.rotation.y += (((gazeSmooth.x - 0.5) * 2) * 0.10 * CFG.followStrength - cubeGroup.rotation.y) * 0.08;
-    cubeGroup.rotation.x += ((-(gazeSmooth.y - 0.5) * 2) * 0.10 * CFG.followStrength - cubeGroup.rotation.x) * 0.08;
-
-    camera.position.x += (((gazeSmooth.x - 0.5) * 2) * 85 - camera.position.x) * 0.07;
-    camera.position.y += ((-(gazeSmooth.y - 0.5) * 2) * 70 - camera.position.y) * 0.07;
-    camera.lookAt(0,0,0);
-
-    updatePointCloud();
-    drawHUD();
-    renderer.render(scene, camera);
-  }}
-
-  async function startTracking() {{
-    try {{
-      const stream = await navigator.mediaDevices.getUserMedia({{ video: true, audio: false }});
-      video.srcObject = stream;
-
-      await webgazer
-        .setRegression('ridge')
-        .setTracker('TFFacemesh')
-        .showVideoPreview(false)
-        .showPredictionPoints(false)
-        .showFaceOverlay(false)
-        .begin();
-
-      isTracking = true;
-      mTracking.textContent = 'ON';
-      setStatus('Tracking ativo no navegador');
-      log('Tracking iniciado com WebGazer.');
-    }} catch (err) {{
-      setStatus('Erro ao iniciar câmera/tracking');
-      log('Erro: ' + err.message);
-    }}
-  }}
-
-  function resetHeat() {{
-    for (let i = 0; i < heat3D.length; i++) heat3D[i] = 0;
-    samples = [];
-    mSamples.textContent = '0';
-    mPeak.textContent = '-';
-    log('Mapa de calor resetado.');
-  }}
-
-  async function generatePDF() {{
-    const {{ jsPDF }} = window.jspdf;
-    const pdf = new jsPDF({{ orientation: 'portrait', unit: 'pt', format: 'a4' }});
-
-    const sceneImg = threeCanvas.toDataURL('image/png');
-    const heatImg = heatCanvas.toDataURL('image/png');
-    const hudImg = hudCanvas.toDataURL('image/png');
-
-    const merge = document.createElement('canvas');
-    merge.width = W; merge.height = H;
-    const mctx = merge.getContext('2d');
-
-    await new Promise(res => {{
-      const i1 = new Image(); const i2 = new Image(); const i3 = new Image();
-      let done = 0; const check = () => {{ done++; if (done === 3) res(); }};
-      i1.onload = () => {{ mctx.drawImage(i1,0,0,W,H); check(); }};
-      i2.onload = () => {{ mctx.drawImage(i2,0,0,W,H); check(); }};
-      i3.onload = () => {{ mctx.drawImage(i3,0,0,W,H); check(); }};
-      i1.src = sceneImg; i2.src = heatImg; i3.src = hudImg;
-    }});
-
-    const merged = merge.toDataURL('image/png');
-    const videoShot = document.createElement('canvas');
-    videoShot.width = video.videoWidth || 640;
-    videoShot.height = video.videoHeight || 480;
-    const vs = videoShot.getContext('2d');
-    vs.drawImage(video, 0, 0, videoShot.width, videoShot.height);
-    const videoImg = videoShot.toDataURL('image/png');
-
-    pdf.setFont('helvetica', 'bold');
-    pdf.setFontSize(18);
-    pdf.text('Simulacro — Relatório de tracking ocular 3D', 40, 42);
-    pdf.setFontSize(10);
-    pdf.setFont('helvetica', 'normal');
-    pdf.text('Tracking no navegador + cubo volumétrico de microspontos + heatmap em profundidade.', 40, 60);
-
-    pdf.setFont('helvetica', 'bold');
-    pdf.text('Métricas', 40, 88);
-    pdf.setFont('helvetica', 'normal');
-    pdf.text('Amostras: ' + samples.length, 40, 106);
-    pdf.text('Tracking: ' + (isTracking ? 'ativo' : 'inativo'), 40, 122);
-    pdf.text('Calibrado: ' + (calibrated ? 'sim' : 'não'), 40, 138);
-    pdf.text('Pico voxel: ' + mPeak.textContent, 40, 154);
-    pdf.text('Gaze atual: ' + mGaze.textContent, 40, 170);
-
-    pdf.addImage(merged, 'PNG', 40, 190, 515, 320);
-    pdf.addPage();
-    pdf.text('Captura da câmera', 40, 42);
-    pdf.addImage(videoImg, 'PNG', 40, 60, 360, 270);
-
-    pdf.text('Interpretação automática', 40, 360);
-    const interp =
-      'O cubo 3D responde ao olhar do observador com rotação quaternion, deslocamento de perspectiva e deformação óptica dos microspontos. O mapa de calor é acumulado no volume interno do cubo, distribuindo incidência entre largura, altura e profundidade conforme a posição estimada do olhar.';
-    pdf.setFontSize(10);
-    const lines = pdf.splitTextToSize(interp, 500);
-    pdf.text(lines, 40, 380);
-
-    pdf.save('relatorio_simulacro_tracking_3d.pdf');
-    log('PDF gerado com sucesso.');
-  }}
-
-  document.getElementById('startBtn').addEventListener('click', startTracking);
-  document.getElementById('calibBtn').addEventListener('click', () => {{
-    calibrationData = [];
-    calibrated = false;
-    mCalib.textContent = 'Em andamento';
-    calibEl.style.display = 'flex';
-    createCalibrationPoints();
-    setStatus('Calibração ativa');
-    log('Calibração iniciada. Clique nos 5 pontos olhando para cada um.');
-  }});
-  document.getElementById('resetHeatBtn').addEventListener('click', resetHeat);
-  document.getElementById('pdfBtn').addEventListener('click', generatePDF);
-
-  animate();
-}})();
-</script>
-</body>
-</html>
-"""
-
-st.title("👁️ Simulacro — Cubo volumétrico com tracking do observador")
-st.caption("Esta versão faz o tracking no navegador e faz o cubo responder ao olhar com pontos 3D em profundidade.")
-
-components.html(html, height=820, scrolling=False)
-
-st.markdown("---")
-col1, col2, col3 = st.columns(3)
-with col1:
-    st.markdown("### O que muda aqui")
-    st.markdown("- tracking no navegador  \\n- cubo 3D volumétrico de pontos  \\n- calor dentro do volume  \\n- quaternions na rotação  \\n- ilusão óptica dos microspontos")
-with col2:
-    st.markdown("### Como funciona")
-    st.markdown("- WebGazer estima o ponto de olhar em tempo real  \\n- o olhar é calibrado em 5 pontos  \\n- o gaze é convertido em voxel dentro do cubo  \\n- os pontos seguem o observador")
-with col3:
-    st.markdown("### Observação")
-    st.markdown("É um **protótipo inicial real da lógica correta**. O próximo passo seria trocar a regressão do olhar por um modelo próprio e sincronizar os dados no backend.")
+""", unsafe_allow_html=True)
+
+st.title("👁️ Eye Tracking 3D  —  Mapa de Calor + Relatório PDF")
+st.caption("Powered by MediaPipe Face Landmarker Tasks API  •  Python 3.13 ✅")
+
+# ── session state defaults ────────────────────────────────────
+for k, v in [
+    ("tracking_active", False),
+    ("session_start",   None),
+    ("snapshot_gaze",   []),      # cópia para plots / PDF
+    ("snapshot_lms",    None),
+    ("snapshot_frames", 0),
+]:
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# ── sidebar ───────────────────────────────────────────────────
+with st.sidebar:
+    st.header("⚙️ Controles")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        start_btn = st.button("▶ Iniciar", use_container_width=True, type="primary")
+    with col2:
+        stop_btn  = st.button("⏹ Pausar",  use_container_width=True)
+
+    clear_btn = st.button("🗑️ Limpar dados", use_container_width=True)
+    st.divider()
+
+    status_txt = "🟢 ATIVO" if st.session_state.tracking_active else "🔴 PARADO"
+    st.markdown(f"**Status:** {status_txt}")
+    n_pts = len(st.session_state.snapshot_gaze)
+    st.metric("Pontos capturados", n_pts)
+    if st.session_state.session_start:
+        dur = (datetime.now() - st.session_state.session_start).seconds
+        st.metric("Duração (s)", dur)
+    st.divider()
+
+    show_3d      = st.checkbox("🧊 Mapa 3D",   value=True)
+    show_heatmap = st.checkbox("🌡️ Heatmap",   value=True)
+    auto_refresh = st.checkbox("🔄 Auto-refresh (1s)", value=True)
+
+# ── botões ────────────────────────────────────────────────────
+if start_btn:
+    st.session_state.tracking_active = True
+    if not st.session_state.session_start:
+        st.session_state.session_start = datetime.now()
+        st.session_state.snapshot_gaze   = []
+        st.session_state.snapshot_frames = 0
+
+if stop_btn:
+    st.session_state.tracking_active = False
+
+if clear_btn:
+    st.session_state.tracking_active = False
+    st.session_state.session_start   = None
+    st.session_state.snapshot_gaze   = []
+    st.session_state.snapshot_lms    = None
+    st.session_state.snapshot_frames = 0
+
+# ── layout principal ─────────────────────────────────────────
+col_cam, col_viz = st.columns([1.1, 0.9], gap="medium")
+
+with col_cam:
+    st.subheader("📷 Webcam + Micropontos")
+
+    webrtc_ctx = webrtc_streamer(
+        key="eye-tracking-v2",
+        mode=WebRtcMode.SENDRECV,
+        video_processor_factory=FaceTrackingProcessor,
+        media_stream_constraints={"video": {"width": W, "height": H}, "audio": False},
+        async_processing=True,
+        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+    )
+
+    # sincroniza estado tracking → processador
+    if webrtc_ctx.video_processor:
+        proc: FaceTrackingProcessor = webrtc_ctx.video_processor
+        proc.active = st.session_state.tracking_active
+
+        # lê dados acumulados no processador
+        with proc.lock:
+            gaze_snap = list(proc.gaze_points)
+            lms_snap  = proc.latest_landmarks
+            frames_n  = proc.frame_count
+            face_ok   = proc.face_detected
+
+        # atualiza session_state
+        if gaze_snap:
+            st.session_state.snapshot_gaze   = gaze_snap
+            st.session_state.snapshot_frames = frames_n
+        if lms_snap:
+            st.session_state.snapshot_lms = lms_snap
+
+        # indicador de face
+        if face_ok:
+            st.success(f"✅ Rosto detectado  |  {len(gaze_snap)} pts")
+        elif webrtc_ctx.state.playing:
+            st.warning("⚠️ Nenhum rosto na câmera")
+
+with col_viz:
+    tab_hm, tab_3d = st.tabs(["🌡️ Heatmap", "🧊 Mapa 3D"])
+
+    with tab_hm:
+        if st.session_state.snapshot_gaze and show_heatmap:
+            fig_hm = plot_heatmap(st.session_state.snapshot_gaze)
+            st.pyplot(fig_hm, use_container_width=True)
+            plt.close(fig_hm)
+        else:
+            st.info("Inicie o tracking para ver o mapa de calor.")
+
+    with tab_3d:
+        if st.session_state.snapshot_lms and show_3d:
+            fig3d = plot_3d_landmarks(st.session_state.snapshot_lms)
+            st.plotly_chart(fig3d, use_container_width=True)
+        else:
+            st.info("O mapa 3D aparece quando um rosto é detectado.")
+
+# ── exportar PDF ─────────────────────────────────────────────
+st.divider()
+col_pdf1, col_pdf2 = st.columns([1, 3])
+with col_pdf1:
+    gen_pdf = st.button(
+        "📄 Gerar Relatório PDF",
+        disabled=len(st.session_state.snapshot_gaze) == 0,
+        type="primary",
+        use_container_width=True,
+    )
+with col_pdf2:
+    if gen_pdf:
+        with st.spinner("Gerando PDF…"):
+            pdf_buf = generate_pdf(
+                st.session_state.snapshot_gaze,
+                st.session_state.session_start,
+                st.session_state.snapshot_frames,
+            )
+        fname = f"eye_tracking_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        st.download_button(
+            label="⬇️  Baixar PDF",
+            data=pdf_buf,
+            file_name=fname,
+            mime="application/pdf",
+            type="primary",
+        )
+
+# ── auto-refresh enquanto tracking ativo ─────────────────────
+if (
+    auto_refresh
+    and st.session_state.tracking_active
+    and webrtc_ctx.state.playing
+):
+    time.sleep(REFRESH_INTERVAL)
+    st.rerun()
