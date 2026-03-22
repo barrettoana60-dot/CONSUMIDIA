@@ -2,12 +2,11 @@
 #  simulacro_streamlit.py  —  Face & Eye Tracking 3D + Heatmap
 #  Compatível com mediapipe >= 0.10.30 (Tasks API) + Python 3.13
 #  Deps: streamlit, streamlit-webrtc, mediapipe, opencv-python-headless,
-#        plotly, matplotlib, reportlab, scipy, av
+#        plotly, matplotlib, reportlab, av
 # ============================================================
 
-import os, io, time, threading, urllib.request
+import os, io, threading, urllib.request
 from datetime import datetime
-from pathlib import Path
 
 import numpy as np
 import cv2
@@ -27,7 +26,11 @@ import plotly.graph_objects as go
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from scipy.ndimage import gaussian_filter
+
+# gaussian_filter sem scipy — usa cv2 que já está no ambiente
+def gaussian_filter(arr: np.ndarray, sigma: float) -> np.ndarray:
+    k = int(6 * sigma) | 1   # kernel ímpar
+    return cv2.GaussianBlur(arr, (k, k), sigma)
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm
@@ -567,11 +570,9 @@ with col_pdf2:
             type="primary",
         )
 
-# ── auto-refresh enquanto tracking ativo ─────────────────────
-if (
-    auto_refresh
-    and st.session_state.tracking_active
-    and webrtc_ctx.state.playing
-):
-    time.sleep(REFRESH_INTERVAL)
-    st.rerun()
+# ── auto-refresh enquanto tracking ativo (sem bloquear botões) ─
+if auto_refresh and st.session_state.tracking_active:
+    st.markdown(
+        '<meta http-equiv="refresh" content="2">',
+        unsafe_allow_html=True,
+    )
