@@ -5,13 +5,13 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-import av
 import cv2
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from matplotlib import pyplot as plt
+from PIL import Image
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet
@@ -24,22 +24,43 @@ from reportlab.platypus import (
     Table,
     TableStyle,
 )
-from streamlit_webrtc import VideoProcessorBase, WebRtcMode, webrtc_streamer
-
 
 # =========================================================
-# CONFIGURAÇÃO
+# CONFIG
 # =========================================================
 st.set_page_config(
-    page_title="Simulacro — Tracking 3D sem MediaPipe",
+    page_title="Simulacro — Tracking 3D Snapshot",
     page_icon="👁️",
     layout="wide",
 )
 
-FRAME_W = 640
-FRAME_H = 480
 DEFAULT_MAX_SAMPLES = 8000
+DEFAULT_GRID_N = 18
 
+# =========================================================
+# SESSION STATE
+# =========================================================
+if "samples" not in st.session_state:
+    st.session_state.samples = []
+if "blink_count" not in st.session_state:
+    st.session_state.blink_count = 0
+if "last_frame_bgr" not in st.session_state:
+    st.session_state.last_frame_bgr = None
+if "last_processed_hash" not in st.session_state:
+    st.session_state.last_processed_hash = None
+if "prev_eye_state" not in st.session_state:
+    st.session_state.prev_eye_state = "open"
+if "session_started_at" not in st.session_state:
+    st.session_state.session_started_at = None
+if "last_metrics" not in st.session_state:
+    st.session_state.last_metrics = {
+        "face_found": False,
+        "gaze_x_norm": 0.5,
+        "gaze_y_norm": 0.5,
+        "roll_deg": 0.0,
+        "velocity": 0.0,
+        "sample_count": 0,
+    }
 
 # =========================================================
 # UTILITÁRIOS
@@ -120,38 +141,19 @@ class GazeSample:
     velocity: float
 
 
-class SharedState:
-    def __init__(self):
-        self.samples: List[GazeSample] = []
-        self.latest_frame_bgr: Optional[np.ndarray] = None
-        self.latest_metrics = {
-            "face_found": False,
-            "blink_count": 0,
-            "samples": 0,
-            "gaze_x": 0.5,
-            "gaze_y": 0.5,
-            "roll_deg": 0.0,
-            "velocity": 0.0,
-        }
-        self.max_samples = DEFAULT_MAX_SAMPLES
-
-
-shared = SharedState()
-
-
 # =========================================================
-# TRACKING COM OPENCV
+# OPENCV CASCADES
 # =========================================================
-def get_cascade(name: str) -> cv2.CascadeClassifier:
-    path = cv2.data.haarcascades + name
-    cascade = cv2.CascadeClassifier(path)
-    if cascade.empty():
-        raise RuntimeError(f"Não foi possível carregar a cascade: {path}")
-    return cascade
+@st.cache_resource
+def load_cascades():
+    face = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    eye = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
+    if face.empty() or eye.empty():
+        raise RuntimeError("Não foi possível carregar as Haar Cascades do OpenCV.")
+    return face, eye
 
 
-FACE_CASCADE = get_cascade("haarcascade_frontalface_default.xml")
-EYE_CASCADE = get_cascade("haarcascade_eye.xml")
+FACE_CASCADE, EYE_CASCADE = load_cascades()
 
 
 def estimate_pupil_center(eye_roi_gray: np.ndarray) -> Optional[Tuple[float, float]]:
@@ -159,11 +161,11 @@ def estimate_pupil_center(eye_roi_gray: np.ndarray) -> Optional[Tuple[float, flo
         return None
 
     roi = cv2.GaussianBlur(eye_roi_gray, (7, 7), 0)
-    _, thr = cv2.threshold(roi, 40, 255, cv2.THRESH_BINARY_INV)
+    _, thr = cv2.threshold(roi, 45, 255, cv2.THRESH_BINARY_INV)
 
     h, w = thr.shape[:2]
     mask = np.zeros_like(thr)
-    cv2.rectangle(mask, (int(w * 0.15), int(h * 0.20)), (int(w * 0.85), int(h * 0.85)), 255, -1)
+    cv2.rectangle(mask, (int(w * 0.15), int(h * 0.18)), (int(w * 0.85), int(h * 0.88)), 255, -1)
     thr = cv2.bitwise_and(thr, mask)
 
     cnts, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -208,8 +210,7 @@ def detect_face_and_eyes(gray: np.ndarray):
 
     eye_boxes = []
     for (ex, ey, ew, eh) in eyes:
-        abs_box = (x + ex, y + ey, ew, eh)
-        eye_boxes.append(abs_box)
+        eye_boxes.append((x + ex, y + ey, ew, eh))
 
     eye_boxes = sorted(eye_boxes, key=lambda b: b[2] * b[3], reverse=True)[:2]
     eye_boxes = sorted(eye_boxes, key=lambda b: b[0])
@@ -217,143 +218,120 @@ def detect_face_and_eyes(gray: np.ndarray):
     return (x, y, w, h), eye_boxes
 
 
-class EyeTrackingProcessor(VideoProcessorBase):
-    def __init__(self):
-        self.sx = 0.5
-        self.sy = 0.5
-        self.sroll = 0.0
+def process_snapshot(image_bgr: np.ndarray):
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    out = image_bgr.copy()
 
-        self.prev_cube_x = 0.0
-        self.prev_cube_y = 0.0
-        self.prev_ts = time.time()
+    face_box, eyes = detect_face_and_eyes(gray)
 
-        self.last_eye_centers = None
-        self.blink_count = 0
-        self.closed_counter = 0
+    face_found = False
+    blink_now = 0
+    velocity = 0.0
+    gaze_x_norm = st.session_state.last_metrics["gaze_x_norm"]
+    gaze_y_norm = st.session_state.last_metrics["gaze_y_norm"]
+    roll_deg = st.session_state.last_metrics["roll_deg"]
 
-    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        img = frame.to_ndarray(format="bgr24")
-        img = cv2.flip(img, 1)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    if face_box is not None:
+        face_found = True
+        fx, fy, fw, fh = face_box
+        cv2.rectangle(out, (fx, fy), (fx + fw, fy + fh), (80, 180, 255), 2)
 
-        face_box, eyes = detect_face_and_eyes(gray)
+        eye_data = []
+        for (ex, ey, ew, eh) in eyes:
+            roi = gray[ey:ey + eh, ex:ex + ew]
+            pupil = estimate_pupil_center(roi)
+            cv2.rectangle(out, (ex, ey), (ex + ew, ey + eh), (0, 255, 120), 2)
 
-        face_found = False
-        velocity = 0.0
-        blink_now = 0
+            if pupil is not None:
+                px = ex + pupil[0]
+                py = ey + pupil[1]
+                cv2.circle(out, (int(px), int(py)), 4, (0, 0, 255), -1)
 
-        if face_box is not None:
-            face_found = True
-            fx, fy, fw, fh = face_box
-            cv2.rectangle(img, (fx, fy), (fx + fw, fy + fh), (80, 180, 255), 2)
+                nx = clamp(pupil[0] / max(1.0, ew), 0.0, 1.0)
+                ny = clamp(pupil[1] / max(1.0, eh), 0.0, 1.0)
+                eye_data.append((ex, ey, ew, eh, px, py, nx, ny))
 
-            eye_data = []
-            for (ex, ey, ew, eh) in eyes:
-                roi = gray[ey:ey + eh, ex:ex + ew]
-                pupil = estimate_pupil_center(roi)
+        if len(eye_data) == 2:
+            left_eye, right_eye = eye_data[0], eye_data[1]
 
-                cv2.rectangle(img, (ex, ey), (ex + ew, ey + eh), (0, 255, 100), 2)
+            avg_nx = (left_eye[6] + right_eye[6]) / 2.0
+            avg_ny = (left_eye[7] + right_eye[7]) / 2.0
 
-                if pupil is not None:
-                    px = ex + pupil[0]
-                    py = ey + pupil[1]
-                    cv2.circle(img, (int(px), int(py)), 4, (0, 0, 255), -1)
+            raw_gaze_x = clamp((avg_nx - 0.5) * 2.0, -1.0, 1.0)
+            raw_gaze_y = clamp((avg_ny - 0.5) * 2.0, -1.0, 1.0)
 
-                    nx = clamp(pupil[0] / max(1.0, ew), 0.0, 1.0)
-                    ny = clamp(pupil[1] / max(1.0, eh), 0.0, 1.0)
-                    eye_data.append((ex, ey, ew, eh, px, py, nx, ny))
+            gaze_x_norm = lerp(gaze_x_norm, (raw_gaze_x + 1.0) / 2.0, 0.35)
+            gaze_y_norm = lerp(gaze_y_norm, (raw_gaze_y + 1.0) / 2.0, 0.35)
 
-            if len(eye_data) == 2:
-                left_eye, right_eye = eye_data[0], eye_data[1]
+            left_center = (left_eye[4], left_eye[5])
+            right_center = (right_eye[4], right_eye[5])
+            roll_deg = math.degrees(math.atan2(left_center[1] - right_center[1], left_center[0] - right_center[0]))
 
-                avg_nx = (left_eye[6] + right_eye[6]) / 2.0
-                avg_ny = (left_eye[7] + right_eye[7]) / 2.0
+            eye_open_score = 0.0
+            for ed in eye_data:
+                _, _, ew, eh, _, _, _, _ = ed
+                eye_open_score += eh / max(1.0, ew)
+            eye_open_score /= 2.0
 
-                gaze_x = clamp((avg_nx - 0.5) * 2.0, -1.0, 1.0)
-                gaze_y = clamp((avg_ny - 0.5) * 2.0, -1.0, 1.0)
+            curr_state = "closed" if eye_open_score < 0.32 else "open"
+            prev_state = st.session_state.prev_eye_state
+            if prev_state == "closed" and curr_state == "open":
+                st.session_state.blink_count += 1
+                blink_now = 1
+            st.session_state.prev_eye_state = curr_state
 
-                left_center = (left_eye[4], left_eye[5])
-                right_center = (right_eye[4], right_eye[5])
-                roll_deg = math.degrees(math.atan2(left_center[1] - right_center[1], left_center[0] - right_center[0]))
+            cube_x = gaze_x_norm * 2.0 - 1.0
+            cube_y = -(gaze_y_norm * 2.0 - 1.0)
+            radial = math.sqrt(cube_x * cube_x + cube_y * cube_y)
+            cube_z = clamp(1.0 - radial * 0.75, -1.0, 1.0)
 
-                self.sx = lerp(self.sx, (gaze_x + 1.0) / 2.0, 0.18)
-                self.sy = lerp(self.sy, (gaze_y + 1.0) / 2.0, 0.18)
-                self.sroll = lerp(self.sroll, roll_deg, 0.12)
+            if st.session_state.samples:
+                prev = st.session_state.samples[-1]
+                dt = max(1e-5, time.time() - prev.ts)
+                velocity = math.sqrt((cube_x - prev.cube_x) ** 2 + (cube_y - prev.cube_y) ** 2) / dt
 
-                # blink simplificado: baixa quantidade de olhos detectados ou ROI muito escura/instável
-                eye_open_score = 0
-                for ed in eye_data:
-                    _, _, ew, eh, _, _, _, _ = ed
-                    ratio = eh / max(1.0, ew)
-                    eye_open_score += ratio
-                eye_open_score /= 2.0
+            sample = GazeSample(
+                ts=time.time(),
+                gaze_x_norm=float(gaze_x_norm),
+                gaze_y_norm=float(gaze_y_norm),
+                cube_x=float(cube_x),
+                cube_y=float(cube_y),
+                cube_z=float(cube_z),
+                head_roll_deg=float(roll_deg),
+                blink=int(blink_now),
+                velocity=float(velocity),
+            )
+            st.session_state.samples.append(sample)
 
-                if eye_open_score < 0.32:
-                    self.closed_counter += 1
-                else:
-                    if self.closed_counter >= 2:
-                        self.blink_count += 1
-                        blink_now = 1
-                    self.closed_counter = 0
+            if len(st.session_state.samples) > DEFAULT_MAX_SAMPLES:
+                st.session_state.samples = st.session_state.samples[-DEFAULT_MAX_SAMPLES:]
 
-                cube_x = self.sx * 2.0 - 1.0
-                cube_y = -(self.sy * 2.0 - 1.0)
-                radial = math.sqrt(cube_x * cube_x + cube_y * cube_y)
-                cube_z = clamp(1.0 - radial * 0.75, -1.0, 1.0)
+            px = int(gaze_x_norm * out.shape[1])
+            py = int(gaze_y_norm * out.shape[0])
+            cv2.circle(out, (px, py), 18, (0, 255, 255), 2)
+            cv2.circle(out, (px, py), 4, (255, 255, 255), -1)
 
-                now = time.time()
-                dt = max(1e-5, now - self.prev_ts)
-                velocity = math.sqrt((cube_x - self.prev_cube_x) ** 2 + (cube_y - self.prev_cube_y) ** 2) / dt
+            cv2.putText(out, f"gaze=({cube_x:+.2f},{cube_y:+.2f},{cube_z:+.2f})",
+                        (20, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (40, 255, 80), 2)
+            cv2.putText(out, f"blinks={st.session_state.blink_count}",
+                        (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 200, 60), 2)
+            cv2.putText(out, f"vel={velocity:.2f}",
+                        (20, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 160, 160), 2)
 
-                shared.samples.append(
-                    GazeSample(
-                        ts=now,
-                        gaze_x_norm=float(self.sx),
-                        gaze_y_norm=float(self.sy),
-                        cube_x=float(cube_x),
-                        cube_y=float(cube_y),
-                        cube_z=float(cube_z),
-                        head_roll_deg=float(self.sroll),
-                        blink=int(blink_now),
-                        velocity=float(velocity),
-                    )
-                )
-
-                if len(shared.samples) > shared.max_samples:
-                    shared.samples = shared.samples[-shared.max_samples:]
-
-                self.prev_cube_x = cube_x
-                self.prev_cube_y = cube_y
-                self.prev_ts = now
-
-                px = int(self.sx * img.shape[1])
-                py = int(self.sy * img.shape[0])
-                cv2.circle(img, (px, py), 18, (0, 255, 255), 2)
-                cv2.circle(img, (px, py), 4, (255, 255, 255), -1)
-
-                cv2.putText(img, f"gaze=({cube_x:+.2f},{cube_y:+.2f},{cube_z:+.2f})",
-                            (20, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (40, 255, 80), 2)
-                cv2.putText(img, f"blinks={self.blink_count}",
-                            (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 200, 60), 2)
-                cv2.putText(img, f"vel={velocity:.2f}",
-                            (20, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 160, 160), 2)
-
-        shared.latest_frame_bgr = img.copy()
-        shared.latest_metrics = {
-            "face_found": face_found,
-            "blink_count": self.blink_count,
-            "samples": len(shared.samples),
-            "gaze_x": self.sx,
-            "gaze_y": self.sy,
-            "roll_deg": self.sroll,
-            "velocity": velocity,
-        }
-
-        return av.VideoFrame.from_ndarray(img, format="bgr24")
+    st.session_state.last_metrics = {
+        "face_found": face_found,
+        "gaze_x_norm": float(gaze_x_norm),
+        "gaze_y_norm": float(gaze_y_norm),
+        "roll_deg": float(roll_deg),
+        "velocity": float(velocity),
+        "sample_count": len(st.session_state.samples),
+    }
+    st.session_state.last_frame_bgr = out
+    return out
 
 
 # =========================================================
-# CUBO 3D + ILUSÃO ÓPTICA
+# HEATMAP / CUBO
 # =========================================================
 def build_front_face_points(grid_n: int) -> pd.DataFrame:
     vals = np.linspace(-1.0, 1.0, grid_n)
@@ -385,7 +363,7 @@ def optical_distortion(x: float, y: float, gaze_x: float, gaze_y: float, strengt
 
 def cube_figure(
     samples: List[GazeSample],
-    grid_n: int = 18,
+    grid_n: int = DEFAULT_GRID_N,
     optical_strength: float = 0.34,
     quat_strength: float = 0.58,
 ) -> go.Figure:
@@ -493,7 +471,7 @@ def cube_figure(
     )
 
     fig.update_layout(
-        title="Cubo 3D com microspontos, rotação por quaternion e ilusão óptica",
+        title="Cubo 3D com microspontos, quaternions e ilusão óptica",
         height=620,
         margin=dict(l=0, r=0, t=42, b=0),
         scene=dict(
@@ -524,7 +502,7 @@ def heatmap_figure(samples: List[GazeSample], n: int = 42) -> go.Figure:
 # =========================================================
 # ANÁLISE
 # =========================================================
-def summarize_samples(samples: List[GazeSample], grid_n: int = 18) -> dict:
+def summarize_samples(samples: List[GazeSample], grid_n: int = DEFAULT_GRID_N) -> dict:
     if not samples:
         return {
             "duration_s": 0.0,
@@ -582,7 +560,7 @@ def interpret_summary(summary: dict) -> str:
 
 
 # =========================================================
-# EXPORTAÇÃO DE IMAGENS PARA PDF
+# EXPORTAÇÃO PDF
 # =========================================================
 def save_heatmap_png(samples: List[GazeSample], path: str, n: int = 42):
     heat = np.zeros((n, n), dtype=np.float32)
@@ -601,7 +579,7 @@ def save_heatmap_png(samples: List[GazeSample], path: str, n: int = 42):
 def save_cube_projection_png(
     samples: List[GazeSample],
     path: str,
-    grid_n: int = 18,
+    grid_n: int = DEFAULT_GRID_N,
     optical_strength: float = 0.34,
     quat_strength: float = 0.58,
 ):
@@ -744,57 +722,73 @@ def generate_pdf(samples: List[GazeSample], frame_bgr: Optional[np.ndarray]) -> 
 
 
 # =========================================================
-# INTERFACE
+# UI
 # =========================================================
-st.title("👁️ Simulacro — Tracking 3D, Quaternions, Heatmap e PDF")
-st.caption("Versão compatível com Streamlit Cloud sem MediaPipe.")
+st.title("👁️ Simulacro — Tracking 3D Snapshot + Quaternions + PDF")
+st.caption("Versão estável para Streamlit Cloud sem MediaPipe e sem streamlit-webrtc.")
 
 with st.sidebar:
     st.header("Controles")
-    grid_n = st.slider("Resolução do cubo", 10, 28, 18)
+    grid_n = st.slider("Resolução do cubo", 10, 28, DEFAULT_GRID_N)
     optical_strength = st.slider("Força da ilusão óptica", 0.00, 0.80, 0.34, 0.01)
     quat_strength = st.slider("Força do quaternion", 0.00, 1.20, 0.58, 0.01)
-    shared.max_samples = st.slider("Máximo de amostras", 500, 12000, DEFAULT_MAX_SAMPLES, 500)
 
     if st.button("Iniciar nova sessão", width="stretch"):
-        shared.samples = []
+        st.session_state.samples = []
+        st.session_state.blink_count = 0
+        st.session_state.last_frame_bgr = None
+        st.session_state.last_processed_hash = None
+        st.session_state.prev_eye_state = "open"
+        st.session_state.session_started_at = time.time()
         st.success("Sessão reiniciada.")
 
     if st.button("Limpar dados", width="stretch"):
-        shared.samples = []
+        st.session_state.samples = []
+        st.session_state.blink_count = 0
         st.warning("Dados removidos.")
 
-cam_col, vis_col = st.columns([1.0, 1.15])
+left, right = st.columns([1.0, 1.15])
 
-with cam_col:
-    st.subheader("Webcam e tracking")
-    webrtc_streamer(
-        key="simulacro-eye-tracking",
-        mode=WebRtcMode.SENDRECV,
-        media_stream_constraints={"video": {"width": FRAME_W, "height": FRAME_H}, "audio": False},
-        video_processor_factory=EyeTrackingProcessor,
-        async_processing=True,
-    )
+with left:
+    st.subheader("Captura da câmera")
+    st.markdown("Use a câmera abaixo e faça capturas sucessivas para acumular a sessão.")
+    camera_file = st.camera_input("Tirar foto para análise")
 
-    metrics = shared.latest_metrics
+    if camera_file is not None:
+        file_bytes = camera_file.getvalue()
+        current_hash = hash(file_bytes)
+
+        if st.session_state.session_started_at is None:
+            st.session_state.session_started_at = time.time()
+
+        if current_hash != st.session_state.last_processed_hash:
+            pil_img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+            img_bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+            processed = process_snapshot(img_bgr)
+            st.session_state.last_processed_hash = current_hash
+            st.image(cv2.cvtColor(processed, cv2.COLOR_BGR2RGB), caption="Frame processado", width="stretch")
+        elif st.session_state.last_frame_bgr is not None:
+            st.image(cv2.cvtColor(st.session_state.last_frame_bgr, cv2.COLOR_BGR2RGB), caption="Último frame processado", width="stretch")
+
+    metrics = st.session_state.last_metrics
     a, b, c, d = st.columns(4)
     a.metric("Rosto", "OK" if metrics["face_found"] else "—")
-    b.metric("Piscadas", metrics["blink_count"])
-    c.metric("Amostras", metrics["samples"])
+    b.metric("Piscadas", st.session_state.blink_count)
+    c.metric("Amostras", metrics["sample_count"])
     d.metric("Roll", f"{metrics['roll_deg']:.1f}°")
 
     st.write(
         {
-            "gaze_x_norm": round(metrics["gaze_x"], 4),
-            "gaze_y_norm": round(metrics["gaze_y"], 4),
+            "gaze_x_norm": round(metrics["gaze_x_norm"], 4),
+            "gaze_y_norm": round(metrics["gaze_y_norm"], 4),
             "velocity": round(metrics["velocity"], 4),
         }
     )
 
-with vis_col:
+with right:
     st.subheader("Cubo 3D com microspontos")
     fig3d = cube_figure(
-        shared.samples,
+        st.session_state.samples,
         grid_n=grid_n,
         optical_strength=optical_strength,
         quat_strength=quat_strength,
@@ -805,20 +799,20 @@ heat_col, data_col = st.columns([1.0, 1.0])
 
 with heat_col:
     st.subheader("Mapa de calor")
-    st.plotly_chart(heatmap_figure(shared.samples), width="stretch")
+    st.plotly_chart(heatmap_figure(st.session_state.samples), width="stretch")
 
 with data_col:
     st.subheader("Amostras recentes")
-    if shared.samples:
-        df = pd.DataFrame([asdict(s) for s in shared.samples[-25:]])
+    if st.session_state.samples:
+        df = pd.DataFrame([asdict(s) for s in st.session_state.samples[-25:]])
         st.dataframe(df, width="stretch", height=370)
     else:
-        st.info("Ainda sem amostras. Autorize a câmera e olhe para a tela.")
+        st.info("Ainda sem amostras. Tire fotos sucessivas com a câmera para acumular o tracking.")
 
 st.markdown("---")
 st.subheader("Análise da sessão")
 
-summary = summarize_samples(shared.samples, grid_n=grid_n)
+summary = summarize_samples(st.session_state.samples, grid_n=grid_n)
 interp = interpret_summary(summary)
 
 m1, m2, m3, m4, m5 = st.columns(5)
@@ -830,7 +824,7 @@ m5.metric("Velocidade média", f"{summary['avg_velocity']:.3f}")
 
 st.write(interp)
 
-pdf_bytes = generate_pdf(shared.samples, shared.latest_frame_bgr)
+pdf_bytes = generate_pdf(st.session_state.samples, st.session_state.last_frame_bgr)
 st.download_button(
     "📄 Baixar relatório PDF",
     data=pdf_bytes,
@@ -842,10 +836,10 @@ st.download_button(
 with st.expander("Notas técnicas"):
     st.markdown(
         """
-- Esta versão evita o MediaPipe porque o teu ambiente do Streamlit Cloud está em Python 3.13.
-- O tracking ocular aqui é **inicial**, com OpenCV clássico.
-- O cubo usa **quaternions** para rotação e **distorção óptica** nos microspontos.
-- O PDF exporta o **mapa de calor**, a **projeção do cubo** e o **último frame**.
-- Próxima melhoria ideal: **calibração de 5 pontos** e **modelo facial mais robusto**.
+- Esta versão foi feita para ser **mais estável no Streamlit Cloud**.
+- O tracking é **inicial** e baseado em OpenCV clássico com snapshots da câmera.
+- O cubo usa **quaternions** e **distorção óptica**.
+- O PDF exporta **heatmap**, **projeção do cubo** e **último frame**.
+- Próxima melhoria ideal: calibração de 5 pontos e componente frontend dedicado para vídeo contínuo.
         """
     )
