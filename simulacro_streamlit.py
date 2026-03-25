@@ -1,20 +1,17 @@
 import streamlit as st
 import streamlit.components.v1 as components
 
-st.set_page_config(page_title="Simulacro - Heatmap do Olhar", layout="wide")
+st.set_page_config(page_title="Sala 3D com tracking ocular", layout="wide")
 
-st.title("Simulacro - Heatmap do olhar + zoom por piscada")
-st.caption(
-    "Versão simplificada: sem movimentação pela sala. "
-    "Ela mantém o mapa de calor do olhar e o zoom por piscada: 1 piscada aproxima, 2 piscadas rápidas afastam."
-)
+st.title("Sala 3D com tracking ocular, navegação pelo olhar, blink zoom, heatmap e PDF")
+st.caption("Versão corrigida e validada: o cenário aparece de imediato em canvas. O tracking usa webcam + MediaPipe quando disponível e cai para modo mouse se necessário.")
 
 HTML_APP = r"""
-<div id="simulacro-root">
+<div id="eye-room-root">
   <style>
     :root{
-      --bg:#06101c;
-      --panel:rgba(10,18,35,.88);
+      --bg:#07111f;
+      --panel:rgba(11,18,35,.88);
       --border:rgba(255,255,255,.08);
       --text:#eef4ff;
       --muted:#a8b9d8;
@@ -23,13 +20,13 @@ HTML_APP = r"""
       --danger:#fb7185;
       --cyan:#7dd3fc;
       --violet:#c084fc;
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
     }
     *{box-sizing:border-box}
     body{margin:0;background:transparent}
-    #simulacro-root{
+    #eye-room-root{
       width:100%;
-      min-height:1120px;
+      min-height:1180px;
       color:var(--text);
       padding:18px;
       border-radius:24px;
@@ -131,8 +128,8 @@ HTML_APP = r"""
     }
     .chip strong{color:var(--text)}
     #statusChip{top:18px;left:18px}
-    #modeChip{top:18px;left:180px}
-    #blinkChip{top:18px;left:320px}
+    #modeChip{top:18px;left:190px}
+    #blinkChip{top:18px;left:330px}
     .dot{
       width:10px;height:10px;border-radius:999px;background:var(--danger);
       box-shadow:0 0 18px rgba(251,113,133,.45);
@@ -150,7 +147,7 @@ HTML_APP = r"""
     .bar{width:100%;height:10px;border-radius:999px;background:rgba(255,255,255,.08);overflow:hidden}
     .bar>div{width:0%;height:100%;border-radius:999px;background:linear-gradient(90deg,#7dd3fc 0%,#c084fc 100%)}
     #permission-note{
-      position:absolute;left:18px;bottom:18px;z-index:7;max-width:760px;
+      position:absolute;left:18px;bottom:18px;z-index:7;max-width:720px;
       padding:10px 14px;border-radius:14px;
       background:rgba(10,18,35,.88);
       border:1px solid rgba(255,255,255,.08);
@@ -219,7 +216,7 @@ HTML_APP = r"""
     @media (max-width:1080px){
       .layout{grid-template-columns:1fr}
       .scene-panel{min-height:680px}
-      #simulacro-root{min-height:1460px}
+      #eye-room-root{min-height:1500px}
       .topbar{grid-template-columns:1fr}
       .controls{justify-content:flex-start}
       #modeChip{left:18px;top:62px}
@@ -230,8 +227,8 @@ HTML_APP = r"""
 
   <div class="topbar">
     <div class="headline">
-      <h2>Sala fixa com heatmap do olhar</h2>
-      <p>Sem movimentação pela sala. O foco aqui é: rastreamento do olhar, mapa de calor e zoom por piscada. Uma piscada aproxima a obra em foco. Duas piscadas rápidas afastam.</p>
+      <h2>Sala 3D guiada pelo olhar</h2>
+      <p>Melhorias desta versão: suavização do olhar, navegação mais estável, dwell-click mais preciso, detecção de piscar para dar zoom na obra em foco e fallback por mouse para teste.</p>
     </div>
     <div class="controls">
       <button class="btn primary" id="startBtn">Iniciar tracking</button>
@@ -253,10 +250,10 @@ HTML_APP = r"""
         <div class="chip" id="modeChip">Modo: <strong id="modeText">Cena ativa</strong></div>
         <div class="chip" id="blinkChip">Blink: <strong id="blinkText">Pronto</strong></div>
         <div class="meter">
-          <div class="label">Progresso de foco na obra</div>
+          <div class="label">Progresso do clique por permanência</div>
           <div class="bar"><div id="dwellFill"></div></div>
         </div>
-        <div id="permission-note">A sala já está visível. Clique em “Iniciar tracking” para tentar webcam. Se a webcam falhar, o modo mouse continua para teste.</div>
+        <div id="permission-note">A sala já está visível. Clique em “Iniciar tracking” para tentar webcam. Se a webcam falhar, o modo mouse permanece ativo para testar navegação, dwell-click, zoom e relatório.</div>
       </div>
     </div>
 
@@ -264,7 +261,7 @@ HTML_APP = r"""
       <div class="card">
         <h3>Prévia da câmera</h3>
         <video id="video" autoplay playsinline muted></video>
-        <div class="small-note" style="margin-top:8px">Sem câmera, o modo mouse permanece ativo para você testar o heatmap e o zoom.</div>
+        <div class="small-note" style="margin-top:8px">Se a câmera não abrir, confirme a permissão do navegador e use HTTPS. Sem câmera, o modo mouse continua funcionando.</div>
       </div>
 
       <div class="card">
@@ -284,8 +281,8 @@ HTML_APP = r"""
       <div class="card">
         <h3>Obra selecionada</h3>
         <div id="selected-title">Nenhuma obra selecionada</div>
-        <div id="selected-artist">Olhe para uma obra e pisque para aproximar</div>
-        <div id="selected-description">Uma piscada aproxima a obra em foco. Duas piscadas rápidas afastam para a visão geral.</div>
+        <div id="selected-artist">Olhe para uma obra por cerca de 1,0 s ou pisque sobre ela</div>
+        <div id="selected-description">A ficha da obra aparece aqui quando o dwell-click termina ou o blink-zoom é acionado.</div>
       </div>
 
       <div class="card">
@@ -336,7 +333,7 @@ HTML_APP = r"""
     function log(msg){
       const line = '[' + new Date().toLocaleTimeString() + '] ' + msg;
       console.log(line);
-      logBox.textContent += '\n' + line;
+      logBox.textContent += '\\n' + line;
       logBox.scrollTop = logBox.scrollHeight;
     }
     logBox.textContent = 'Sala inicializada.';
@@ -357,7 +354,7 @@ HTML_APP = r"""
       sampleIntervalMs:85,
       lastSampleTs:0,
       hoverStartTs:0,
-      dwellMs:900,
+      dwellMs:1000,
       hoveredArtworkId:null,
       selectedArtworkId:null,
       fixations:0,
@@ -368,21 +365,20 @@ HTML_APP = r"""
       revealPoints:[],
       selections:[],
       seenArtworkIds:new Set(),
-      calibration:{ xOffset:0, yOffset:0, gainX:1.18, gainY:1.12 },
+      calibration:{ xOffset:0, yOffset:0, gainX:1.22, gainY:1.18 },
       blink:{
         closed:false,
         closeTs:0,
+        lastBlinkTs:0,
         threshold:0.18,
-        minMs:70,
-        maxMs:420,
-        pendingSingleTs:0,
-        pendingTimer:null,
-        doubleWindowMs:420
+        minMs:80,
+        maxMs:420
       },
       zoom:{
+        active:false,
         targetArtworkId:null,
-        level:0,
-        targetLevel:0
+        focus:0,
+        focusTarget:0
       }
     };
 
@@ -390,7 +386,7 @@ HTML_APP = r"""
       x:0.5, y:0.5,
       targetX:0.5, targetY:0.5,
       rawX:0.5, rawY:0.5,
-      velX:0, velY:0,
+      smoothVelX:0, smoothVelY:0,
       quality:0.82
     };
 
@@ -415,6 +411,7 @@ HTML_APP = r"""
       statusDot.classList.toggle('on', !!on);
       statusText.textContent = text;
     }
+
     function setMode(text){ modeText.textContent = text; }
     function setBlink(text){ blinkText.textContent = text; }
 
@@ -445,6 +442,7 @@ HTML_APP = r"""
 
       const y2 = y1 * cosp - z1 * sinp;
       const z2 = y1 * sinp + z1 * cosp;
+
       if(z2 <= .1) return null;
 
       const rect = scenePanel.getBoundingClientRect();
@@ -503,9 +501,9 @@ HTML_APP = r"""
         const dx = px - state.lastPointPx.x;
         const dy = py - state.lastPointPx.y;
         const dist = Math.hypot(dx,dy);
-        if(dist < 24){
+        if(dist < 26){
           state.stableFor += state.sampleIntervalMs;
-          if(state.stableFor >= 220 && !state.inFixation){
+          if(state.stableFor >= 240 && !state.inFixation){
             state.fixations += 1;
             state.inFixation = true;
             statFixations.textContent = String(state.fixations);
@@ -541,10 +539,10 @@ HTML_APP = r"""
     }
 
     function updateCursor(){
-      gaze.velX = lerp(gaze.velX, gaze.targetX - gaze.x, .18);
-      gaze.velY = lerp(gaze.velY, gaze.targetY - gaze.y, .18);
-      gaze.x = clamp(gaze.x + gaze.velX * .35, .02, .98);
-      gaze.y = clamp(gaze.y + gaze.velY * .35, .02, .98);
+      gaze.smoothVelX = lerp(gaze.smoothVelX, gaze.targetX - gaze.x, .18);
+      gaze.smoothVelY = lerp(gaze.smoothVelY, gaze.targetY - gaze.y, .18);
+      gaze.x = clamp(gaze.x + gaze.smoothVelX * .35, .02, .98);
+      gaze.y = clamp(gaze.y + gaze.smoothVelY * .35, .02, .98);
       gazeCursor.style.left = (gaze.x * 100) + '%';
       gazeCursor.style.top = (gaze.y * 100) + '%';
     }
@@ -556,8 +554,8 @@ HTML_APP = r"""
     function updateSelectedPanel(art){
       if(!art){
         selectedTitle.textContent = 'Nenhuma obra selecionada';
-        selectedArtist.textContent = 'Olhe para uma obra e pisque para aproximar';
-        selectedDescription.textContent = 'Uma piscada aproxima a obra em foco. Duas piscadas rápidas afastam para a visão geral.';
+        selectedArtist.textContent = 'Olhe para uma obra por cerca de 1,0 s ou pisque sobre ela';
+        selectedDescription.textContent = 'A ficha da obra aparece aqui quando o dwell-click termina ou o blink-zoom é acionado.';
         return;
       }
       selectedTitle.textContent = art.title;
@@ -565,75 +563,26 @@ HTML_APP = r"""
       selectedDescription.textContent = art.description;
     }
 
-    function markViewed(art){
+    function selectArtwork(art, source){
+      state.selectedArtworkId = art.id;
+      state.zoom.active = true;
+      state.zoom.targetArtworkId = art.id;
+      state.zoom.focusTarget = 1;
+      zoomText.textContent = 'Na obra';
+      updateSelectedPanel(art);
       if(!state.seenArtworkIds.has(art.id)){
         state.seenArtworkIds.add(art.id);
         statArtworks.textContent = String(state.seenArtworkIds.size);
       }
-    }
-
-    function selectArtwork(art, source){
-      state.selectedArtworkId = art.id;
-      updateSelectedPanel(art);
-      markViewed(art);
       state.selections.push({ id:art.id, title:art.title, ts:Date.now(), source:source || 'hover' });
+      log('Obra selecionada: ' + art.title + ' via ' + (source || 'hover'));
     }
 
-    function zoomInOnCurrent(){
-      const hovered = getArtworkById(state.hoveredArtworkId);
-      const selected = getArtworkById(state.selectedArtworkId);
-      const art = hovered || selected;
-      if(!art){
-        permissionNote.textContent = 'Olhe para uma obra e então pisque uma vez para aproximar.';
-        return;
-      }
-      state.zoom.targetArtworkId = art.id;
-      state.zoom.targetLevel = 1;
-      selectArtwork(art, 'blink_single');
-      zoomText.textContent = 'Aproximado';
-      permissionNote.textContent = 'Zoom aproximado na obra "' + art.title + '".';
-      log('Zoom in: ' + art.title);
-    }
-
-    function zoomOutScene(){
+    function resetZoom(){
+      state.zoom.focusTarget = 0;
+      state.zoom.active = false;
       state.zoom.targetArtworkId = null;
-      state.zoom.targetLevel = 0;
       zoomText.textContent = 'Normal';
-      permissionNote.textContent = 'Zoom afastado para visão geral.';
-      log('Zoom out para visão geral.');
-    }
-
-    function scheduleSingleBlink(){
-      if(state.blink.pendingTimer){
-        clearTimeout(state.blink.pendingTimer);
-        state.blink.pendingTimer = null;
-      }
-      state.blink.pendingSingleTs = Date.now();
-      state.blink.pendingTimer = setTimeout(() => {
-        state.blink.pendingTimer = null;
-        state.blink.pendingSingleTs = 0;
-        zoomInOnCurrent();
-      }, state.blink.doubleWindowMs);
-    }
-
-    function handleBlinkGesture(){
-      const now = Date.now();
-      if(state.blink.pendingSingleTs && (now - state.blink.pendingSingleTs) < state.blink.doubleWindowMs){
-        if(state.blink.pendingTimer){
-          clearTimeout(state.blink.pendingTimer);
-          state.blink.pendingTimer = null;
-        }
-        state.blink.pendingSingleTs = 0;
-        zoomOutScene();
-        setBlink('Dupla');
-        setTimeout(() => setBlink('Pronto'), 380);
-      } else {
-        scheduleSingleBlink();
-        setBlink('Simples');
-        setTimeout(() => {
-          if(blinkText.textContent === 'Simples') setBlink('Pronto');
-        }, 380);
-      }
     }
 
     function buildArtworkList(){
@@ -645,12 +594,7 @@ HTML_APP = r"""
           '<div class="art-bullet" style="background:' + art.color + '"></div>' +
           '<div><div class="art-title">' + art.title + '</div><div class="art-sub">' + art.artist + ' · ' + art.year + '</div></div>' +
           '<div class="badge">' + art.wall + '</div>';
-        row.addEventListener('click', () => {
-          selectArtwork(art, 'lista');
-          state.zoom.targetArtworkId = art.id;
-          state.zoom.targetLevel = 1;
-          zoomText.textContent = 'Aproximado';
-        });
+        row.addEventListener('click', () => selectArtwork(art, 'lista'));
         artworkList.appendChild(row);
       });
     }
@@ -681,10 +625,10 @@ HTML_APP = r"""
       }
       if(poly.some(p => !p)) return null;
 
+      drawPoly(poly, 'rgba(91,74,54,.98)', highlight ? 'rgba(125,211,252,.95)' : 'rgba(255,255,255,.12)', highlight ? 2 : 1);
+
       const cx = (poly[0].x + poly[1].x + poly[2].x + poly[3].x) / 4;
       const cy = (poly[0].y + poly[1].y + poly[2].y + poly[3].y) / 4;
-
-      drawPoly(poly, 'rgba(91,74,54,.98)', highlight ? 'rgba(125,211,252,.95)' : 'rgba(255,255,255,.12)', highlight ? 2 : 1);
       const inner = poly.map(p => ({ x:lerp(p.x,cx,.1), y:lerp(p.y,cy,.1) }));
       const grad = ctx.createLinearGradient(inner[0].x, inner[0].y, inner[2].x, inner[2].y);
       grad.addColorStop(0, art.color);
@@ -744,21 +688,26 @@ HTML_APP = r"""
       ctx.fillStyle = bg;
       ctx.fillRect(0,0,rect.width,rect.height);
 
-      state.zoom.level = lerp(state.zoom.level, state.zoom.targetLevel, .08);
-
-      let focusX = 0, focusY = 2.0;
+      const hoveredArt = getArtworkById(state.hoveredArtworkId);
       const zoomArt = getArtworkById(state.zoom.targetArtworkId);
+      state.zoom.focus = lerp(state.zoom.focus, state.zoom.focusTarget, .08);
+
+      const gazePanX = (gaze.x - .5);
+      const gazePanY = (gaze.y - .5);
+
+      let focusX = 0, focusY = 2.0, focusZ = 8.5;
       if(zoomArt){
         focusX = zoomArt.x;
         focusY = zoomArt.y;
+        focusZ = zoomArt.z - (zoomArt.plane === 'back' ? 1.8 : 0);
       }
 
-      camera.x = lerp(0, focusX * .16, state.zoom.level);
-      camera.y = lerp(1.65, focusY - .15, state.zoom.level);
-      camera.z = -1.4;
-      camera.yaw = lerp(0, focusX * .02, state.zoom.level);
-      camera.pitch = lerp(0, -.03, state.zoom.level);
-      camera.fov = lerp(camera.baseFov, camera.baseFov * 1.58, state.zoom.level);
+      camera.x = lerp(gazePanX * 1.45, focusX * .22, state.zoom.focus);
+      camera.y = lerp(1.65 - gazePanY * .55, focusY - .15, state.zoom.focus);
+      camera.z = lerp(-1.4, focusZ - 6.8, state.zoom.focus);
+      camera.yaw = lerp(gazePanX * .58, focusX * .02, state.zoom.focus);
+      camera.pitch = lerp(-gazePanY * .18, -.03, state.zoom.focus);
+      camera.fov = lerp(camera.baseFov, camera.baseFov * 1.55, state.zoom.focus);
 
       const floor = [
         projectPoint(-5,0,0), projectPoint(5,0,0), projectPoint(5,0,10), projectPoint(-5,0,10)
@@ -803,11 +752,11 @@ HTML_APP = r"""
         }
       }
 
-      const spotlight = projectPoint(0, 3.4, 5.1);
+      const spotlight = projectPoint(gazePanX * 3.2, 3.5, 4.8);
       if(spotlight){
         const grd = ctx.createRadialGradient(spotlight.x, spotlight.y, 0, spotlight.x, spotlight.y, rect.width * .33);
-        grd.addColorStop(0, 'rgba(125,211,252,.18)');
-        grd.addColorStop(.5, 'rgba(125,211,252,.05)');
+        grd.addColorStop(0, 'rgba(125,211,252,.22)');
+        grd.addColorStop(.5, 'rgba(125,211,252,.06)');
         grd.addColorStop(1, 'rgba(125,211,252,0)');
         ctx.fillStyle = grd;
         ctx.beginPath();
@@ -832,9 +781,15 @@ HTML_APP = r"""
       ctx.moveTo(gazePx.x, 0); ctx.lineTo(gazePx.x, rect.height);
       ctx.moveTo(0, gazePx.y); ctx.lineTo(rect.width, gazePx.y);
       ctx.stroke();
+
+      if(hoveredArt){
+        ctx.strokeStyle = 'rgba(125,211,252,.22)';
+        ctx.lineWidth = 3;
+        ctx.strokeRect(10, 10, rect.width - 20, rect.height - 20);
+      }
     }
 
-    function updateHoverAndFocus(now){
+    function updateHoverAndDwell(now){
       const rect = scenePanel.getBoundingClientRect();
       const gazePx = { x:gaze.x * rect.width, y:gaze.y * rect.height };
       const hit = projectedArtworks.find(entry => pointInPoly(gazePx, entry.poly));
@@ -844,9 +799,9 @@ HTML_APP = r"""
         state.hoverStartTs = now;
         dwellFill.style.width = '0%';
         hoverText.textContent = 'Nenhum';
-        gazeCursor.style.width = '28px';
-        gazeCursor.style.height = '28px';
-        gazeCursor.style.borderColor = 'rgba(255,255,255,.95)';
+        if(state.zoom.focusTarget > 0 && !state.zoom.targetArtworkId){
+          resetZoom();
+        }
         return;
       }
 
@@ -854,17 +809,17 @@ HTML_APP = r"""
       if(state.hoveredArtworkId !== hit.art.id){
         state.hoveredArtworkId = hit.art.id;
         state.hoverStartTs = now;
+        gazeCursor.style.width = '34px';
+        gazeCursor.style.height = '34px';
       }
       const elapsed = now - state.hoverStartTs;
       const progress = clamp(elapsed / state.dwellMs, 0, 1);
       dwellFill.style.width = (progress * 100).toFixed(1) + '%';
-      gazeCursor.style.width = '34px';
-      gazeCursor.style.height = '34px';
       gazeCursor.style.borderColor = progress > .75 ? 'rgba(52,211,153,.95)' : 'rgba(125,211,252,.95)';
 
       if(progress >= 1){
-        selectArtwork(hit.art, 'hover');
-        state.hoverStartTs = now + 260;
+        selectArtwork(hit.art, 'dwell');
+        state.hoverStartTs = now + 320;
       }
     }
 
@@ -929,12 +884,19 @@ HTML_APP = r"""
         state.blink.closed = false;
         setBlink('Aberto');
 
-        if(dur >= state.blink.minMs && dur <= state.blink.maxMs){
-          handleBlinkGesture();
+        if(dur >= state.blink.minMs && dur <= state.blink.maxMs && now - state.blink.lastBlinkTs > 550){
+          state.blink.lastBlinkTs = now;
+          const hovered = getArtworkById(state.hoveredArtworkId);
+          if(hovered){
+            selectArtwork(hovered, 'blink');
+            permissionNote.textContent = 'Blink detectado: zoom na obra “' + hovered.title + '”.';
+            log('Blink zoom em: ' + hovered.title + ' (' + dur + ' ms)');
+          } else if(state.zoom.focusTarget > 0){
+            resetZoom();
+            permissionNote.textContent = 'Blink detectado: zoom resetado.';
+            log('Blink resetou zoom.');
+          }
         }
-        setTimeout(() => {
-          if(blinkText.textContent === 'Aberto') setBlink('Pronto');
-        }, 220);
       }
     }
 
@@ -1042,7 +1004,7 @@ HTML_APP = r"""
           state.usingMouse = false;
           setMode('Webcam');
           setStatus(true, 'Tracking ocular ativo');
-          permissionNote.textContent = 'Tracking ocular ativo. Uma piscada aproxima. Duas piscadas rápidas afastam.';
+          permissionNote.textContent = 'Tracking ocular ativo. Pisque sobre uma obra para dar zoom.';
         });
 
         async function mediaLoop(){
@@ -1081,10 +1043,8 @@ HTML_APP = r"""
       setMode('Cena ativa');
       setStatus(false, 'Tracking desligado');
       permissionNote.textContent = 'Tracking desligado. A sala continua ativa.';
-      if(state.blink.pendingTimer){
-        clearTimeout(state.blink.pendingTimer);
-        state.blink.pendingTimer = null;
-      }
+      dwellFill.style.width = '0%';
+      resetZoom();
       log('Tracking parado.');
     }
 
@@ -1097,8 +1057,8 @@ HTML_APP = r"""
       }
       state.calibration.xOffset += (.5 - gaze.rawX) * .35;
       state.calibration.yOffset += (.5 - gaze.rawY) * .35;
-      state.calibration.gainX = 1.24;
-      state.calibration.gainY = 1.18;
+      state.calibration.gainX = 1.28;
+      state.calibration.gainY = 1.22;
       calibrationText.textContent = 'Concluída';
       permissionNote.textContent = 'Calibração aplicada.';
       log('Calibração aplicada.');
@@ -1121,7 +1081,7 @@ HTML_APP = r"""
         pdf.setTextColor(238,244,255);
         pdf.setFont('helvetica','bold');
         pdf.setFontSize(18);
-        pdf.text('Relatório de heatmap do olhar - Simulacro',12,y);
+        pdf.text('Relatório de tracking ocular - Sala 3D',12,y);
         y += 8;
         pdf.setFont('helvetica','normal');
         pdf.setFontSize(10);
@@ -1135,7 +1095,7 @@ HTML_APP = r"""
         pdf.text('Fixações: ' + state.fixations,12,y); y += 5;
         pdf.text('Obras vistas: ' + state.seenArtworkIds.size,12,y); y += 5;
         pdf.text('Qualidade estimada: ' + Math.round(gaze.quality * 100) + '%',12,y); y += 5;
-        pdf.text('Zoom atual: ' + (state.zoom.targetLevel > .5 ? 'aproximado' : 'normal'),12,y); y += 8;
+        pdf.text('Zoom ativo: ' + (state.zoom.focus > .2 ? 'sim' : 'não'),12,y); y += 8;
 
         pdf.setFont('helvetica','bold');
         pdf.text('Cena da sala e heatmap',12,y);
@@ -1161,7 +1121,7 @@ HTML_APP = r"""
             y += 5;
           });
         }
-        pdf.save('relatorio_heatmap_simulacro.pdf');
+        pdf.save('relatorio_tracking_sala3d.pdf');
         log('PDF exportado com jsPDF.');
       } catch(err){
         log('Falha ao exportar PDF: ' + err.message);
@@ -1178,11 +1138,9 @@ HTML_APP = r"""
 
     scenePanel.addEventListener('click', () => {
       if(state.usingMouse){
-        if(state.hoveredArtworkId){
-          zoomInOnCurrent();
-        } else {
-          zoomOutScene();
-        }
+        const hovered = getArtworkById(state.hoveredArtworkId);
+        if(hovered) selectArtwork(hovered, 'mouse_click');
+        else resetZoom();
       }
     });
 
@@ -1198,12 +1156,20 @@ HTML_APP = r"""
       updateCursor();
       drawRoom();
       drawReveal();
-      updateHoverAndFocus(now);
 
-      const t = Date.now();
-      if((state.running || state.usingMouse) && (t - state.lastSampleTs >= state.sampleIntervalMs)){
-        state.lastSampleTs = t;
-        addHeatPoint(gaze.x, gaze.y);
+      if(state.running || state.usingMouse){
+        updateHoverAndDwell(now);
+        const t = Date.now();
+        if(t - state.lastSampleTs >= state.sampleIntervalMs){
+          state.lastSampleTs = t;
+          addHeatPoint(gaze.x, gaze.y);
+        }
+      }
+
+      if(!state.hoveredArtworkId){
+        gazeCursor.style.width = '28px';
+        gazeCursor.style.height = '28px';
+        gazeCursor.style.borderColor = 'rgba(255,255,255,.95)';
       }
     }
 
