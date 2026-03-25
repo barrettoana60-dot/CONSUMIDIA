@@ -1,3 +1,4 @@
+
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -236,7 +237,7 @@ HTML_APP = r"""
     <div class="headline">
       <h2>Sala 3D guiada pelo rosto/cabeça</h2>
       <p>
-        Controle estável por pose facial: virar a cabeça gira a câmera, mover o rosto lateralmente desloca, aproximar o rosto da câmera anda para frente, afastar anda para trás. A navegação usa filtro temporal, amortecimento, zonas mortas e colisão simples para reduzir tremedeira. Duas piscadas rápidas alternam zoom in/zoom out.
+        Controle estável por pose facial: virar a cabeça gira a câmera de forma sutil, mover o rosto lateralmente desloca com amortecimento, aproximar o rosto da câmera anda para frente e afastar anda para trás. A navegação usa filtro temporal, zonas mortas, amortecimento extra e colisão simples para reduzir tremedeira. Uma piscada aproxima; duas piscadas rápidas afastam.
       </p>
     </div>
     <div class="controls">
@@ -258,7 +259,7 @@ HTML_APP = r"""
         <div id="cursor"></div>
         <div class="chip" id="statusChip"><span id="statusDot" class="dot"></span><span id="statusText">Aguardando</span></div>
         <div class="chip" id="modeChip">Modo: <strong id="modeText">Cena ativa</strong></div>
-        <div class="chip" id="blinkChip">Piscadas: <strong id="blinkText">0</strong></div>
+        <div class="chip" id="blinkChip">Blink: <strong id="blinkText">Pronto</strong></div>
         <div class="chip" id="walkChip">Andar: <strong id="walkText">Parado</strong></div>
         <div class="meter">
           <div class="label">Progresso do dwell-click</div>
@@ -297,7 +298,7 @@ HTML_APP = r"""
         <h3>Obra selecionada</h3>
         <div id="selected-title">Nenhuma obra selecionada</div>
         <div id="selected-artist">Pare sobre uma obra por ~0,9 s ou faça duas piscadas rápidas</div>
-        <div id="selected-description">A ficha da obra aparece aqui quando o dwell-click termina ou quando o zoom é acionado pela dupla piscada.</div>
+        <div id="selected-description">A ficha da obra aparece aqui quando o dwell-click termina ou quando o zoom é acionado por 1 piscada (aproxima) ou 2 piscadas rápidas (afasta).</div>
       </div>
 
       <div class="card">
@@ -420,6 +421,7 @@ HTML_APP = r"""
     function setMode(text){ modeText.textContent = text; }
     function setWalk(text){ walkText.textContent = text; }
     function setBlinkCount(n){ blinkText.textContent = String(n); }
+    function setBlinkStatus(t){ blinkText.textContent = t; }
 
     // ---------- Scene data ----------
     const room = { minX:-5.2, maxX:5.2, minZ:-1.0, maxZ:10.4 };
@@ -449,16 +451,16 @@ HTML_APP = r"""
     };
 
     const filters = {
-      smoothing:0.11,
-      deadX:0.08,
-      deadZ:0.08,
-      walkForce:1.45,
-      yawGain:1.08,
-      pitchGain:0.82,
-      strafeGain:0.86,
-      depthGain:2.1,
-      friction:0.92,
-      turnFriction:0.90
+      smoothing:0.08,
+      deadX:0.12,
+      deadZ:0.14,
+      walkForce:0.72,
+      yawGain:0.78,
+      pitchGain:0.52,
+      strafeGain:0.42,
+      depthGain:1.08,
+      friction:0.965,
+      turnFriction:0.955
     };
 
     const tracking = {
@@ -497,11 +499,11 @@ HTML_APP = r"""
         closed:false,
         closeTs:0,
         lastBlinkTs:0,
-        threshold:0.17,
-        minMs:70,
-        maxMs:380,
-        doubleWindowMs:520,
-        singleWindowMs:360,
+        threshold:0.175,
+        minMs:80,
+        maxMs:340,
+        doubleWindowMs:420,
+        singleWindowMs:240,
         pending:false,
         pendingTs:0,
         pendingTimer:null
@@ -857,7 +859,7 @@ HTML_APP = r"""
       if(!art){
         selectedTitle.textContent = 'Nenhuma obra selecionada';
         selectedArtist.textContent = 'Pare sobre uma obra por ~0,9 s ou faça duas piscadas rápidas';
-        selectedDescription.textContent = 'A ficha da obra aparece aqui quando o dwell-click termina ou quando o zoom é acionado pela dupla piscada.';
+        selectedDescription.textContent = 'A ficha da obra aparece aqui quando o dwell-click termina ou quando o zoom é acionado por 1 piscada (aproxima) ou 2 piscadas rápidas (afasta).';
         return;
       }
       selectedTitle.textContent = art.title;
@@ -1134,15 +1136,15 @@ HTML_APP = r"""
       if(openness < tracking.blink.threshold && !tracking.blink.closed){
         tracking.blink.closed = true;
         tracking.blink.closeTs = now;
+        setBlinkStatus('Fechado');
       } else if(openness >= tracking.blink.threshold && tracking.blink.closed){
         const dur = now - tracking.blink.closeTs;
         tracking.blink.closed = false;
+        setBlinkStatus('Aberto');
 
         if(dur >= tracking.blink.minMs && dur <= tracking.blink.maxMs){
           tracking.blink.count += 1;
-          setBlinkCount(tracking.blink.count);
 
-          // segunda piscada rápida = afasta
           if(tracking.blink.pending && now - tracking.blink.pendingTs <= tracking.blink.doubleWindowMs){
             if(tracking.blink.pendingTimer){
               clearTimeout(tracking.blink.pendingTimer);
@@ -1151,14 +1153,15 @@ HTML_APP = r"""
             tracking.blink.pending = false;
             tracking.blink.pendingTs = 0;
             tracking.blink.lastBlinkTs = now;
+            setBlinkStatus('2 piscadas');
             cycleZoom(-1, 'double_blink');
             return;
           }
 
-          // primeira piscada fica pendente; se não vier outra logo depois, aproxima
           tracking.blink.pending = true;
           tracking.blink.pendingTs = now;
           tracking.blink.lastBlinkTs = now;
+          setBlinkStatus('1 piscada…');
 
           if(tracking.blink.pendingTimer){
             clearTimeout(tracking.blink.pendingTimer);
@@ -1175,7 +1178,13 @@ HTML_APP = r"""
               selectArtwork(hovered, 'single_blink');
               tracking.zoomFocusArtworkId = hovered.id;
             }
+            setBlinkStatus('1 piscada');
             cycleZoom(1, 'single_blink');
+            setTimeout(() => {
+              if(!tracking.blink.closed && !tracking.blink.pending){
+                setBlinkStatus('Pronto');
+              }
+            }, 260);
           }, tracking.blink.singleWindowMs);
         }
       }
@@ -1211,40 +1220,40 @@ HTML_APP = r"""
     function applyTrackingToNavigation(dt){
       const cal = tracking.calibrationReady ? tracking.calibration : { centerX:.5, centerY:.5, depth:tracking.smoothed.depth || .34, yaw:0, pitch:0 };
 
-      const dx = applyDeadzone((tracking.smoothed.centerX - cal.centerX) * 2.2, filters.deadX);
-      const dy = applyDeadzone((tracking.smoothed.centerY - cal.centerY) * 2.0, 0.05);
-      const depthDelta = applyDeadzone((tracking.smoothed.depth - cal.depth) * 5.2, filters.deadZ);
-      const yawDelta = applyDeadzone((tracking.smoothed.yaw - cal.yaw), 0.05);
-      const pitchDelta = applyDeadzone((tracking.smoothed.pitch - cal.pitch), 0.05);
+      const dx = applyDeadzone((tracking.smoothed.centerX - cal.centerX) * 2.0, filters.deadX);
+      const dy = applyDeadzone((tracking.smoothed.centerY - cal.centerY) * 1.7, 0.07);
+      const depthDelta = applyDeadzone((tracking.smoothed.depth - cal.depth) * 4.2, filters.deadZ);
+      const yawDelta = applyDeadzone((tracking.smoothed.yaw - cal.yaw), 0.07);
+      const pitchDelta = applyDeadzone((tracking.smoothed.pitch - cal.pitch), 0.07);
 
-      // Cursor and focus: face horizontal position stays natural, yaw is inverted to avoid opposite turning
-      gaze.targetX = clamp(0.5 + dx * 0.62 - yawDelta * 0.14, 0.05, 0.95);
-      gaze.targetY = clamp(0.5 + dy * 0.48 + pitchDelta * 0.10, 0.08, 0.92);
+      // Cursor follows face position gently. Yaw now follows the same intuitive direction as the head.
+      gaze.targetX = clamp(0.5 + dx * 0.26 + yawDelta * 0.14, 0.10, 0.90);
+      gaze.targetY = clamp(0.5 + dy * 0.22 + pitchDelta * 0.06, 0.14, 0.86);
 
-      const zoomWalkFactor = tracking.zoomTarget > 0.2 ? 0.62 : 1.0;
+      const zoomWalkFactor = tracking.zoomTarget > 0.2 ? 0.72 : 1.0;
 
-      // Desired turn: invert yaw so turning face right rotates scene right
-      const desiredYawVel = ((-yawDelta * filters.yawGain) + (dx * 0.18)) * 0.050;
-      const desiredPitchVel = (-pitchDelta * filters.pitchGain) * 0.030;
+      // Turn more subtly and naturally.
+      const desiredYawVel = ((yawDelta * filters.yawGain) + (dx * 0.05)) * 0.016;
+      const desiredPitchVel = (-pitchDelta * filters.pitchGain) * 0.010;
 
-      camera.yawVel = lerp(camera.yawVel, desiredYawVel, 0.12);
-      camera.pitchVel = lerp(camera.pitchVel, desiredPitchVel, 0.10);
+      camera.yawVel = lerp(camera.yawVel, desiredYawVel, 0.08);
+      camera.pitchVel = lerp(camera.pitchVel, desiredPitchVel, 0.07);
 
-      // Real movement from face displacement and depth
-      const strafe = clamp(dx * filters.strafeGain, -1, 1);
-      const forward = clamp(depthDelta * filters.depthGain, -1, 1);
+      // Movement is mainly driven by face lateral position and depth, but much softer.
+      const strafe = clamp(dx * filters.strafeGain, -0.65, 0.65);
+      const forward = clamp(depthDelta * filters.depthGain, -0.75, 0.75);
 
       const sinY = Math.sin(camera.yaw);
       const cosY = Math.cos(camera.yaw);
 
-      const desiredVX = (strafe * cosY + forward * sinY) * filters.walkForce * 0.080 * zoomWalkFactor;
-      const desiredVZ = (-strafe * sinY + forward * cosY) * filters.walkForce * 0.080 * zoomWalkFactor;
+      const desiredVX = (strafe * cosY + forward * sinY) * filters.walkForce * 0.032 * zoomWalkFactor;
+      const desiredVZ = (-strafe * sinY + forward * cosY) * filters.walkForce * 0.032 * zoomWalkFactor;
 
-      camera.vx = lerp(camera.vx, desiredVX, 0.10);
-      camera.vz = lerp(camera.vz, desiredVZ, 0.10);
+      camera.vx = lerp(camera.vx, desiredVX, 0.07);
+      camera.vz = lerp(camera.vz, desiredVZ, 0.07);
 
-      camera.yaw = clamp(camera.yaw + camera.yawVel * dt * 60, -1.3, 1.3);
-      camera.pitch = clamp(camera.pitch + camera.pitchVel * dt * 60, -0.35, 0.35);
+      camera.yaw = clamp(camera.yaw + camera.yawVel * dt * 60, -1.15, 1.15);
+      camera.pitch = clamp(camera.pitch + camera.pitchVel * dt * 60, -0.24, 0.24);
       camera.x += camera.vx * dt * 60;
       camera.z += camera.vz * dt * 60;
 
@@ -1253,7 +1262,6 @@ HTML_APP = r"""
       camera.vx *= Math.pow(filters.friction, dt * 60);
       camera.vz *= Math.pow(filters.friction, dt * 60);
 
-      // Collisions / room bounds
       camera.x = clamp(camera.x, room.minX + 0.55, room.maxX - 0.55);
       camera.z = clamp(camera.z, room.minZ + 0.35, room.maxZ - 0.8);
 
@@ -1270,18 +1278,18 @@ HTML_APP = r"""
           const nz = dzo / Math.max(1e-6, d);
           camera.x = o.x + nx * o.r;
           camera.z = o.z + nz * o.r;
-          camera.vx *= 0.35;
-          camera.vz *= 0.35;
+          camera.vx *= 0.28;
+          camera.vz *= 0.28;
         }
       });
 
       const speed = Math.hypot(camera.vx, camera.vz);
       speedText.textContent = round2(speed);
-      if(speed < 0.004) setWalk('Parado');
-      else if(forward > 0.03) setWalk('Frente');
-      else if(forward < -0.03) setWalk('Trás');
-      else if(strafe > 0.03) setWalk('Direita');
-      else if(strafe < -0.03) setWalk('Esquerda');
+      if(speed < 0.0025) setWalk('Parado');
+      else if(forward > 0.04) setWalk('Frente');
+      else if(forward < -0.04) setWalk('Trás');
+      else if(strafe > 0.04) setWalk('Direita');
+      else if(strafe < -0.04) setWalk('Esquerda');
       else setWalk('Suave');
     }
 
@@ -1294,8 +1302,8 @@ HTML_APP = r"""
 
       const lookX = gaze.targetX - .5;
       const lookY = gaze.targetY - .5;
-      camera.yawVel += lookX * 0.0022;
-      camera.pitchVel += -lookY * 0.0012;
+      camera.yawVel += lookX * 0.0010;
+      camera.pitchVel += -lookY * 0.0006;
     });
 
     scenePanel.addEventListener('wheel', (ev) => {
