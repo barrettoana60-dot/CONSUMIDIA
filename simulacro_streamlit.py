@@ -1,7 +1,4 @@
-from pathlib import Path
-import zipfile
-
-app_code = r'''import streamlit as st
+import streamlit as st
 import streamlit.components.v1 as components
 
 st.set_page_config(page_title="Sala 3D com tracking ocular", layout="wide")
@@ -1193,50 +1190,3 @@ HTML_APP = r"""
 """
 
 components.html(HTML_APP, height=1280, scrolling=True)
-'''
-
-reqs = "streamlit>=1.36\n"
-
-readme = """# Sala 3D com tracking ocular - blink zoom
-
-Arquivos:
-- simulacro_streamlit_blink_zoom.py
-- requirements_blink_zoom.txt
-
-Rodar:
-pip install -r requirements_blink_zoom.txt
-streamlit run simulacro_streamlit_blink_zoom.py
-
-Novidades:
-- tracking ocular com suavização melhor
-- navegação pelo olhar mais estável
-- dwell-click mais rápido
-- blink zoom em obras
-- fallback por mouse
-"""
-
-base = Path("/mnt/data")
-py_path = base / "simulacro_streamlit_blink_zoom.py"
-req_path = base / "requirements_blink_zoom.txt"
-readme_path = base / "README_blink_zoom.md"
-zip_path = base / "simulacro_streamlit_blink_zoom.zip"
-
-py_path.write_text(app_code, encoding="utf-8")
-req_path.write_text(reqs, encoding="utf-8")
-readme_path.write_text(readme, encoding="utf-8")
-
-# validate syntax without creating pyc
-compile(app_code, str(py_path), "exec")
-
-if zip_path.exists():
-    zip_path.unlink()
-with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-    zf.write(py_path, arcname=py_path.name)
-    zf.write(req_path, arcname=req_path.name)
-    zf.write(readme_path, arcname=readme_path.name)
-
-print(py_path)
-print(req_path)
-print(readme_path)
-print(zip_path)
-print("Sintaxe validada.")
