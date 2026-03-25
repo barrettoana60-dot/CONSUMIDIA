@@ -7,7 +7,7 @@ st.title("Simulacro — navegação facial estável na sala 3D")
 st.caption(
     "Versão refeita para ficar mais estável: rastreamento por rosto/cabeça com filtros, "
     "movimentação fluida, zonas mortas, colisão simples, dwell-click, heatmap, mini mapa, "
-    "duas piscadas para zoom e fallback por mouse."
+    "1 piscada aproxima, 2 piscadas afastam, tracking facial mais estável e fallback por mouse."
 )
 
 HTML_APP = r"""
@@ -449,16 +449,16 @@ HTML_APP = r"""
     };
 
     const filters = {
-      smoothing:0.18,
-      deadX:0.05,
-      deadZ:0.04,
-      walkForce:1.0,
-      yawGain:1.2,
-      pitchGain:0.9,
-      strafeGain:1.05,
-      depthGain:1.45,
-      friction:0.86,
-      turnFriction:0.78
+      smoothing:0.11,
+      deadX:0.08,
+      deadZ:0.08,
+      walkForce:1.45,
+      yawGain:1.08,
+      pitchGain:0.82,
+      strafeGain:0.86,
+      depthGain:2.1,
+      friction:0.92,
+      turnFriction:0.90
     };
 
     const tracking = {
@@ -500,7 +500,11 @@ HTML_APP = r"""
         threshold:0.17,
         minMs:70,
         maxMs:380,
-        doubleWindowMs:650
+        doubleWindowMs:520,
+        singleWindowMs:360,
+        pending:false,
+        pendingTs:0,
+        pendingTimer:null
       },
       hoverStartTs:0,
       hoveredArtworkId:null,
@@ -974,16 +978,35 @@ HTML_APP = r"""
       log('Câmera resetada.');
     }
 
-    function cycleZoom(direction){
+    function cycleZoom(direction, source){
+      const prevStep = tracking.zoomStep;
       if(direction > 0){
         tracking.zoomStep = clamp(tracking.zoomStep + 1, 0, tracking.zoomLevels.length - 1);
       } else {
         tracking.zoomStep = clamp(tracking.zoomStep - 1, 0, tracking.zoomLevels.length - 1);
       }
+
+      const focusId = tracking.hoveredArtworkId || tracking.selectedArtworkId || tracking.zoomFocusArtworkId;
+      if(direction > 0 && focusId){
+        tracking.zoomFocusArtworkId = focusId;
+      }
+      if(direction < 0 && tracking.zoomStep === 0){
+        tracking.zoomFocusArtworkId = null;
+      }
+
       tracking.zoomTarget = tracking.zoomLevels[tracking.zoomStep];
-      zoomText.textContent = tracking.zoomStep === 0 ? 'Normal' : ('Nível ' + tracking.zoomStep);
-      permissionNote.textContent = direction > 0 ? 'Dupla piscada: aproximando.' : 'Dupla piscada: afastando.';
-      log(direction > 0 ? 'Zoom aproximado.' : 'Zoom afastado.');
+      zoomText.textContent =
+        tracking.zoomStep === 0 ? 'Normal' :
+        tracking.zoomStep === 1 ? 'Aproximado' : 'Muito próximo';
+
+      const label = source === 'single_blink' ? '1 piscada: aproximando.' :
+                    source === 'double_blink' ? '2 piscadas: afastando.' :
+                    (direction > 0 ? 'Aproximando.' : 'Afastando.');
+      permissionNote.textContent = label;
+
+      if(prevStep !== tracking.zoomStep){
+        log(direction > 0 ? 'Zoom aproximado.' : 'Zoom afastado.');
+      }
     }
 
     function updateHoverAndDwell(now){
@@ -1116,18 +1139,44 @@ HTML_APP = r"""
         tracking.blink.closed = false;
 
         if(dur >= tracking.blink.minMs && dur <= tracking.blink.maxMs){
-          if(now - tracking.blink.lastBlinkTs <= tracking.blink.doubleWindowMs){
-            tracking.blink.count += 2;
-            setBlinkCount(tracking.blink.count);
-            // alternate in/out on each double blink
-            const direction = tracking.zoomStep >= tracking.zoomLevels.length - 1 ? -1 : 1;
-            cycleZoom(direction);
-            tracking.blink.lastBlinkTs = 0;
-          } else {
+          tracking.blink.count += 1;
+          setBlinkCount(tracking.blink.count);
+
+          // segunda piscada rápida = afasta
+          if(tracking.blink.pending && now - tracking.blink.pendingTs <= tracking.blink.doubleWindowMs){
+            if(tracking.blink.pendingTimer){
+              clearTimeout(tracking.blink.pendingTimer);
+              tracking.blink.pendingTimer = null;
+            }
+            tracking.blink.pending = false;
+            tracking.blink.pendingTs = 0;
             tracking.blink.lastBlinkTs = now;
-            tracking.blink.count += 1;
-            setBlinkCount(tracking.blink.count);
+            cycleZoom(-1, 'double_blink');
+            return;
           }
+
+          // primeira piscada fica pendente; se não vier outra logo depois, aproxima
+          tracking.blink.pending = true;
+          tracking.blink.pendingTs = now;
+          tracking.blink.lastBlinkTs = now;
+
+          if(tracking.blink.pendingTimer){
+            clearTimeout(tracking.blink.pendingTimer);
+            tracking.blink.pendingTimer = null;
+          }
+
+          tracking.blink.pendingTimer = setTimeout(() => {
+            tracking.blink.pending = false;
+            tracking.blink.pendingTs = 0;
+            tracking.blink.pendingTimer = null;
+
+            const hovered = getArtworkById(tracking.hoveredArtworkId) || getArtworkById(tracking.selectedArtworkId);
+            if(hovered){
+              selectArtwork(hovered, 'single_blink');
+              tracking.zoomFocusArtworkId = hovered.id;
+            }
+            cycleZoom(1, 'single_blink');
+          }, tracking.blink.singleWindowMs);
         }
       }
     }
@@ -1162,50 +1211,55 @@ HTML_APP = r"""
     function applyTrackingToNavigation(dt){
       const cal = tracking.calibrationReady ? tracking.calibration : { centerX:.5, centerY:.5, depth:tracking.smoothed.depth || .34, yaw:0, pitch:0 };
 
-      const dx = applyDeadzone((tracking.smoothed.centerX - cal.centerX) * 2.4, filters.deadX);
-      const dy = applyDeadzone((tracking.smoothed.centerY - cal.centerY) * 2.2, 0.04);
-      const depthDelta = applyDeadzone((tracking.smoothed.depth - cal.depth) * 4.0, filters.deadZ);
-      const yawDelta = applyDeadzone((tracking.smoothed.yaw - cal.yaw), 0.04);
-      const pitchDelta = applyDeadzone((tracking.smoothed.pitch - cal.pitch), 0.04);
+      const dx = applyDeadzone((tracking.smoothed.centerX - cal.centerX) * 2.2, filters.deadX);
+      const dy = applyDeadzone((tracking.smoothed.centerY - cal.centerY) * 2.0, 0.05);
+      const depthDelta = applyDeadzone((tracking.smoothed.depth - cal.depth) * 5.2, filters.deadZ);
+      const yawDelta = applyDeadzone((tracking.smoothed.yaw - cal.yaw), 0.05);
+      const pitchDelta = applyDeadzone((tracking.smoothed.pitch - cal.pitch), 0.05);
 
-      // Gaze cursor follows head pose instead of iris
-      gaze.targetX = clamp(0.5 + dx * 0.55 + yawDelta * 0.15, 0.05, 0.95);
-      gaze.targetY = clamp(0.5 + dy * 0.52 + pitchDelta * 0.12, 0.08, 0.92);
+      // Cursor and focus: face horizontal position stays natural, yaw is inverted to avoid opposite turning
+      gaze.targetX = clamp(0.5 + dx * 0.62 - yawDelta * 0.14, 0.05, 0.95);
+      gaze.targetY = clamp(0.5 + dy * 0.48 + pitchDelta * 0.10, 0.08, 0.92);
 
-      // Camera turning
-      camera.yawVel += yawDelta * filters.yawGain * dt * 2.6;
-      camera.pitchVel += (-pitchDelta) * filters.pitchGain * dt * 1.6;
+      const zoomWalkFactor = tracking.zoomTarget > 0.2 ? 0.62 : 1.0;
 
-      // Movement based on face center and depth
-      // Strafe from face horizontal position
-      const strafe = dx * filters.strafeGain * filters.walkForce;
-      // Forward/back from face size (closer face => forward)
-      const forward = depthDelta * filters.depthGain * filters.walkForce;
+      // Desired turn: invert yaw so turning face right rotates scene right
+      const desiredYawVel = ((-yawDelta * filters.yawGain) + (dx * 0.18)) * 0.050;
+      const desiredPitchVel = (-pitchDelta * filters.pitchGain) * 0.030;
+
+      camera.yawVel = lerp(camera.yawVel, desiredYawVel, 0.12);
+      camera.pitchVel = lerp(camera.pitchVel, desiredPitchVel, 0.10);
+
+      // Real movement from face displacement and depth
+      const strafe = clamp(dx * filters.strafeGain, -1, 1);
+      const forward = clamp(depthDelta * filters.depthGain, -1, 1);
 
       const sinY = Math.sin(camera.yaw);
       const cosY = Math.cos(camera.yaw);
 
-      camera.vx += (strafe * cosY + forward * sinY) * dt * 1.25;
-      camera.vz += (-strafe * sinY + forward * cosY) * dt * 1.25;
+      const desiredVX = (strafe * cosY + forward * sinY) * filters.walkForce * 0.080 * zoomWalkFactor;
+      const desiredVZ = (-strafe * sinY + forward * cosY) * filters.walkForce * 0.080 * zoomWalkFactor;
+
+      camera.vx = lerp(camera.vx, desiredVX, 0.10);
+      camera.vz = lerp(camera.vz, desiredVZ, 0.10);
+
+      camera.yaw = clamp(camera.yaw + camera.yawVel * dt * 60, -1.3, 1.3);
+      camera.pitch = clamp(camera.pitch + camera.pitchVel * dt * 60, -0.35, 0.35);
+      camera.x += camera.vx * dt * 60;
+      camera.z += camera.vz * dt * 60;
 
       camera.yawVel *= Math.pow(filters.turnFriction, dt * 60);
       camera.pitchVel *= Math.pow(filters.turnFriction, dt * 60);
       camera.vx *= Math.pow(filters.friction, dt * 60);
       camera.vz *= Math.pow(filters.friction, dt * 60);
 
-      camera.yaw = clamp(camera.yaw + camera.yawVel, -1.3, 1.3);
-      camera.pitch = clamp(camera.pitch + camera.pitchVel, -0.35, 0.35);
-      camera.x += camera.vx;
-      camera.z += camera.vz;
-
       // Collisions / room bounds
       camera.x = clamp(camera.x, room.minX + 0.55, room.maxX - 0.55);
       camera.z = clamp(camera.z, room.minZ + 0.35, room.maxZ - 0.8);
 
-      // Simple collision around pedestals
       const obstacles = [
-        { x:-1.8, z:3.0, r:0.9 },
-        { x:1.8, z:3.35, r:0.9 }
+        { x:-1.8, z:3.0, r:0.95 },
+        { x:1.8, z:3.35, r:0.95 }
       ];
       obstacles.forEach(o => {
         const dxo = camera.x - o.x;
@@ -1216,18 +1270,18 @@ HTML_APP = r"""
           const nz = dzo / Math.max(1e-6, d);
           camera.x = o.x + nx * o.r;
           camera.z = o.z + nz * o.r;
-          camera.vx *= 0.45;
-          camera.vz *= 0.45;
+          camera.vx *= 0.35;
+          camera.vz *= 0.35;
         }
       });
 
       const speed = Math.hypot(camera.vx, camera.vz);
       speedText.textContent = round2(speed);
       if(speed < 0.004) setWalk('Parado');
-      else if(forward > 0.02) setWalk('Frente');
-      else if(forward < -0.02) setWalk('Trás');
-      else if(strafe > 0.02) setWalk('Direita');
-      else if(strafe < -0.02) setWalk('Esquerda');
+      else if(forward > 0.03) setWalk('Frente');
+      else if(forward < -0.03) setWalk('Trás');
+      else if(strafe > 0.03) setWalk('Direita');
+      else if(strafe < -0.03) setWalk('Esquerda');
       else setWalk('Suave');
     }
 
@@ -1330,7 +1384,7 @@ HTML_APP = r"""
           tracking.usingMouse = false;
           setMode('Webcam');
           setStatus(true, 'Tracking facial ativo');
-          permissionNote.textContent = 'Tracking facial ativo. Mantenha o rosto estável e use duas piscadas rápidas para alternar zoom.';
+          permissionNote.textContent = 'Tracking facial ativo. Mantenha o rosto estável e use 1 piscada aproxima e 2 piscadas rápidas afastam.';
         });
 
         async function mediaLoop(){
