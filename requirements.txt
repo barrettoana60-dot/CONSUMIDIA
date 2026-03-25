@@ -8,3 +8,5 @@ matplotlib==3.10.8
 reportlab==4.4.10
 av==16.1.0
 pillow==12.1.1
+streamlit>=1.55.0,<2.0.0
+packaging>=24.0
