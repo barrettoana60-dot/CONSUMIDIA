@@ -5,6 +5,7 @@ st.set_page_config(page_title="Sala 3D com tracking ocular", layout="wide")
 
 st.title("Sala 3D com tracking ocular, dwell-click, heatmap e PDF")
 st.caption("Versão estável: a sala 3D já aparece sem depender de Three.js. O tracking ocular tenta usar webcam + MediaPipe; se falhar, entra no modo mouse para teste.")
+st.warning("Se aparecer apenas ‘Falha ao iniciar’, você provavelmente ainda está rodando um arquivo antigo. Nesta versão, o motivo exato do erro aparece dentro da própria interface.")
 
 HTML_APP = r"""
 <div id="eye-room-root">
@@ -816,6 +817,21 @@ HTML_APP = r"""
         });
       }
 
+      async function loadScriptWithFallback(urls) {
+        let lastErr = null;
+        for (const url of urls) {
+          try {
+            await loadScript(url);
+            log('Biblioteca carregada: ' + url);
+            return url;
+          } catch (err) {
+            lastErr = err;
+            log('Tentativa falhou: ' + url);
+          }
+        }
+        throw lastErr || new Error('Nenhuma URL carregou.');
+      }
+
       async function startTracking() {
         log('Iniciar tracking clicado.');
         state.startedAt = state.startedAt || Date.now();
@@ -824,17 +840,36 @@ HTML_APP = r"""
         permissionNote.textContent = 'Tentando abrir webcam + tracking ocular…';
 
         try {
-          await loadScript('https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js');
+          if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+            throw new Error('getUserMedia não disponível neste navegador/ambiente.');
+          }
+
+          const loadedUrl = await loadScriptWithFallback([
+            'https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js',
+            'https://unpkg.com/@mediapipe/face_mesh/face_mesh.js'
+          ]);
           state.mediaPipeReady = true;
           log('MediaPipe carregado.');
 
-          state.stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: false });
+          state.stream = await navigator.mediaDevices.getUserMedia({
+            video: {
+              width: { ideal: 640 },
+              height: { ideal: 480 },
+              facingMode: 'user'
+            },
+            audio: false
+          });
           video.srcObject = state.stream;
           await video.play();
           log('Webcam aberta.');
 
           state.faceMesh = new window.FaceMesh({
-            locateFile: (file) => 'https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/' + file,
+            locateFile: (file) => {
+              if (loadedUrl.indexOf('unpkg.com') !== -1) {
+                return 'https://unpkg.com/@mediapipe/face_mesh/' + file;
+              }
+              return 'https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/' + file;
+            },
           });
           state.faceMesh.setOptions({
             maxNumFaces: 1,
@@ -895,8 +930,9 @@ HTML_APP = r"""
           state.usingMouse = true;
           modeText.textContent = 'Mouse';
           setStatus(true, 'Modo mouse ativo');
-          permissionNote.textContent = 'Não foi possível iniciar webcam/MediaPipe. O modo mouse ficou ativo para teste.';
-          log('Falha no tracking ocular: ' + err.message + ' | entrando no modo mouse.');
+          const reason = (err && (err.message || err.name)) ? (err.message || err.name) : String(err);
+          permissionNote.textContent = 'Tracking ocular não iniciou: ' + reason + '. O modo mouse ficou ativo para teste.';
+          log('Falha no tracking ocular: ' + reason + ' | entrando no modo mouse.');
         }
       }
 
