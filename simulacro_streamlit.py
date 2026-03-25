@@ -1,6 +1,4 @@
-from pathlib import Path
-
-app_code = r'''import streamlit as st
+import streamlit as st
 import streamlit.components.v1 as components
 
 st.set_page_config(page_title="Sala 3D com tracking ocular", layout="wide")
@@ -1035,18 +1033,3 @@ HTML_APP = r"""
 """
 
 components.html(HTML_APP, height=1250, scrolling=True)
-'''
-
-reqs = """streamlit>=1.36
-"""
-
-readme = """# Sala 3D com tracking ocular - versão corrigida
-
-## Arquivos
-- `app_streamlit_funcional.py`
-- `requirements_streamlit_funcional.txt`
-
-## Como rodar
-```bash
-pip install -r requirements_streamlit_funcional.txt
-streamlit run app_streamlit_funcional.py
