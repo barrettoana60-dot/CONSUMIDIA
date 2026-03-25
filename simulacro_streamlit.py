@@ -1,239 +1,60 @@
 import streamlit as st
 import streamlit.components.v1 as components
 
-st.set_page_config(page_title="Sala 3D com tracking ocular", layout="wide")
+st.set_page_config(page_title="Sala 3D com tracking facial", layout="wide")
 
-st.title("Sala 3D com tracking ocular, navegação pelo olhar, blink zoom, heatmap e PDF")
-st.caption("Versão corrigida e validada: o cenário aparece de imediato em canvas. O tracking usa webcam + MediaPipe quando disponível e cai para modo mouse se necessário.")
+st.title("Sala 3D com tracking facial, navegação, zoom por duas piscadas, heatmap e PDF")
+st.caption("Versão focada em rastreamento do rosto/cabeça: girar, andar, mirar, dwell-click, duplo piscar para aproximar/afastar e fallback por mouse.")
 
-HTML_APP = r"""
-<div id="eye-room-root">
+HTML_APP = r'''
+<div id="face-room-root">
   <style>
     :root{
-      --bg:#07111f;
-      --panel:rgba(11,18,35,.88);
-      --border:rgba(255,255,255,.08);
-      --text:#eef4ff;
-      --muted:#a8b9d8;
-      --ok:#34d399;
-      --warn:#fbbf24;
-      --danger:#fb7185;
-      --cyan:#7dd3fc;
-      --violet:#c084fc;
+      --bg:#07111f;--panel:rgba(11,18,35,.88);--border:rgba(255,255,255,.08);--text:#eef4ff;--muted:#a8b9d8;
+      --ok:#34d399;--warn:#fbbf24;--danger:#fb7185;--cyan:#7dd3fc;--violet:#c084fc;
       font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
     }
-    *{box-sizing:border-box}
-    body{margin:0;background:transparent}
-    #eye-room-root{
-      width:100%;
-      min-height:1180px;
-      color:var(--text);
-      padding:18px;
-      border-radius:24px;
-      overflow:hidden;
-      background:
-        radial-gradient(circle at top, rgba(81,120,255,.12), transparent 28%),
-        radial-gradient(circle at bottom right, rgba(194,120,255,.12), transparent 24%),
-        linear-gradient(180deg, #06101c 0%, #040812 100%);
-      border:1px solid rgba(255,255,255,.06);
-    }
-    .topbar{
-      display:grid;
-      grid-template-columns:1fr auto;
-      gap:16px;
-      align-items:center;
-      margin-bottom:16px;
-    }
-    .headline h2{
-      margin:0;
-      font-size:28px;
-      font-weight:800;
-    }
-    .headline p{
-      margin:8px 0 0;
-      color:var(--muted);
-      max-width:900px;
-      line-height:1.5;
-      font-size:14px;
-    }
-    .controls{
-      display:flex;
-      flex-wrap:wrap;
-      gap:10px;
-      justify-content:flex-end;
-    }
-    .btn{
-      border:1px solid rgba(255,255,255,.1);
-      background:linear-gradient(180deg, rgba(255,255,255,.12), rgba(255,255,255,.04));
-      color:var(--text);
-      padding:10px 14px;
-      border-radius:14px;
-      font-weight:700;
-      cursor:pointer;
-      transition:.2s ease;
-      box-shadow:0 8px 22px rgba(0,0,0,.18);
-      user-select:none;
-    }
-    .btn:hover{transform:translateY(-1px);border-color:rgba(125,211,252,.45)}
-    .btn.primary{background:linear-gradient(180deg, rgba(125,211,252,.28), rgba(125,211,252,.12));border-color:rgba(125,211,252,.35)}
-    .btn.warn{background:linear-gradient(180deg, rgba(251,191,36,.25), rgba(251,191,36,.08));border-color:rgba(251,191,36,.35)}
-    .btn.subtle{background:linear-gradient(180deg, rgba(192,132,252,.18), rgba(192,132,252,.06));border-color:rgba(192,132,252,.3)}
-    .layout{
-      display:grid;
-      grid-template-columns:minmax(0,1.72fr) minmax(330px,.78fr);
-      gap:16px;
-      min-height:980px;
-    }
-    .scene-panel,.sidebar{
-      background:linear-gradient(180deg, rgba(255,255,255,.03), rgba(255,255,255,.015));
-      border:1px solid var(--border);
-      border-radius:22px;
-      overflow:hidden;
-      position:relative;
-      backdrop-filter:blur(18px);
-    }
-    .scene-panel{
-      min-height:920px;
-      box-shadow:inset 0 1px 0 rgba(255,255,255,.05),0 18px 50px rgba(0,0,0,.25);
-    }
-    #scene-shell{position:absolute;inset:0}
-    #room,#heatmap,#reveal{
-      position:absolute;inset:0;width:100%;height:100%;display:block;
-    }
-    #heatmap,#reveal{pointer-events:none}
-    #gaze-cursor{
-      position:absolute;
-      width:28px;height:28px;
-      border:2px solid rgba(255,255,255,.95);
-      border-radius:999px;
-      box-shadow:0 0 0 8px rgba(125,211,252,.16),0 0 24px rgba(125,211,252,.35);
-      transform:translate(-50%,-50%);
-      pointer-events:none;
-      z-index:6;
-      left:50%;top:50%;
-      transition:width .12s ease,height .12s ease,border-color .12s ease;
-    }
-    #gaze-cursor::after{
-      content:"";
-      position:absolute;inset:6px;border-radius:999px;background:rgba(255,255,255,.85);
-    }
-    .chip{
-      position:absolute;z-index:7;
-      display:inline-flex;align-items:center;gap:8px;
-      padding:10px 12px;border-radius:999px;
-      background:rgba(9,16,30,.74);
-      border:1px solid rgba(255,255,255,.08);
-      color:var(--muted);font-size:13px;
-      backdrop-filter:blur(12px);
-    }
-    .chip strong{color:var(--text)}
-    #statusChip{top:18px;left:18px}
-    #modeChip{top:18px;left:190px}
-    #blinkChip{top:18px;left:330px}
-    .dot{
-      width:10px;height:10px;border-radius:999px;background:var(--danger);
-      box-shadow:0 0 18px rgba(251,113,133,.45);
-    }
-    .dot.on{
-      background:var(--ok);
-      box-shadow:0 0 18px rgba(52,211,153,.45);
-    }
-    .meter{
-      position:absolute;top:18px;right:18px;z-index:7;
-      width:220px;padding:12px;border-radius:16px;
-      background:rgba(9,16,30,.74);border:1px solid rgba(255,255,255,.08);
-    }
-    .meter .label{font-size:12px;color:var(--muted);margin-bottom:8px}
-    .bar{width:100%;height:10px;border-radius:999px;background:rgba(255,255,255,.08);overflow:hidden}
-    .bar>div{width:0%;height:100%;border-radius:999px;background:linear-gradient(90deg,#7dd3fc 0%,#c084fc 100%)}
-    #permission-note{
-      position:absolute;left:18px;bottom:18px;z-index:7;max-width:720px;
-      padding:10px 14px;border-radius:14px;
-      background:rgba(10,18,35,.88);
-      border:1px solid rgba(255,255,255,.08);
-      color:var(--muted);font-size:13px;line-height:1.45;
-    }
-    .sidebar{padding:16px;display:flex;flex-direction:column;gap:14px}
-    .card{
-      background:linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.02));
-      border:1px solid rgba(255,255,255,.08);
-      border-radius:20px;
-      padding:14px;
-      box-shadow:inset 0 1px 0 rgba(255,255,255,.04);
-    }
-    .card h3{margin:0 0 10px;font-size:15px}
-    #video{
-      width:100%;
-      aspect-ratio:16/10;
-      object-fit:cover;
-      border-radius:16px;
-      border:1px solid rgba(255,255,255,.08);
-      background:#030712;
-      transform:scaleX(-1);
-    }
-    .stats-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-    .stat{
-      background:rgba(255,255,255,.03);
-      border:1px solid rgba(255,255,255,.07);
-      border-radius:16px;padding:12px;
-    }
-    .stat .k{font-size:12px;color:var(--muted);margin-bottom:6px}
-    .stat .v{font-size:22px;font-weight:800}
-    .meta-line{
-      display:flex;justify-content:space-between;gap:10px;
-      border-bottom:1px dashed rgba(255,255,255,.08);
-      padding:8px 0;color:var(--muted);font-size:13px;
-    }
-    .meta-line:last-child{border-bottom:none}
-    .meta-line strong{color:var(--text);font-size:13px}
-    #selected-title{font-size:20px;margin:0 0 6px}
-    #selected-artist{color:#7dd3fc;margin-bottom:10px;font-weight:700}
-    #selected-description{color:var(--muted);line-height:1.5;font-size:13.5px}
-    #artwork-list{display:grid;gap:10px;max-height:260px;overflow:auto}
-    .art-row{
-      display:grid;grid-template-columns:14px 1fr auto;gap:10px;align-items:center;
-      background:rgba(255,255,255,.03);
-      border:1px solid rgba(255,255,255,.08);
-      border-radius:16px;padding:12px;cursor:pointer;
-    }
-    .art-row:hover{border-color:rgba(125,211,252,.28)}
-    .art-bullet{width:14px;height:14px;border-radius:999px}
-    .art-title{font-weight:800;margin-bottom:3px}
-    .art-sub{color:var(--muted);font-size:12.5px}
-    .badge{
-      font-size:11px;font-weight:800;color:#dbeafe;
-      background:rgba(125,211,252,.14);
-      border:1px solid rgba(125,211,252,.22);
-      padding:6px 9px;border-radius:999px;
-    }
-    #logBox{
-      min-height:120px;max-height:180px;overflow:auto;border-radius:12px;padding:10px;
-      background:rgba(3,7,18,.72);border:1px solid rgba(255,255,255,.08);
-      color:#a8b9d8;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
-      font-size:12px;line-height:1.4;white-space:pre-wrap;
-    }
+    *{box-sizing:border-box} body{margin:0;background:transparent}
+    #face-room-root{width:100%;min-height:1220px;color:var(--text);padding:18px;border-radius:24px;overflow:hidden;
+      background:radial-gradient(circle at top, rgba(81,120,255,.12), transparent 28%),radial-gradient(circle at bottom right, rgba(194,120,255,.12), transparent 24%),linear-gradient(180deg,#06101c 0%,#040812 100%);border:1px solid rgba(255,255,255,.06)}
+    .topbar{display:grid;grid-template-columns:1fr auto;gap:16px;align-items:center;margin-bottom:16px}
+    .headline h2{margin:0;font-size:28px;font-weight:800}.headline p{margin:8px 0 0;color:var(--muted);max-width:980px;line-height:1.5;font-size:14px}
+    .controls{display:flex;flex-wrap:wrap;gap:10px;justify-content:flex-end}
+    .btn{border:1px solid rgba(255,255,255,.1);background:linear-gradient(180deg,rgba(255,255,255,.12),rgba(255,255,255,.04));color:var(--text);padding:10px 14px;border-radius:14px;font-weight:700;cursor:pointer;transition:.2s ease;box-shadow:0 8px 22px rgba(0,0,0,.18);user-select:none}
+    .btn:hover{transform:translateY(-1px);border-color:rgba(125,211,252,.45)}.btn.primary{background:linear-gradient(180deg,rgba(125,211,252,.28),rgba(125,211,252,.12));border-color:rgba(125,211,252,.35)}.btn.warn{background:linear-gradient(180deg,rgba(251,191,36,.25),rgba(251,191,36,.08));border-color:rgba(251,191,36,.35)}.btn.subtle{background:linear-gradient(180deg,rgba(192,132,252,.18),rgba(192,132,252,.06));border-color:rgba(192,132,252,.3)}
+    .layout{display:grid;grid-template-columns:minmax(0,1.72fr) minmax(340px,.78fr);gap:16px;min-height:980px}
+    .scene-panel,.sidebar{background:linear-gradient(180deg,rgba(255,255,255,.03),rgba(255,255,255,.015));border:1px solid var(--border);border-radius:22px;overflow:hidden;position:relative;backdrop-filter:blur(18px)}
+    .scene-panel{min-height:940px;box-shadow:inset 0 1px 0 rgba(255,255,255,.05),0 18px 50px rgba(0,0,0,.25)}
+    #scene-shell{position:absolute;inset:0} #room,#heatmap,#reveal{position:absolute;inset:0;width:100%;height:100%;display:block} #heatmap,#reveal{pointer-events:none}
+    #cursor{position:absolute;width:28px;height:28px;border:2px solid rgba(255,255,255,.95);border-radius:999px;box-shadow:0 0 0 8px rgba(125,211,252,.16),0 0 24px rgba(125,211,252,.35);transform:translate(-50%,-50%);pointer-events:none;z-index:6;left:50%;top:50%;transition:width .12s ease,height .12s ease,border-color .12s ease}
+    #cursor::after{content:"";position:absolute;inset:6px;border-radius:999px;background:rgba(255,255,255,.85)}
+    .chip{position:absolute;z-index:7;display:inline-flex;align-items:center;gap:8px;padding:10px 12px;border-radius:999px;background:rgba(9,16,30,.74);border:1px solid rgba(255,255,255,.08);color:var(--muted);font-size:13px;backdrop-filter:blur(12px)}
+    .chip strong{color:var(--text)} .dot{width:10px;height:10px;border-radius:999px;background:var(--danger);box-shadow:0 0 18px rgba(251,113,133,.45)} .dot.on{background:var(--ok);box-shadow:0 0 18px rgba(52,211,153,.45)}
+    #statusChip{top:18px;left:18px} #modeChip{top:18px;left:190px} #blinkChip{top:18px;left:340px} #walkChip{top:18px;left:510px}
+    .meter{position:absolute;top:18px;right:18px;z-index:7;width:240px;padding:12px;border-radius:16px;background:rgba(9,16,30,.74);border:1px solid rgba(255,255,255,.08)} .meter .label{font-size:12px;color:var(--muted);margin-bottom:8px}
+    .bar{width:100%;height:10px;border-radius:999px;background:rgba(255,255,255,.08);overflow:hidden}.bar>div{width:0%;height:100%;border-radius:999px;background:linear-gradient(90deg,#7dd3fc 0%,#c084fc 100%)}
+    #permission-note{position:absolute;left:18px;bottom:18px;z-index:7;max-width:760px;padding:10px 14px;border-radius:14px;background:rgba(10,18,35,.88);border:1px solid rgba(255,255,255,.08);color:var(--muted);font-size:13px;line-height:1.45}
+    .sidebar{padding:16px;display:flex;flex-direction:column;gap:14px}.card{background:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,.02));border:1px solid rgba(255,255,255,.08);border-radius:20px;padding:14px;box-shadow:inset 0 1px 0 rgba(255,255,255,.04)}.card h3{margin:0 0 10px;font-size:15px}
+    #video{width:100%;aspect-ratio:16/10;object-fit:cover;border-radius:16px;border:1px solid rgba(255,255,255,.08);background:#030712;transform:scaleX(-1)}
+    .stats-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.stat{background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.07);border-radius:16px;padding:12px}.stat .k{font-size:12px;color:var(--muted);margin-bottom:6px}.stat .v{font-size:22px;font-weight:800}
+    .meta-line{display:flex;justify-content:space-between;gap:10px;border-bottom:1px dashed rgba(255,255,255,.08);padding:8px 0;color:var(--muted);font-size:13px}.meta-line:last-child{border-bottom:none}.meta-line strong{color:var(--text);font-size:13px}
+    #selected-title{font-size:20px;margin:0 0 6px}#selected-artist{color:#7dd3fc;margin-bottom:10px;font-weight:700}#selected-description{color:var(--muted);line-height:1.5;font-size:13.5px}
+    #artwork-list{display:grid;gap:10px;max-height:260px;overflow:auto}.art-row{display:grid;grid-template-columns:14px 1fr auto;gap:10px;align-items:center;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:12px;cursor:pointer}.art-row:hover{border-color:rgba(125,211,252,.28)} .art-bullet{width:14px;height:14px;border-radius:999px}.art-title{font-weight:800;margin-bottom:3px}.art-sub{color:var(--muted);font-size:12.5px}.badge{font-size:11px;font-weight:800;color:#dbeafe;background:rgba(125,211,252,.14);border:1px solid rgba(125,211,252,.22);padding:6px 9px;border-radius:999px}
+    #logBox{min-height:120px;max-height:190px;overflow:auto;border-radius:12px;padding:10px;background:rgba(3,7,18,.72);border:1px solid rgba(255,255,255,.08);color:#a8b9d8;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.4;white-space:pre-wrap}
     .small-note{color:var(--muted);font-size:12px;line-height:1.4}
-    @media (max-width:1080px){
-      .layout{grid-template-columns:1fr}
-      .scene-panel{min-height:680px}
-      #eye-room-root{min-height:1500px}
-      .topbar{grid-template-columns:1fr}
-      .controls{justify-content:flex-start}
-      #modeChip{left:18px;top:62px}
-      #blinkChip{left:170px;top:62px}
-      .meter{top:104px;right:18px}
-    }
+    @media (max-width:1080px){.layout{grid-template-columns:1fr}.scene-panel{min-height:700px}#face-room-root{min-height:1540px}.topbar{grid-template-columns:1fr}.controls{justify-content:flex-start}#modeChip{left:18px;top:62px}#blinkChip{left:170px;top:62px}#walkChip{left:330px;top:62px}.meter{top:104px;right:18px}}
   </style>
 
   <div class="topbar">
     <div class="headline">
-      <h2>Sala 3D guiada pelo olhar</h2>
-      <p>Melhorias desta versão: suavização do olhar, navegação mais estável, dwell-click mais preciso, detecção de piscar para dar zoom na obra em foco e fallback por mouse para teste.</p>
+      <h2>Sala 3D guiada pelo rosto/cabeça</h2>
+      <p>Use o rosto para controlar a navegação. Virar a cabeça gira a câmera, mover o rosto lateralmente desloca a visão, aproximar o rosto da câmera anda para frente, afastar anda para trás. Duas piscadas rápidas alternam entre aproximar e afastar a obra em foco.</p>
     </div>
     <div class="controls">
-      <button class="btn primary" id="startBtn">Iniciar tracking</button>
-      <button class="btn warn" id="calibrateBtn">Calibrar olhar</button>
+      <button class="btn primary" id="startBtn">Iniciar tracking facial</button>
+      <button class="btn warn" id="calibrateBtn">Calibrar rosto</button>
       <button class="btn subtle" id="resetHeatBtn">Limpar heatmap</button>
+      <button class="btn" id="resetCamBtn">Resetar câmera</button>
       <button class="btn" id="exportPdfBtn">Exportar PDF</button>
       <button class="btn" id="stopBtn">Parar</button>
     </div>
@@ -245,25 +66,21 @@ HTML_APP = r"""
         <canvas id="room"></canvas>
         <canvas id="heatmap"></canvas>
         <canvas id="reveal"></canvas>
-        <div id="gaze-cursor"></div>
+        <div id="cursor"></div>
         <div class="chip" id="statusChip"><span id="statusDot" class="dot"></span><span id="statusText">Aguardando</span></div>
         <div class="chip" id="modeChip">Modo: <strong id="modeText">Cena ativa</strong></div>
-        <div class="chip" id="blinkChip">Blink: <strong id="blinkText">Pronto</strong></div>
-        <div class="meter">
-          <div class="label">Progresso do clique por permanência</div>
-          <div class="bar"><div id="dwellFill"></div></div>
-        </div>
-        <div id="permission-note">A sala já está visível. Clique em “Iniciar tracking” para tentar webcam. Se a webcam falhar, o modo mouse permanece ativo para testar navegação, dwell-click, zoom e relatório.</div>
+        <div class="chip" id="blinkChip">Piscadas: <strong id="blinkText">0</strong></div>
+        <div class="chip" id="walkChip">Andar: <strong id="walkText">Parado</strong></div>
+        <div class="meter"><div class="label">Progresso do clique por permanência</div><div class="bar"><div id="dwellFill"></div></div></div>
+        <div id="permission-note">A sala já está visível. Clique em “Iniciar tracking facial” para tentar webcam. Se falhar, o modo mouse continua ativo para testar navegação, dwell-click, zoom e relatório.</div>
       </div>
     </div>
-
     <div class="sidebar">
       <div class="card">
         <h3>Prévia da câmera</h3>
         <video id="video" autoplay playsinline muted></video>
-        <div class="small-note" style="margin-top:8px">Se a câmera não abrir, confirme a permissão do navegador e use HTTPS. Sem câmera, o modo mouse continua funcionando.</div>
+        <div class="small-note" style="margin-top:8px">No tracking facial, o app usa o centro do rosto, o giro da cabeça e a escala do rosto. Sem webcam, o modo mouse continua funcionando.</div>
       </div>
-
       <div class="card">
         <h3>Métricas da sessão</h3>
         <div class="stats-grid">
@@ -276,20 +93,18 @@ HTML_APP = r"""
         <div class="meta-line"><span>Último hover</span><strong id="hoverText">Nenhum</strong></div>
         <div class="meta-line"><span>Calibração</span><strong id="calibrationText">Pendente</strong></div>
         <div class="meta-line"><span>Zoom</span><strong id="zoomText">Normal</strong></div>
+        <div class="meta-line"><span>Posição</span><strong id="positionText">x 0.0 · z -1.4</strong></div>
       </div>
-
       <div class="card">
         <h3>Obra selecionada</h3>
         <div id="selected-title">Nenhuma obra selecionada</div>
-        <div id="selected-artist">Olhe para uma obra por cerca de 1,0 s ou pisque sobre ela</div>
-        <div id="selected-description">A ficha da obra aparece aqui quando o dwell-click termina ou o blink-zoom é acionado.</div>
+        <div id="selected-artist">Pare sobre uma obra por ~0,9 s ou dê duas piscadas rápidas</div>
+        <div id="selected-description">A ficha da obra aparece quando o dwell-click termina ou quando o duplo blink aciona o zoom.</div>
       </div>
-
       <div class="card">
         <h3>Obras da sala</h3>
         <div id="artwork-list"></div>
       </div>
-
       <div class="card">
         <h3>Log do sistema</h3>
         <div id="logBox">Inicializando sala…</div>
@@ -304,22 +119,23 @@ HTML_APP = r"""
     const revealCanvas = document.getElementById('reveal');
     const scenePanel = document.querySelector('.scene-panel');
     const video = document.getElementById('video');
-
     const ctx = roomCanvas.getContext('2d');
     const heatCtx = heatmapCanvas.getContext('2d');
     const revealCtx = revealCanvas.getContext('2d');
 
-    const gazeCursor = document.getElementById('gaze-cursor');
+    const cursor = document.getElementById('cursor');
     const dwellFill = document.getElementById('dwellFill');
     const statusDot = document.getElementById('statusDot');
     const statusText = document.getElementById('statusText');
     const modeText = document.getElementById('modeText');
     const blinkText = document.getElementById('blinkText');
+    const walkText = document.getElementById('walkText');
     const permissionNote = document.getElementById('permission-note');
     const qualityText = document.getElementById('qualityText');
     const hoverText = document.getElementById('hoverText');
     const calibrationText = document.getElementById('calibrationText');
     const zoomText = document.getElementById('zoomText');
+    const positionText = document.getElementById('positionText');
     const statTime = document.getElementById('statTime');
     const statFixations = document.getElementById('statFixations');
     const statPoints = document.getElementById('statPoints');
@@ -333,7 +149,7 @@ HTML_APP = r"""
     function log(msg){
       const line = '[' + new Date().toLocaleTimeString() + '] ' + msg;
       console.log(line);
-      logBox.textContent += '\\n' + line;
+      logBox.textContent += '\n' + line;
       logBox.scrollTop = logBox.scrollHeight;
     }
     logBox.textContent = 'Sala inicializada.';
@@ -343,6 +159,7 @@ HTML_APP = r"""
     function clamp(v,a,b){ return Math.min(b, Math.max(a, v)); }
     function lerp(a,b,t){ return a + (b-a)*t; }
     function avg(points,key){ return points.reduce((s,p)=>s+p[key],0)/Math.max(1,points.length); }
+    function hypot2(a,b){ return Math.hypot(a.x-b.x, a.y-b.y); }
 
     const state = {
       running:false,
@@ -354,7 +171,7 @@ HTML_APP = r"""
       sampleIntervalMs:85,
       lastSampleTs:0,
       hoverStartTs:0,
-      dwellMs:1000,
+      dwellMs:900,
       hoveredArtworkId:null,
       selectedArtworkId:null,
       fixations:0,
@@ -365,37 +182,29 @@ HTML_APP = r"""
       revealPoints:[],
       selections:[],
       seenArtworkIds:new Set(),
-      calibration:{ xOffset:0, yOffset:0, gainX:1.22, gainY:1.18 },
+      calibration:{
+        centerX:0.5, centerY:0.5, scale:0.18, yaw:0, pitch:0,
+        gainX:1.25, gainY:1.05, gainYaw:1.4, gainPitch:1.2, gainScale:2.8
+      },
       blink:{
         closed:false,
         closeTs:0,
         lastBlinkTs:0,
         threshold:0.18,
-        minMs:80,
-        maxMs:420
+        minMs:70,
+        maxMs:420,
+        windowMs:650,
+        countInWindow:0,
+        windowStartTs:0
       },
-      zoom:{
-        active:false,
-        targetArtworkId:null,
-        focus:0,
-        focusTarget:0
-      }
+      zoom:{ active:false, targetArtworkId:null, focus:0, focusTarget:0 },
+      walk:{ vx:0, vz:0, turn:0, pitch:0 },
+      tracking:{ faceX:0.5, faceY:0.5, faceScale:0.18, yaw:0, pitch:0 }
     };
 
-    const gaze = {
-      x:0.5, y:0.5,
-      targetX:0.5, targetY:0.5,
-      rawX:0.5, rawY:0.5,
-      smoothVelX:0, smoothVelY:0,
-      quality:0.82
-    };
+    const gaze = { x:0.5, y:0.5, targetX:0.5, targetY:0.5, velX:0, velY:0, quality:0.82 };
 
-    const camera = {
-      x:0, y:1.65, z:-1.4,
-      yaw:0, pitch:0,
-      baseFov:700,
-      fov:700
-    };
+    const camera = { x:0, y:1.65, z:-1.4, yaw:0, pitch:0, baseFov:700, fov:700 };
 
     const artworks = [
       { id:'obra_01', title:'Memórias de Superfície', artist:'Lívia Andrade', year:'2024', wall:'fundo', color:'#ef4444', description:'Pintura em camadas com relevo cromático.', plane:'back', x:-2.8, y:2.1, z:9.85, w:1.7, h:1.2 },
@@ -407,13 +216,9 @@ HTML_APP = r"""
 
     let projectedArtworks = [];
 
-    function setStatus(on,text){
-      statusDot.classList.toggle('on', !!on);
-      statusText.textContent = text;
-    }
-
+    function setStatus(on,text){ statusDot.classList.toggle('on', !!on); statusText.textContent = text; }
     function setMode(text){ modeText.textContent = text; }
-    function setBlink(text){ blinkText.textContent = text; }
+    function setWalk(text){ walkText.textContent = text; }
 
     function resizeCanvases(){
       const rect = scenePanel.getBoundingClientRect();
@@ -429,33 +234,23 @@ HTML_APP = r"""
     }
 
     function projectPoint(x,y,z){
-      const relX = x - camera.x;
-      const relY = y - camera.y;
-      const relZ = z - camera.z;
-
+      const relX = x - camera.x, relY = y - camera.y, relZ = z - camera.z;
       const cosy = Math.cos(camera.yaw), siny = Math.sin(camera.yaw);
       const cosp = Math.cos(camera.pitch), sinp = Math.sin(camera.pitch);
-
       const x1 = relX * cosy - relZ * siny;
       const z1 = relX * siny + relZ * cosy;
       const y1 = relY;
-
       const y2 = y1 * cosp - z1 * sinp;
       const z2 = y1 * sinp + z1 * cosp;
-
       if(z2 <= .1) return null;
-
       const rect = scenePanel.getBoundingClientRect();
-      const cx = rect.width/2;
-      const cy = rect.height/2;
-      const s = camera.fov / z2;
+      const cx = rect.width/2, cy = rect.height/2, s = camera.fov / z2;
       return { x: cx + x1 * s, y: cy - y2 * s, depth:z2, scale:s };
     }
 
     function drawPoly(points, fill, stroke, lineWidth){
       if(!points || points.some(p => !p)) return;
-      ctx.beginPath();
-      ctx.moveTo(points[0].x, points[0].y);
+      ctx.beginPath(); ctx.moveTo(points[0].x, points[0].y);
       for(let i=1;i<points.length;i++) ctx.lineTo(points[i].x, points[i].y);
       ctx.closePath();
       if(fill){ ctx.fillStyle = fill; ctx.fill(); }
@@ -465,10 +260,8 @@ HTML_APP = r"""
     function pointInPoly(pt, poly){
       let inside = false;
       for(let i=0, j=poly.length - 1; i<poly.length; j=i++){
-        const xi = poly[i].x, yi = poly[i].y;
-        const xj = poly[j].x, yj = poly[j].y;
-        const intersect = ((yi > pt.y) !== (yj > pt.y)) &&
-          (pt.x < ((xj - xi) * (pt.y - yi)) / ((yj - yi) || 1e-6) + xi);
+        const xi = poly[i].x, yi = poly[i].y, xj = poly[j].x, yj = poly[j].y;
+        const intersect = ((yi > pt.y) !== (yj > pt.y)) && (pt.x < ((xj - xi) * (pt.y - yi)) / ((yj - yi) || 1e-6) + xi);
         if(intersect) inside = !inside;
       }
       return inside;
@@ -476,42 +269,18 @@ HTML_APP = r"""
 
     function addHeatPoint(xNorm, yNorm){
       const rect = scenePanel.getBoundingClientRect();
-      const px = xNorm * rect.width;
-      const py = yNorm * rect.height;
+      const px = xNorm * rect.width, py = yNorm * rect.height;
       state.heatPoints.push({x:px,y:py,ts:Date.now()});
       if(state.heatPoints.length > 5000) state.heatPoints.shift();
-
       const grad = heatCtx.createRadialGradient(px,py,4,px,py,34);
-      grad.addColorStop(0,'rgba(255,64,64,.18)');
-      grad.addColorStop(.35,'rgba(255,191,0,.12)');
-      grad.addColorStop(.7,'rgba(34,197,94,.08)');
-      grad.addColorStop(1,'rgba(34,197,94,0)');
-      heatCtx.fillStyle = grad;
-      heatCtx.beginPath();
-      heatCtx.arc(px,py,34,0,Math.PI*2);
-      heatCtx.fill();
-
-      state.revealPoints.push({x:px,y:py,life:1});
-      if(state.revealPoints.length > 260) state.revealPoints.shift();
-
-      statPoints.textContent = String(state.heatPoints.length);
-      qualityText.textContent = Math.round(gaze.quality * 100) + '%';
-
+      grad.addColorStop(0,'rgba(255,64,64,.18)'); grad.addColorStop(.35,'rgba(255,191,0,.12)'); grad.addColorStop(.7,'rgba(34,197,94,.08)'); grad.addColorStop(1,'rgba(34,197,94,0)');
+      heatCtx.fillStyle = grad; heatCtx.beginPath(); heatCtx.arc(px,py,34,0,Math.PI*2); heatCtx.fill();
+      state.revealPoints.push({x:px,y:py,life:1}); if(state.revealPoints.length > 260) state.revealPoints.shift();
+      statPoints.textContent = String(state.heatPoints.length); qualityText.textContent = Math.round(gaze.quality * 100) + '%';
       if(state.lastPointPx){
-        const dx = px - state.lastPointPx.x;
-        const dy = py - state.lastPointPx.y;
-        const dist = Math.hypot(dx,dy);
-        if(dist < 26){
-          state.stableFor += state.sampleIntervalMs;
-          if(state.stableFor >= 240 && !state.inFixation){
-            state.fixations += 1;
-            state.inFixation = true;
-            statFixations.textContent = String(state.fixations);
-          }
-        } else {
-          state.stableFor = 0;
-          state.inFixation = false;
-        }
+        const dist = Math.hypot(px - state.lastPointPx.x, py - state.lastPointPx.y);
+        if(dist < 24){ state.stableFor += state.sampleIntervalMs; if(state.stableFor >= 220 && !state.inFixation){ state.fixations += 1; state.inFixation = true; statFixations.textContent = String(state.fixations); } }
+        else { state.stableFor = 0; state.inFixation = false; }
       }
       state.lastPointPx = {x:px,y:py};
     }
@@ -519,614 +288,318 @@ HTML_APP = r"""
     function drawReveal(){
       const rect = scenePanel.getBoundingClientRect();
       revealCtx.clearRect(0,0,rect.width,rect.height);
-      revealCtx.fillStyle = 'rgba(4,8,18,.48)';
-      revealCtx.fillRect(0,0,rect.width,rect.height);
+      revealCtx.fillStyle = 'rgba(4,8,18,.48)'; revealCtx.fillRect(0,0,rect.width,rect.height);
       revealCtx.globalCompositeOperation = 'destination-out';
       state.revealPoints.forEach(p => {
         const radius = 100 + p.life * 78;
         const grad = revealCtx.createRadialGradient(p.x,p.y,0,p.x,p.y,radius);
-        grad.addColorStop(0,'rgba(255,255,255,' + (.18 * p.life) + ')');
-        grad.addColorStop(.45,'rgba(255,255,255,' + (.11 * p.life) + ')');
-        grad.addColorStop(1,'rgba(255,255,255,0)');
-        revealCtx.fillStyle = grad;
-        revealCtx.beginPath();
-        revealCtx.arc(p.x,p.y,radius,0,Math.PI*2);
-        revealCtx.fill();
-        p.life *= .988;
+        grad.addColorStop(0,'rgba(255,255,255,' + (.18 * p.life) + ')'); grad.addColorStop(.45,'rgba(255,255,255,' + (.11 * p.life) + ')'); grad.addColorStop(1,'rgba(255,255,255,0)');
+        revealCtx.fillStyle = grad; revealCtx.beginPath(); revealCtx.arc(p.x,p.y,radius,0,Math.PI*2); revealCtx.fill(); p.life *= .988;
       });
       state.revealPoints = state.revealPoints.filter(p => p.life > .08);
       revealCtx.globalCompositeOperation = 'source-over';
     }
 
     function updateCursor(){
-      gaze.smoothVelX = lerp(gaze.smoothVelX, gaze.targetX - gaze.x, .18);
-      gaze.smoothVelY = lerp(gaze.smoothVelY, gaze.targetY - gaze.y, .18);
-      gaze.x = clamp(gaze.x + gaze.smoothVelX * .35, .02, .98);
-      gaze.y = clamp(gaze.y + gaze.smoothVelY * .35, .02, .98);
-      gazeCursor.style.left = (gaze.x * 100) + '%';
-      gazeCursor.style.top = (gaze.y * 100) + '%';
+      gaze.velX = lerp(gaze.velX, gaze.targetX - gaze.x, .22);
+      gaze.velY = lerp(gaze.velY, gaze.targetY - gaze.y, .22);
+      gaze.x = clamp(gaze.x + gaze.velX * .42, .02, .98);
+      gaze.y = clamp(gaze.y + gaze.velY * .42, .02, .98);
+      cursor.style.left = (gaze.x * 100) + '%';
+      cursor.style.top = (gaze.y * 100) + '%';
     }
 
-    function getArtworkById(id){
-      return artworks.find(a => a.id === id) || null;
-    }
+    function getArtworkById(id){ return artworks.find(a => a.id === id) || null; }
 
     function updateSelectedPanel(art){
-      if(!art){
-        selectedTitle.textContent = 'Nenhuma obra selecionada';
-        selectedArtist.textContent = 'Olhe para uma obra por cerca de 1,0 s ou pisque sobre ela';
-        selectedDescription.textContent = 'A ficha da obra aparece aqui quando o dwell-click termina ou o blink-zoom é acionado.';
-        return;
-      }
-      selectedTitle.textContent = art.title;
-      selectedArtist.textContent = art.artist + ' · ' + art.year + ' · parede ' + art.wall;
-      selectedDescription.textContent = art.description;
+      if(!art){ selectedTitle.textContent = 'Nenhuma obra selecionada'; selectedArtist.textContent = 'Pare sobre uma obra por ~0,9 s ou dê duas piscadas rápidas'; selectedDescription.textContent = 'A ficha da obra aparece quando o dwell-click termina ou quando o duplo blink aciona o zoom.'; return; }
+      selectedTitle.textContent = art.title; selectedArtist.textContent = art.artist + ' · ' + art.year + ' · parede ' + art.wall; selectedDescription.textContent = art.description;
     }
 
     function selectArtwork(art, source){
       state.selectedArtworkId = art.id;
-      state.zoom.active = true;
-      state.zoom.targetArtworkId = art.id;
-      state.zoom.focusTarget = 1;
-      zoomText.textContent = 'Na obra';
       updateSelectedPanel(art);
-      if(!state.seenArtworkIds.has(art.id)){
-        state.seenArtworkIds.add(art.id);
-        statArtworks.textContent = String(state.seenArtworkIds.size);
-      }
+      if(!state.seenArtworkIds.has(art.id)){ state.seenArtworkIds.add(art.id); statArtworks.textContent = String(state.seenArtworkIds.size); }
       state.selections.push({ id:art.id, title:art.title, ts:Date.now(), source:source || 'hover' });
       log('Obra selecionada: ' + art.title + ' via ' + (source || 'hover'));
     }
 
-    function resetZoom(){
-      state.zoom.focusTarget = 0;
-      state.zoom.active = false;
-      state.zoom.targetArtworkId = null;
-      zoomText.textContent = 'Normal';
+    function zoomToArtwork(art){
+      if(!art) return;
+      state.zoom.active = true; state.zoom.targetArtworkId = art.id; state.zoom.focusTarget = 1; zoomText.textContent = 'Na obra'; selectArtwork(art, 'double_blink_zoom_in');
+    }
+
+    function zoomOut(){
+      state.zoom.active = false; state.zoom.targetArtworkId = null; state.zoom.focusTarget = 0; zoomText.textContent = 'Normal';
+    }
+
+    function toggleDoubleBlinkAction(){
+      const hovered = getArtworkById(state.hoveredArtworkId) || getArtworkById(state.selectedArtworkId);
+      if(state.zoom.focus < .55 && hovered){
+        zoomToArtwork(hovered);
+        permissionNote.textContent = 'Duas piscadas: aproximando a obra “' + hovered.title + '”.';
+        log('Duplo blink: zoom in em ' + hovered.title);
+      } else {
+        zoomOut();
+        permissionNote.textContent = 'Duas piscadas: afastando a câmera.';
+        log('Duplo blink: zoom out');
+      }
     }
 
     function buildArtworkList(){
       artworkList.innerHTML = '';
       artworks.forEach(art => {
-        const row = document.createElement('div');
-        row.className = 'art-row';
-        row.innerHTML =
-          '<div class="art-bullet" style="background:' + art.color + '"></div>' +
-          '<div><div class="art-title">' + art.title + '</div><div class="art-sub">' + art.artist + ' · ' + art.year + '</div></div>' +
-          '<div class="badge">' + art.wall + '</div>';
-        row.addEventListener('click', () => selectArtwork(art, 'lista'));
-        artworkList.appendChild(row);
+        const row = document.createElement('div'); row.className = 'art-row';
+        row.innerHTML = '<div class="art-bullet" style="background:' + art.color + '"></div><div><div class="art-title">' + art.title + '</div><div class="art-sub">' + art.artist + ' · ' + art.year + '</div></div><div class="badge">' + art.wall + '</div>';
+        row.addEventListener('click', () => zoomToArtwork(art)); artworkList.appendChild(row);
       });
     }
 
     function drawArtwork(art, highlight){
       let poly = [];
-      if(art.plane === 'back'){
-        poly = [
-          projectPoint(art.x - art.w/2, art.y - art.h/2, art.z),
-          projectPoint(art.x + art.w/2, art.y - art.h/2, art.z),
-          projectPoint(art.x + art.w/2, art.y + art.h/2, art.z),
-          projectPoint(art.x - art.w/2, art.y + art.h/2, art.z)
-        ];
-      } else if(art.plane === 'left'){
-        poly = [
-          projectPoint(art.x, art.y - art.h/2, art.z - art.w/2),
-          projectPoint(art.x, art.y - art.h/2, art.z + art.w/2),
-          projectPoint(art.x, art.y + art.h/2, art.z + art.w/2),
-          projectPoint(art.x, art.y + art.h/2, art.z - art.w/2)
-        ];
-      } else {
-        poly = [
-          projectPoint(art.x, art.y - art.h/2, art.z + art.w/2),
-          projectPoint(art.x, art.y - art.h/2, art.z - art.w/2),
-          projectPoint(art.x, art.y + art.h/2, art.z - art.w/2),
-          projectPoint(art.x, art.y + art.h/2, art.z + art.w/2)
-        ];
-      }
+      if(art.plane === 'back') poly = [projectPoint(art.x-art.w/2,art.y-art.h/2,art.z),projectPoint(art.x+art.w/2,art.y-art.h/2,art.z),projectPoint(art.x+art.w/2,art.y+art.h/2,art.z),projectPoint(art.x-art.w/2,art.y+art.h/2,art.z)];
+      else if(art.plane === 'left') poly = [projectPoint(art.x,art.y-art.h/2,art.z-art.w/2),projectPoint(art.x,art.y-art.h/2,art.z+art.w/2),projectPoint(art.x,art.y+art.h/2,art.z+art.w/2),projectPoint(art.x,art.y+art.h/2,art.z-art.w/2)];
+      else poly = [projectPoint(art.x,art.y-art.h/2,art.z+art.w/2),projectPoint(art.x,art.y-art.h/2,art.z-art.w/2),projectPoint(art.x,art.y+art.h/2,art.z-art.w/2),projectPoint(art.x,art.y+art.h/2,art.z+art.w/2)];
       if(poly.some(p => !p)) return null;
-
-      drawPoly(poly, 'rgba(91,74,54,.98)', highlight ? 'rgba(125,211,252,.95)' : 'rgba(255,255,255,.12)', highlight ? 2 : 1);
-
-      const cx = (poly[0].x + poly[1].x + poly[2].x + poly[3].x) / 4;
-      const cy = (poly[0].y + poly[1].y + poly[2].y + poly[3].y) / 4;
+      drawPoly(poly,'rgba(91,74,54,.98)',highlight ? 'rgba(125,211,252,.95)' : 'rgba(255,255,255,.12)',highlight ? 2 : 1);
+      const cx = (poly[0].x + poly[1].x + poly[2].x + poly[3].x)/4, cy = (poly[0].y + poly[1].y + poly[2].y + poly[3].y)/4;
       const inner = poly.map(p => ({ x:lerp(p.x,cx,.1), y:lerp(p.y,cy,.1) }));
-      const grad = ctx.createLinearGradient(inner[0].x, inner[0].y, inner[2].x, inner[2].y);
-      grad.addColorStop(0, art.color);
-      grad.addColorStop(1, '#0f172a');
-      drawPoly(inner, grad, highlight ? 'rgba(255,255,255,.22)' : 'rgba(255,255,255,.08)', 1);
-
-      ctx.fillStyle = 'rgba(255,255,255,.92)';
-      ctx.font = 'bold 13px Inter, sans-serif';
-      ctx.textAlign = 'center';
-      ctx.fillText(art.title, cx, cy - 4);
-      ctx.fillStyle = 'rgba(220,230,255,.78)';
-      ctx.font = '12px Inter, sans-serif';
-      ctx.fillText(art.artist, cx, cy + 14);
-
+      const grad = ctx.createLinearGradient(inner[0].x,inner[0].y,inner[2].x,inner[2].y); grad.addColorStop(0,art.color); grad.addColorStop(1,'#0f172a');
+      drawPoly(inner,grad,highlight ? 'rgba(255,255,255,.22)' : 'rgba(255,255,255,.08)',1);
+      ctx.fillStyle = 'rgba(255,255,255,.92)'; ctx.font = 'bold 13px Inter, sans-serif'; ctx.textAlign = 'center'; ctx.fillText(art.title,cx,cy-4); ctx.fillStyle = 'rgba(220,230,255,.78)'; ctx.font = '12px Inter, sans-serif'; ctx.fillText(art.artist,cx,cy+14);
       return poly;
     }
 
     function drawPedestal(x,z,hue){
-      const base = [
-        projectPoint(x - .55, 0, z - .55),
-        projectPoint(x + .55, 0, z - .55),
-        projectPoint(x + .55, 0, z + .55),
-        projectPoint(x - .55, 0, z + .55)
-      ];
-      const top = [
-        projectPoint(x - .42, 1.05, z - .42),
-        projectPoint(x + .42, 1.05, z - .42),
-        projectPoint(x + .42, 1.05, z + .42),
-        projectPoint(x - .42, 1.05, z + .42)
-      ];
-      if(base.some(p => !p) || top.some(p => !p)) return;
-      drawPoly([base[0], base[1], top[1], top[0]], 'rgba(220,225,235,.82)', 'rgba(255,255,255,.12)', 1);
-      drawPoly([base[1], base[2], top[2], top[1]], 'rgba(192,200,215,.85)', 'rgba(255,255,255,.12)', 1);
-      drawPoly([base[2], base[3], top[3], top[2]], 'rgba(168,178,190,.88)', 'rgba(255,255,255,.12)', 1);
-      drawPoly(top, 'rgba(240,243,248,.95)', 'rgba(255,255,255,.14)', 1);
-
-      const orb = projectPoint(x, 1.55, z);
-      if(orb){
-        const r = orb.scale * .18;
-        const g = ctx.createRadialGradient(orb.x - r*.4, orb.y - r*.4, r*.2, orb.x, orb.y, r*1.5);
-        g.addColorStop(0, hue);
-        g.addColorStop(1, 'rgba(12,20,36,.15)');
-        ctx.fillStyle = g;
-        ctx.beginPath();
-        ctx.arc(orb.x, orb.y, r, 0, Math.PI * 2);
-        ctx.fill();
-      }
+      const base = [projectPoint(x-.55,0,z-.55),projectPoint(x+.55,0,z-.55),projectPoint(x+.55,0,z+.55),projectPoint(x-.55,0,z+.55)];
+      const top = [projectPoint(x-.42,1.05,z-.42),projectPoint(x+.42,1.05,z-.42),projectPoint(x+.42,1.05,z+.42),projectPoint(x-.42,1.05,z+.42)];
+      if(base.some(p=>!p) || top.some(p=>!p)) return;
+      drawPoly([base[0],base[1],top[1],top[0]],'rgba(220,225,235,.82)','rgba(255,255,255,.12)',1);
+      drawPoly([base[1],base[2],top[2],top[1]],'rgba(192,200,215,.85)','rgba(255,255,255,.12)',1);
+      drawPoly([base[2],base[3],top[3],top[2]],'rgba(168,178,190,.88)','rgba(255,255,255,.12)',1);
+      drawPoly(top,'rgba(240,243,248,.95)','rgba(255,255,255,.14)',1);
+      const orb = projectPoint(x,1.55,z); if(orb){ const r = orb.scale * .18; const g = ctx.createRadialGradient(orb.x-r*.4,orb.y-r*.4,r*.2,orb.x,orb.y,r*1.5); g.addColorStop(0,hue); g.addColorStop(1,'rgba(12,20,36,.15)'); ctx.fillStyle = g; ctx.beginPath(); ctx.arc(orb.x,orb.y,r,0,Math.PI*2); ctx.fill(); }
     }
 
     function drawRoom(){
       const rect = scenePanel.getBoundingClientRect();
       ctx.clearRect(0,0,rect.width,rect.height);
+      const bg = ctx.createLinearGradient(0,0,0,rect.height); bg.addColorStop(0,'#07111f'); bg.addColorStop(1,'#030814'); ctx.fillStyle = bg; ctx.fillRect(0,0,rect.width,rect.height);
 
-      const bg = ctx.createLinearGradient(0,0,0,rect.height);
-      bg.addColorStop(0, '#07111f');
-      bg.addColorStop(1, '#030814');
-      ctx.fillStyle = bg;
-      ctx.fillRect(0,0,rect.width,rect.height);
-
-      const hoveredArt = getArtworkById(state.hoveredArtworkId);
-      const zoomArt = getArtworkById(state.zoom.targetArtworkId);
       state.zoom.focus = lerp(state.zoom.focus, state.zoom.focusTarget, .08);
+      const focusArt = getArtworkById(state.zoom.targetArtworkId);
+      const gazePanX = gaze.x - .5, gazePanY = gaze.y - .5;
+      let focusX = 0, focusY = 2.0, focusZ = 8.4;
+      if(focusArt){ focusX = focusArt.x; focusY = focusArt.y; focusZ = focusArt.z; }
 
-      const gazePanX = (gaze.x - .5);
-      const gazePanY = (gaze.y - .5);
+      const zoomYaw = focusArt ? clamp((focusArt.x - camera.x) * .02, -.2, .2) : 0;
+      camera.pitch = lerp(camera.pitch, lerp(-gazePanY * .16, -.02, state.zoom.focus), .1);
+      camera.yaw = lerp(camera.yaw, camera.yaw + state.walk.turn * .018 + lerp(gazePanX * .14, zoomYaw, state.zoom.focus), .45);
+      camera.x = lerp(camera.x, camera.x + state.walk.vx * .08 + gazePanX * .03 + lerp(0, (focusX - camera.x) * .08, state.zoom.focus), .35);
+      camera.z = lerp(camera.z, camera.z + state.walk.vz * .14 + lerp(0, (focusZ - 6.4 - camera.z) * .08, state.zoom.focus), .35);
+      camera.y = lerp(camera.y, 1.65 - gazePanY * .34 + lerp(0, focusY - .15 - 1.65, state.zoom.focus), .14);
+      camera.fov = lerp(camera.fov, lerp(camera.baseFov, camera.baseFov * 1.48, state.zoom.focus), .12);
 
-      let focusX = 0, focusY = 2.0, focusZ = 8.5;
-      if(zoomArt){
-        focusX = zoomArt.x;
-        focusY = zoomArt.y;
-        focusZ = zoomArt.z - (zoomArt.plane === 'back' ? 1.8 : 0);
-      }
+      camera.x = clamp(camera.x, -3.7, 3.7); camera.z = clamp(camera.z, -1.8, 6.8); camera.yaw = clamp(camera.yaw, -1.1, 1.1);
+      positionText.textContent = 'x ' + camera.x.toFixed(1) + ' · z ' + camera.z.toFixed(1);
 
-      camera.x = lerp(gazePanX * 1.45, focusX * .22, state.zoom.focus);
-      camera.y = lerp(1.65 - gazePanY * .55, focusY - .15, state.zoom.focus);
-      camera.z = lerp(-1.4, focusZ - 6.8, state.zoom.focus);
-      camera.yaw = lerp(gazePanX * .58, focusX * .02, state.zoom.focus);
-      camera.pitch = lerp(-gazePanY * .18, -.03, state.zoom.focus);
-      camera.fov = lerp(camera.baseFov, camera.baseFov * 1.55, state.zoom.focus);
+      const floor = [projectPoint(-5,0,0),projectPoint(5,0,0),projectPoint(5,0,10),projectPoint(-5,0,10)];
+      const ceiling = [projectPoint(-5,4,0),projectPoint(5,4,0),projectPoint(5,4,10),projectPoint(-5,4,10)];
+      const leftWall = [projectPoint(-5,0,0),projectPoint(-5,0,10),projectPoint(-5,4,10),projectPoint(-5,4,0)];
+      const rightWall = [projectPoint(5,0,0),projectPoint(5,0,10),projectPoint(5,4,10),projectPoint(5,4,0)];
+      const backWall = [projectPoint(-5,0,10),projectPoint(5,0,10),projectPoint(5,4,10),projectPoint(-5,4,10)];
+      drawPoly(ceiling,'rgba(11,18,35,.9)','rgba(255,255,255,.05)',1); drawPoly(leftWall,'rgba(15,25,44,.94)','rgba(255,255,255,.06)',1); drawPoly(rightWall,'rgba(12,22,39,.94)','rgba(255,255,255,.06)',1); drawPoly(backWall,'rgba(17,27,48,.96)','rgba(255,255,255,.06)',1); drawPoly(floor,'rgba(22,36,54,.98)','rgba(255,255,255,.05)',1);
 
-      const floor = [
-        projectPoint(-5,0,0), projectPoint(5,0,0), projectPoint(5,0,10), projectPoint(-5,0,10)
-      ];
-      const ceiling = [
-        projectPoint(-5,4,0), projectPoint(5,4,0), projectPoint(5,4,10), projectPoint(-5,4,10)
-      ];
-      const leftWall = [
-        projectPoint(-5,0,0), projectPoint(-5,0,10), projectPoint(-5,4,10), projectPoint(-5,4,0)
-      ];
-      const rightWall = [
-        projectPoint(5,0,0), projectPoint(5,0,10), projectPoint(5,4,10), projectPoint(5,4,0)
-      ];
-      const backWall = [
-        projectPoint(-5,0,10), projectPoint(5,0,10), projectPoint(5,4,10), projectPoint(-5,4,10)
-      ];
+      for(let i=-4;i<=4;i+=1){ const a = projectPoint(i,.001,.2), b = projectPoint(i,.001,9.8); if(a&&b){ ctx.strokeStyle = 'rgba(255,255,255,.05)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke(); } }
+      for(let z=1;z<=10;z+=1){ const a = projectPoint(-4.8,.001,z), b = projectPoint(4.8,.001,z); if(a&&b){ ctx.strokeStyle = 'rgba(255,255,255,.045)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke(); } }
 
-      drawPoly(ceiling, 'rgba(11,18,35,.9)', 'rgba(255,255,255,.05)', 1);
-      drawPoly(leftWall, 'rgba(15,25,44,.94)', 'rgba(255,255,255,.06)', 1);
-      drawPoly(rightWall, 'rgba(12,22,39,.94)', 'rgba(255,255,255,.06)', 1);
-      drawPoly(backWall, 'rgba(17,27,48,.96)', 'rgba(255,255,255,.06)', 1);
-      drawPoly(floor, 'rgba(22,36,54,.98)', 'rgba(255,255,255,.05)', 1);
-
-      for(let i=-4;i<=4;i+=1){
-        const a = projectPoint(i,.001,.2);
-        const b = projectPoint(i,.001,9.8);
-        if(a && b){
-          ctx.strokeStyle = 'rgba(255,255,255,.05)';
-          ctx.lineWidth = 1;
-          ctx.beginPath();
-          ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
-        }
-      }
-      for(let z=1;z<=10;z+=1){
-        const a = projectPoint(-4.8,.001,z);
-        const b = projectPoint(4.8,.001,z);
-        if(a && b){
-          ctx.strokeStyle = 'rgba(255,255,255,.045)';
-          ctx.lineWidth = 1;
-          ctx.beginPath();
-          ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
-        }
-      }
-
-      const spotlight = projectPoint(gazePanX * 3.2, 3.5, 4.8);
-      if(spotlight){
-        const grd = ctx.createRadialGradient(spotlight.x, spotlight.y, 0, spotlight.x, spotlight.y, rect.width * .33);
-        grd.addColorStop(0, 'rgba(125,211,252,.22)');
-        grd.addColorStop(.5, 'rgba(125,211,252,.06)');
-        grd.addColorStop(1, 'rgba(125,211,252,0)');
-        ctx.fillStyle = grd;
-        ctx.beginPath();
-        ctx.arc(spotlight.x, spotlight.y, rect.width * .33, 0, Math.PI * 2);
-        ctx.fill();
-      }
-
-      drawPedestal(-1.8,3.0,'rgba(125,211,252,.95)');
-      drawPedestal(1.8,3.35,'rgba(192,132,252,.95)');
+      const spotlight = projectPoint(gazePanX*3.2, 3.5, 4.8); if(spotlight){ const grd = ctx.createRadialGradient(spotlight.x,spotlight.y,0,spotlight.x,spotlight.y,rect.width*.33); grd.addColorStop(0,'rgba(125,211,252,.22)'); grd.addColorStop(.5,'rgba(125,211,252,.06)'); grd.addColorStop(1,'rgba(125,211,252,0)'); ctx.fillStyle = grd; ctx.beginPath(); ctx.arc(spotlight.x,spotlight.y,rect.width*.33,0,Math.PI*2); ctx.fill(); }
+      drawPedestal(-1.8,3.0,'rgba(125,211,252,.95)'); drawPedestal(1.8,3.35,'rgba(192,132,252,.95)');
 
       projectedArtworks = [];
-      artworks.forEach(art => {
-        const highlight = state.hoveredArtworkId === art.id || state.selectedArtworkId === art.id || state.zoom.targetArtworkId === art.id;
-        const poly = drawArtwork(art, highlight);
-        if(poly) projectedArtworks.push({ art, poly });
-      });
+      artworks.forEach(art => { const highlight = state.hoveredArtworkId === art.id || state.selectedArtworkId === art.id || state.zoom.targetArtworkId === art.id; const poly = drawArtwork(art, highlight); if(poly) projectedArtworks.push({ art, poly }); });
 
       const gazePx = { x:gaze.x * rect.width, y:gaze.y * rect.height };
-      ctx.strokeStyle = 'rgba(255,255,255,.10)';
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(gazePx.x, 0); ctx.lineTo(gazePx.x, rect.height);
-      ctx.moveTo(0, gazePx.y); ctx.lineTo(rect.width, gazePx.y);
-      ctx.stroke();
-
-      if(hoveredArt){
-        ctx.strokeStyle = 'rgba(125,211,252,.22)';
-        ctx.lineWidth = 3;
-        ctx.strokeRect(10, 10, rect.width - 20, rect.height - 20);
-      }
+      ctx.strokeStyle = 'rgba(255,255,255,.10)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(gazePx.x,0); ctx.lineTo(gazePx.x,rect.height); ctx.moveTo(0,gazePx.y); ctx.lineTo(rect.width,gazePx.y); ctx.stroke();
     }
 
     function updateHoverAndDwell(now){
       const rect = scenePanel.getBoundingClientRect();
       const gazePx = { x:gaze.x * rect.width, y:gaze.y * rect.height };
       const hit = projectedArtworks.find(entry => pointInPoly(gazePx, entry.poly));
-
-      if(!hit){
-        state.hoveredArtworkId = null;
-        state.hoverStartTs = now;
-        dwellFill.style.width = '0%';
-        hoverText.textContent = 'Nenhum';
-        if(state.zoom.focusTarget > 0 && !state.zoom.targetArtworkId){
-          resetZoom();
-        }
-        return;
-      }
-
+      if(!hit){ state.hoveredArtworkId = null; state.hoverStartTs = now; dwellFill.style.width = '0%'; hoverText.textContent = 'Nenhum'; return; }
       hoverText.textContent = hit.art.title;
-      if(state.hoveredArtworkId !== hit.art.id){
-        state.hoveredArtworkId = hit.art.id;
-        state.hoverStartTs = now;
-        gazeCursor.style.width = '34px';
-        gazeCursor.style.height = '34px';
-      }
-      const elapsed = now - state.hoverStartTs;
-      const progress = clamp(elapsed / state.dwellMs, 0, 1);
+      if(state.hoveredArtworkId !== hit.art.id){ state.hoveredArtworkId = hit.art.id; state.hoverStartTs = now; cursor.style.width = '34px'; cursor.style.height = '34px'; }
+      const progress = clamp((now - state.hoverStartTs) / state.dwellMs, 0, 1);
       dwellFill.style.width = (progress * 100).toFixed(1) + '%';
-      gazeCursor.style.borderColor = progress > .75 ? 'rgba(52,211,153,.95)' : 'rgba(125,211,252,.95)';
-
-      if(progress >= 1){
-        selectArtwork(hit.art, 'dwell');
-        state.hoverStartTs = now + 320;
-      }
+      cursor.style.borderColor = progress > .75 ? 'rgba(52,211,153,.95)' : 'rgba(125,211,252,.95)';
+      if(progress >= 1){ selectArtwork(hit.art, 'dwell'); state.hoverStartTs = now + 320; }
     }
 
     function clearHeatmap(){
-      const rect = scenePanel.getBoundingClientRect();
-      heatCtx.clearRect(0,0,rect.width,rect.height);
-      revealCtx.clearRect(0,0,rect.width,rect.height);
-      state.heatPoints = [];
-      state.revealPoints = [];
-      state.fixations = 0;
-      state.inFixation = false;
-      state.stableFor = 0;
-      state.lastPointPx = null;
-      statFixations.textContent = '0';
-      statPoints.textContent = '0';
-      log('Heatmap limpo.');
+      const rect = scenePanel.getBoundingClientRect(); heatCtx.clearRect(0,0,rect.width,rect.height); revealCtx.clearRect(0,0,rect.width,rect.height);
+      state.heatPoints = []; state.revealPoints = []; state.fixations = 0; state.inFixation = false; state.stableFor = 0; state.lastPointPx = null; statFixations.textContent = '0'; statPoints.textContent = '0'; log('Heatmap limpo.');
+    }
+
+    function resetCamera(){
+      camera.x = 0; camera.y = 1.65; camera.z = -1.4; camera.yaw = 0; camera.pitch = 0; camera.fov = camera.baseFov; state.walk.vx = 0; state.walk.vz = 0; state.walk.turn = 0; zoomOut(); permissionNote.textContent = 'Câmera resetada.'; log('Câmera resetada.');
     }
 
     function updateClock(){
       if(!state.startedAt){ statTime.textContent = '00:00'; return; }
-      const sec = Math.max(0, Math.floor((Date.now() - state.startedAt) / 1000));
-      const mm = String(Math.floor(sec / 60)).padStart(2,'0');
-      const ss = String(sec % 60).padStart(2,'0');
-      statTime.textContent = mm + ':' + ss;
+      const sec = Math.max(0, Math.floor((Date.now() - state.startedAt) / 1000)); statTime.textContent = String(Math.floor(sec / 60)).padStart(2,'0') + ':' + String(sec % 60).padStart(2,'0');
     }
     setInterval(updateClock, 400);
 
     function eyeOpenness(landmarks, topIdx, bottomIdx, leftIdx, rightIdx){
       const top = landmarks[topIdx], bottom = landmarks[bottomIdx], left = landmarks[leftIdx], right = landmarks[rightIdx];
-      const vertical = Math.hypot(top.x - bottom.x, top.y - bottom.y);
-      const horizontal = Math.hypot(left.x - right.x, left.y - right.y);
+      const vertical = Math.hypot(top.x - bottom.x, top.y - bottom.y), horizontal = Math.hypot(left.x - right.x, left.y - right.y);
       return vertical / Math.max(horizontal, 1e-6);
     }
 
-    function irisCenter(landmarks, ids){
-      const pts = ids.map(i => landmarks[i]).filter(Boolean);
-      return { x:avg(pts,'x'), y:avg(pts,'y') };
-    }
-
-    function eyeBox(landmarks, ids){
-      const pts = ids.map(i => landmarks[i]).filter(Boolean);
-      return {
-        minX: Math.min(...pts.map(p => p.x)),
-        maxX: Math.max(...pts.map(p => p.x)),
-        minY: Math.min(...pts.map(p => p.y)),
-        maxY: Math.max(...pts.map(p => p.y))
-      };
-    }
-
-    function processBlink(landmarks){
+    function detectBlinks(landmarks){
       const leftOpen = eyeOpenness(landmarks, 159, 145, 33, 133);
       const rightOpen = eyeOpenness(landmarks, 386, 374, 362, 263);
       const openness = (leftOpen + rightOpen) / 2;
       const now = Date.now();
-
-      if(openness < state.blink.threshold && !state.blink.closed){
-        state.blink.closed = true;
-        state.blink.closeTs = now;
-        setBlink('Fechado');
-      } else if(openness >= state.blink.threshold && state.blink.closed){
-        const dur = now - state.blink.closeTs;
-        state.blink.closed = false;
-        setBlink('Aberto');
-
-        if(dur >= state.blink.minMs && dur <= state.blink.maxMs && now - state.blink.lastBlinkTs > 550){
+      if(openness < state.blink.threshold && !state.blink.closed){ state.blink.closed = true; state.blink.closeTs = now; }
+      else if(openness >= state.blink.threshold && state.blink.closed){
+        const dur = now - state.blink.closeTs; state.blink.closed = false;
+        if(dur >= state.blink.minMs && dur <= state.blink.maxMs && now - state.blink.lastBlinkTs > 90){
           state.blink.lastBlinkTs = now;
-          const hovered = getArtworkById(state.hoveredArtworkId);
-          if(hovered){
-            selectArtwork(hovered, 'blink');
-            permissionNote.textContent = 'Blink detectado: zoom na obra “' + hovered.title + '”.';
-            log('Blink zoom em: ' + hovered.title + ' (' + dur + ' ms)');
-          } else if(state.zoom.focusTarget > 0){
-            resetZoom();
-            permissionNote.textContent = 'Blink detectado: zoom resetado.';
-            log('Blink resetou zoom.');
-          }
+          if(now - state.blink.windowStartTs > state.blink.windowMs){ state.blink.windowStartTs = now; state.blink.countInWindow = 0; }
+          state.blink.countInWindow += 1; blinkText.textContent = String(state.blink.countInWindow);
+          log('Piscada detectada (' + dur + ' ms).');
+          if(state.blink.countInWindow >= 2){ state.blink.countInWindow = 0; blinkText.textContent = '0'; toggleDoubleBlinkAction(); }
         }
       }
+      if(now - state.blink.windowStartTs > state.blink.windowMs && state.blink.countInWindow > 0){ state.blink.countInWindow = 0; blinkText.textContent = '0'; }
     }
 
-    function mapGazeFromLandmarks(landmarks){
-      const leftIris = irisCenter(landmarks,[468,469,470,471,472]);
-      const rightIris = irisCenter(landmarks,[473,474,475,476,477]);
-      const leftEye = eyeBox(landmarks,[33,133,159,145,160,144]);
-      const rightEye = eyeBox(landmarks,[362,263,386,374,385,380]);
+    function mapFaceToControls(landmarks){
+      const nose = landmarks[1];
+      const leftOuter = landmarks[33], rightOuter = landmarks[263];
+      const forehead = landmarks[10], chin = landmarks[152];
+      const leftMouth = landmarks[61], rightMouth = landmarks[291];
+      const eyeMid = { x:(leftOuter.x + rightOuter.x)/2, y:(leftOuter.y + rightOuter.y)/2 };
+      const faceCenter = { x:(eyeMid.x + nose.x)/2, y:(forehead.y + chin.y)/2 };
+      const eyeDist = hypot2(leftOuter, rightOuter);
+      const faceHeight = hypot2(forehead, chin);
+      const mouthMid = { x:(leftMouth.x + rightMouth.x)/2, y:(leftMouth.y + rightMouth.y)/2 };
 
-      const lrx = clamp((leftIris.x - leftEye.minX) / Math.max(.001, leftEye.maxX - leftEye.minX), 0, 1);
-      const rrx = clamp((rightIris.x - rightEye.minX) / Math.max(.001, rightEye.maxX - rightEye.minX), 0, 1);
-      const lry = clamp((leftIris.y - leftEye.minY) / Math.max(.001, leftEye.maxY - leftEye.minY), 0, 1);
-      const rry = clamp((rightIris.y - rightEye.minY) / Math.max(.001, rightEye.maxY - rightEye.minY), 0, 1);
+      const yaw = clamp(((nose.x - eyeMid.x) / Math.max(eyeDist, 1e-6)) * 2.4, -1, 1);
+      const pitch = clamp(((mouthMid.y - eyeMid.y) / Math.max(faceHeight, 1e-6) - 0.18) * 5.0, -1, 1);
+      const scale = clamp((eyeDist * 0.55 + faceHeight * 0.45), 0.08, 0.45);
 
-      const rawX = (((lrx + rrx) / 2) - .5) * state.calibration.gainX + .5 + state.calibration.xOffset;
-      const rawY = (((lry + rry) / 2) - .5) * state.calibration.gainY + .5 + state.calibration.yOffset;
+      state.tracking.faceX = faceCenter.x;
+      state.tracking.faceY = faceCenter.y;
+      state.tracking.faceScale = scale;
+      state.tracking.yaw = yaw;
+      state.tracking.pitch = pitch;
 
-      gaze.rawX = clamp(rawX, .02, .98);
-      gaze.rawY = clamp(rawY, .02, .98);
+      const cx = state.calibration.centerX, cy = state.calibration.centerY, cs = state.calibration.scale;
+      const dyaw = (yaw - state.calibration.yaw) * state.calibration.gainYaw;
+      const dpitch = (pitch - state.calibration.pitch) * state.calibration.gainPitch;
+      const dx = (faceCenter.x - cx) * state.calibration.gainX;
+      const dy = (faceCenter.y - cy) * state.calibration.gainY;
+      const ds = (scale - cs) * state.calibration.gainScale;
 
-      gaze.targetX = clamp(lerp(gaze.targetX, gaze.rawX, .24), .02, .98);
-      gaze.targetY = clamp(lerp(gaze.targetY, gaze.rawY, .24), .02, .98);
+      gaze.targetX = clamp(0.5 + dx + dyaw * 0.22, 0.02, 0.98);
+      gaze.targetY = clamp(0.5 + dy + dpitch * 0.12, 0.02, 0.98);
 
-      const eyeWidthDiff = Math.abs((leftEye.maxX - leftEye.minX) - (rightEye.maxX - rightEye.minX));
-      gaze.quality = clamp(1 - eyeWidthDiff * 10, .48, .98);
+      state.walk.turn = clamp(dyaw * 0.9, -1, 1);
+      state.walk.vx = clamp(dx * 0.55, -0.55, 0.55);
+      state.walk.vz = clamp(ds * 0.95 - dpitch * 0.18, -0.65, 0.65);
+
+      if(Math.abs(state.walk.vz) > 0.18) setWalk(state.walk.vz > 0 ? 'Frente' : 'Trás');
+      else if(Math.abs(state.walk.vx) > 0.15) setWalk(state.walk.vx > 0 ? 'Direita' : 'Esquerda');
+      else if(Math.abs(state.walk.turn) > 0.15) setWalk(state.walk.turn > 0 ? 'Girando dir.' : 'Girando esq.');
+      else setWalk('Parado');
+
+      gaze.quality = clamp(1 - Math.abs(yaw) * 0.2, 0.55, 0.98);
     }
 
     async function loadScript(src){
       return new Promise((resolve, reject) => {
         const old = document.querySelector('script[data-src="' + src + '"]');
         if(old){ resolve(true); return; }
-        const s = document.createElement('script');
-        s.src = src;
-        s.async = true;
-        s.dataset.src = src;
-        s.onload = () => resolve(true);
-        s.onerror = () => reject(new Error('Falha ao carregar ' + src));
-        document.head.appendChild(s);
+        const s = document.createElement('script'); s.src = src; s.async = true; s.dataset.src = src; s.onload = () => resolve(true); s.onerror = () => reject(new Error('Falha ao carregar ' + src)); document.head.appendChild(s);
       });
     }
 
     async function loadScriptWithFallback(urls){
       let lastErr = null;
       for(const url of urls){
-        try{
-          await loadScript(url);
-          log('Biblioteca carregada: ' + url);
-          return url;
-        } catch(err){
-          lastErr = err;
-          log('Tentativa falhou: ' + url);
-        }
+        try{ await loadScript(url); log('Biblioteca carregada: ' + url); return url; }
+        catch(err){ lastErr = err; log('Tentativa falhou: ' + url); }
       }
       throw lastErr || new Error('Nenhuma URL carregou.');
     }
 
     async function startTracking(){
-      log('Iniciar tracking clicado.');
+      log('Iniciar tracking facial clicado.');
       state.startedAt = state.startedAt || Date.now();
-      state.running = true;
-      setStatus(false, 'Preparando');
-      permissionNote.textContent = 'Tentando abrir webcam + tracking ocular…';
-
+      state.running = true; setStatus(false, 'Preparando'); permissionNote.textContent = 'Tentando abrir webcam + tracking facial…';
       try{
-        if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
-          throw new Error('getUserMedia não disponível neste navegador/ambiente.');
-        }
-
-        const loadedUrl = await loadScriptWithFallback([
-          'https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js',
-          'https://unpkg.com/@mediapipe/face_mesh/face_mesh.js'
-        ]);
-
-        state.stream = await navigator.mediaDevices.getUserMedia({
-          video:{ width:{ideal:640}, height:{ideal:480}, facingMode:'user' },
-          audio:false
-        });
-        video.srcObject = state.stream;
-        await video.play();
-        log('Webcam aberta.');
-
-        state.faceMesh = new window.FaceMesh({
-          locateFile:(file) => loadedUrl.indexOf('unpkg.com') !== -1
-            ? 'https://unpkg.com/@mediapipe/face_mesh/' + file
-            : 'https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/' + file
-        });
-        state.faceMesh.setOptions({
-          maxNumFaces:1,
-          refineLandmarks:true,
-          minDetectionConfidence:.55,
-          minTrackingConfidence:.55
-        });
-
+        if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('getUserMedia não disponível neste navegador/ambiente.');
+        const loadedUrl = await loadScriptWithFallback(['https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js','https://unpkg.com/@mediapipe/face_mesh/face_mesh.js']);
+        state.stream = await navigator.mediaDevices.getUserMedia({ video:{ width:{ideal:640}, height:{ideal:480}, facingMode:'user' }, audio:false });
+        video.srcObject = state.stream; await video.play(); log('Webcam aberta.');
+        state.faceMesh = new window.FaceMesh({ locateFile:(file) => loadedUrl.indexOf('unpkg.com') !== -1 ? 'https://unpkg.com/@mediapipe/face_mesh/' + file : 'https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/' + file });
+        state.faceMesh.setOptions({ maxNumFaces:1, refineLandmarks:true, minDetectionConfidence:.55, minTrackingConfidence:.55 });
         state.faceMesh.onResults((results) => {
           if(!state.running) return;
-          if(!results.multiFaceLandmarks || !results.multiFaceLandmarks[0]){
-            setStatus(false, 'Rosto não encontrado');
-            gaze.quality = .45;
-            return;
-          }
+          if(!results.multiFaceLandmarks || !results.multiFaceLandmarks[0]){ setStatus(false, 'Rosto não encontrado'); gaze.quality = .45; setWalk('Parado'); return; }
           const landmarks = results.multiFaceLandmarks[0];
-          mapGazeFromLandmarks(landmarks);
-          processBlink(landmarks);
-
-          state.usingMouse = false;
-          setMode('Webcam');
-          setStatus(true, 'Tracking ocular ativo');
-          permissionNote.textContent = 'Tracking ocular ativo. Pisque sobre uma obra para dar zoom.';
+          mapFaceToControls(landmarks);
+          detectBlinks(landmarks);
+          state.usingMouse = false; setMode('Rosto'); setStatus(true, 'Tracking facial ativo'); permissionNote.textContent = 'Tracking facial ativo. Mova o rosto para andar e dê duas piscadas rápidas para aproximar/afastar.';
         });
-
         async function mediaLoop(){
           if(!state.running || !state.faceMesh) return;
-          try{
-            if(video.readyState >= 2){
-              await state.faceMesh.send({ image: video });
-            }
-          } catch(err){
-            log('Erro no frame do MediaPipe: ' + err.message);
-          }
+          try{ if(video.readyState >= 2){ await state.faceMesh.send({ image: video }); } }
+          catch(err){ log('Erro no frame do MediaPipe: ' + err.message); }
           state.rafMedia = requestAnimationFrame(mediaLoop);
         }
         if(state.rafMedia) cancelAnimationFrame(state.rafMedia);
         state.rafMedia = requestAnimationFrame(mediaLoop);
       } catch(err){
-        state.usingMouse = true;
-        setMode('Mouse');
-        setStatus(true, 'Modo mouse ativo');
-        const reason = err && (err.message || err.name) ? (err.message || err.name) : String(err);
-        permissionNote.textContent = 'Tracking ocular não iniciou: ' + reason + '. O modo mouse ficou ativo para teste.';
-        log('Falha no tracking ocular: ' + reason + ' | entrando no modo mouse.');
+        state.usingMouse = true; setMode('Mouse'); setStatus(true, 'Modo mouse ativo'); const reason = err && (err.message || err.name) ? (err.message || err.name) : String(err); permissionNote.textContent = 'Tracking facial não iniciou: ' + reason + '. O modo mouse ficou ativo para teste.'; log('Falha no tracking facial: ' + reason + ' | entrando no modo mouse.');
       }
     }
 
     function stopTracking(){
-      state.running = false;
-      if(state.rafMedia) cancelAnimationFrame(state.rafMedia);
-      state.rafMedia = null;
-      if(state.stream){
-        state.stream.getTracks().forEach(t => t.stop());
-        state.stream = null;
-      }
-      video.srcObject = null;
-      state.usingMouse = true;
-      setMode('Cena ativa');
-      setStatus(false, 'Tracking desligado');
-      permissionNote.textContent = 'Tracking desligado. A sala continua ativa.';
-      dwellFill.style.width = '0%';
-      resetZoom();
-      log('Tracking parado.');
+      state.running = false; if(state.rafMedia) cancelAnimationFrame(state.rafMedia); state.rafMedia = null; if(state.stream){ state.stream.getTracks().forEach(t => t.stop()); state.stream = null; } video.srcObject = null; state.usingMouse = true; setMode('Cena ativa'); setStatus(false, 'Tracking desligado'); setWalk('Parado'); permissionNote.textContent = 'Tracking desligado. A sala continua ativa.'; dwellFill.style.width = '0%'; log('Tracking parado.');
     }
 
     function calibrate(){
-      if(state.usingMouse){
-        calibrationText.textContent = 'Modo mouse';
-        permissionNote.textContent = 'No modo mouse não é necessário calibrar.';
-        log('Calibração ignorada no modo mouse.');
-        return;
-      }
-      state.calibration.xOffset += (.5 - gaze.rawX) * .35;
-      state.calibration.yOffset += (.5 - gaze.rawY) * .35;
-      state.calibration.gainX = 1.28;
-      state.calibration.gainY = 1.22;
-      calibrationText.textContent = 'Concluída';
-      permissionNote.textContent = 'Calibração aplicada.';
-      log('Calibração aplicada.');
+      if(state.usingMouse){ calibrationText.textContent = 'Modo mouse'; permissionNote.textContent = 'No modo mouse não é necessário calibrar.'; log('Calibração ignorada no modo mouse.'); return; }
+      state.calibration.centerX = state.tracking.faceX;
+      state.calibration.centerY = state.tracking.faceY;
+      state.calibration.scale = state.tracking.faceScale;
+      state.calibration.yaw = state.tracking.yaw;
+      state.calibration.pitch = state.tracking.pitch;
+      state.calibration.gainX = 1.35; state.calibration.gainY = 1.08; state.calibration.gainYaw = 1.55; state.calibration.gainPitch = 1.15; state.calibration.gainScale = 3.1;
+      calibrationText.textContent = 'Concluída'; permissionNote.textContent = 'Calibração facial aplicada.'; log('Calibração facial aplicada.');
     }
 
     async function exportPdf(){
       log('Exportar PDF clicado.');
-      const sceneImg = roomCanvas.toDataURL('image/png',1.0);
-      const heatImg = heatmapCanvas.toDataURL('image/png',1.0);
-
+      const sceneImg = roomCanvas.toDataURL('image/png',1.0), heatImg = heatmapCanvas.toDataURL('image/png',1.0);
       try{
         await loadScript('https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js');
-        const jsPDF = window.jspdf && window.jspdf.jsPDF;
-        if(!jsPDF) throw new Error('jsPDF não disponível.');
-
-        const pdf = new jsPDF('p','mm','a4');
-        let y = 16;
-        pdf.setFillColor(8,17,31);
-        pdf.rect(0,0,210,297,'F');
-        pdf.setTextColor(238,244,255);
-        pdf.setFont('helvetica','bold');
-        pdf.setFontSize(18);
-        pdf.text('Relatório de tracking ocular - Sala 3D',12,y);
-        y += 8;
-        pdf.setFont('helvetica','normal');
-        pdf.setFontSize(10);
-        pdf.setTextColor(168,185,216);
-        pdf.text('Gerado em: ' + new Date().toLocaleString(),12,y);
-        y += 9;
-        pdf.setTextColor(238,244,255);
-        pdf.setFontSize(11);
-        pdf.text('Modo: ' + (state.usingMouse ? 'Mouse' : 'Webcam'),12,y); y += 5;
-        pdf.text('Amostras: ' + state.heatPoints.length,12,y); y += 5;
-        pdf.text('Fixações: ' + state.fixations,12,y); y += 5;
-        pdf.text('Obras vistas: ' + state.seenArtworkIds.size,12,y); y += 5;
-        pdf.text('Qualidade estimada: ' + Math.round(gaze.quality * 100) + '%',12,y); y += 5;
-        pdf.text('Zoom ativo: ' + (state.zoom.focus > .2 ? 'sim' : 'não'),12,y); y += 8;
-
-        pdf.setFont('helvetica','bold');
-        pdf.text('Cena da sala e heatmap',12,y);
-        y += 3;
-        pdf.addImage(sceneImg,'PNG',12,y,88,66,undefined,'FAST');
-        pdf.addImage(heatImg,'PNG',108,y,88,66,undefined,'FAST');
-        y += 74;
-
-        pdf.setFont('helvetica','bold');
-        pdf.text('Seleções registradas',12,y);
-        y += 6;
-        pdf.setFont('helvetica','normal');
-        if(!state.selections.length){
-          pdf.text('Nenhuma seleção registrada.',12,y);
-        } else {
-          const grouped = {};
-          state.selections.forEach(s => {
-            grouped[s.id] = grouped[s.id] || { title:s.title, count:0 };
-            grouped[s.id].count += 1;
-          });
-          Object.keys(grouped).forEach(id => {
-            pdf.text('• ' + grouped[id].title + ' (' + grouped[id].count + ')',12,y);
-            y += 5;
-          });
-        }
-        pdf.save('relatorio_tracking_sala3d.pdf');
-        log('PDF exportado com jsPDF.');
-      } catch(err){
-        log('Falha ao exportar PDF: ' + err.message);
-        permissionNote.textContent = 'Falha ao exportar PDF: ' + err.message;
-      }
+        const jsPDF = window.jspdf && window.jspdf.jsPDF; if(!jsPDF) throw new Error('jsPDF não disponível.');
+        const pdf = new jsPDF('p','mm','a4'); let y = 16;
+        pdf.setFillColor(8,17,31); pdf.rect(0,0,210,297,'F'); pdf.setTextColor(238,244,255); pdf.setFont('helvetica','bold'); pdf.setFontSize(18); pdf.text('Relatório de tracking facial - Sala 3D',12,y); y += 8;
+        pdf.setFont('helvetica','normal'); pdf.setFontSize(10); pdf.setTextColor(168,185,216); pdf.text('Gerado em: ' + new Date().toLocaleString(),12,y); y += 9;
+        pdf.setTextColor(238,244,255); pdf.setFontSize(11);
+        ['Modo: ' + (state.usingMouse ? 'Mouse' : 'Rosto'),'Amostras: ' + state.heatPoints.length,'Fixações: ' + state.fixations,'Obras vistas: ' + state.seenArtworkIds.size,'Qualidade estimada: ' + Math.round(gaze.quality * 100) + '%','Posição final: x ' + camera.x.toFixed(1) + ' · z ' + camera.z.toFixed(1)].forEach(line => { pdf.text(line,12,y); y += 5; });
+        y += 3; pdf.setFont('helvetica','bold'); pdf.text('Cena da sala e heatmap',12,y); y += 3; pdf.addImage(sceneImg,'PNG',12,y,88,66,undefined,'FAST'); pdf.addImage(heatImg,'PNG',108,y,88,66,undefined,'FAST'); y += 74;
+        pdf.setFont('helvetica','bold'); pdf.text('Seleções registradas',12,y); y += 6; pdf.setFont('helvetica','normal');
+        if(!state.selections.length) pdf.text('Nenhuma seleção registrada.',12,y);
+        else { const grouped = {}; state.selections.forEach(s => { grouped[s.id] = grouped[s.id] || { title:s.title, count:0 }; grouped[s.id].count += 1; }); Object.keys(grouped).forEach(id => { pdf.text('• ' + grouped[id].title + ' (' + grouped[id].count + ')',12,y); y += 5; }); }
+        pdf.save('relatorio_tracking_facial_sala3d.pdf'); log('PDF exportado com jsPDF.');
+      } catch(err){ log('Falha ao exportar PDF: ' + err.message); permissionNote.textContent = 'Falha ao exportar PDF: ' + err.message; }
     }
 
     scenePanel.addEventListener('mousemove', (ev) => {
@@ -1134,14 +607,12 @@ HTML_APP = r"""
       const rect = scenePanel.getBoundingClientRect();
       gaze.targetX = clamp((ev.clientX - rect.left) / rect.width, .02, .98);
       gaze.targetY = clamp((ev.clientY - rect.top) / rect.height, .02, .98);
+      state.walk.turn = (gaze.targetX - .5) * .8; state.walk.vx = (gaze.targetX - .5) * .35; state.walk.vz = (.5 - gaze.targetY) * .45;
+      if(Math.abs(state.walk.vz) > .18) setWalk(state.walk.vz > 0 ? 'Frente' : 'Trás'); else if(Math.abs(state.walk.vx) > .15) setWalk(state.walk.vx > 0 ? 'Direita' : 'Esquerda'); else setWalk('Parado');
     });
 
     scenePanel.addEventListener('click', () => {
-      if(state.usingMouse){
-        const hovered = getArtworkById(state.hoveredArtworkId);
-        if(hovered) selectArtwork(hovered, 'mouse_click');
-        else resetZoom();
-      }
+      if(state.usingMouse){ const hovered = getArtworkById(state.hoveredArtworkId); if(hovered) zoomToArtwork(hovered); else zoomOut(); }
     });
 
     document.getElementById('startBtn').addEventListener('click', startTracking);
@@ -1149,44 +620,20 @@ HTML_APP = r"""
     document.getElementById('calibrateBtn').addEventListener('click', calibrate);
     document.getElementById('resetHeatBtn').addEventListener('click', clearHeatmap);
     document.getElementById('exportPdfBtn').addEventListener('click', exportPdf);
+    document.getElementById('resetCamBtn').addEventListener('click', resetCamera);
 
     function tick(now){
       requestAnimationFrame(tick);
       if(!state.startedAt) state.startedAt = Date.now();
-      updateCursor();
-      drawRoom();
-      drawReveal();
-
-      if(state.running || state.usingMouse){
-        updateHoverAndDwell(now);
-        const t = Date.now();
-        if(t - state.lastSampleTs >= state.sampleIntervalMs){
-          state.lastSampleTs = t;
-          addHeatPoint(gaze.x, gaze.y);
-        }
-      }
-
-      if(!state.hoveredArtworkId){
-        gazeCursor.style.width = '28px';
-        gazeCursor.style.height = '28px';
-        gazeCursor.style.borderColor = 'rgba(255,255,255,.95)';
-      }
+      updateCursor(); drawRoom(); drawReveal(); updateHoverAndDwell(now);
+      const t = Date.now(); if(t - state.lastSampleTs >= state.sampleIntervalMs){ state.lastSampleTs = t; addHeatPoint(gaze.x, gaze.y); }
+      if(!state.hoveredArtworkId){ cursor.style.width = '28px'; cursor.style.height = '28px'; cursor.style.borderColor = 'rgba(255,255,255,.95)'; }
     }
 
-    resizeCanvases();
-    buildArtworkList();
-    updateSelectedPanel(null);
-    calibrationText.textContent = 'Pendente';
-    zoomText.textContent = 'Normal';
-    setMode('Cena ativa');
-    setBlink('Pronto');
-    setStatus(true, 'Cena carregada');
-    window.addEventListener('resize', resizeCanvases);
-    requestAnimationFrame(tick);
-    log('Sala desenhada com sucesso.');
+    resizeCanvases(); buildArtworkList(); updateSelectedPanel(null); calibrationText.textContent = 'Pendente'; zoomText.textContent = 'Normal'; positionText.textContent = 'x 0.0 · z -1.4'; setMode('Cena ativa'); blinkText.textContent = '0'; setStatus(true, 'Cena carregada'); setWalk('Parado'); window.addEventListener('resize', resizeCanvases); requestAnimationFrame(tick); log('Sala desenhada com sucesso.');
   })();
   </script>
 </div>
-"""
+'''
 
-components.html(HTML_APP, height=1280, scrolling=True)
+components.html(HTML_APP, height=1300, scrolling=True)
