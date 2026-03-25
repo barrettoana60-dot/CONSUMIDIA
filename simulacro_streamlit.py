@@ -1,16 +1,13 @@
 import streamlit as st
-from packaging.version import Version
+import streamlit.components.v1 as components
 
 st.set_page_config(page_title="Sala 3D com Eye Tracking", layout="wide")
-
-if Version(st.__version__) < Version("1.55.0"):
-    st.error("Este app precisa de Streamlit 1.55.0 ou superior por causa do st.html com JavaScript.")
-    st.stop()
 
 st.title("Sala 3D com tracking ocular, dwell-click, heatmap e PDF")
 st.caption(
     "Permita o acesso à câmera, use o botão de calibração e olhe para as obras para navegar e selecioná-las."
 )
+st.info("Versão corrigida para Streamlit: o frontend roda dentro de um componente HTML, o que permite executar o JavaScript dos botões e da câmera.")
 
 HTML_APP = r'''
 <div id="eye-room-root">
@@ -1354,4 +1351,4 @@ HTML_APP = r'''
 </div>
 '''
 
-st.html(HTML_APP, unsafe_allow_javascript=True, width="stretch")
+components.html(HTML_APP, height=1200, scrolling=True)
