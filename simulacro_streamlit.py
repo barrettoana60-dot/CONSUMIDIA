@@ -4,7 +4,7 @@ import streamlit.components.v1 as components
 st.set_page_config(page_title="Sala 3D – Face Tracking Parallax", layout="wide")
 
 st.title("Sala 3D com Face Tracking Robusto")
-st.caption("Cabeça/rosto como navegação principal, malha facial com contorno dos olhos, blink robusto para zoom e fallback automático para câmera fraca com zoom por distância do rosto.")
+st.caption("Cabeça/rosto como navegação principal, malha facial geral com contorno dos olhos, direção por pose da cabeça, blink opcional para zoom e fallback automático para câmera fraca com zoom por distância do rosto.")
 
 HTML_APP = r"""
 <div id="eye-room-root">
@@ -242,7 +242,7 @@ HTML_APP = r"""
 
       <div class="chip" id="statusChip"><span id="statusDot" class="dot"></span><span id="statusText">Aguardando</span></div>
       <div class="chip" id="modeChip">Modo: <strong id="modeText">Cena ativa</strong></div>
-      <div class="chip" id="blinkChip">👁 Blink: <strong id="blinkText">Calibrando</strong></div>
+      <div class="chip" id="blinkChip">👁 Blink: <strong id="blinkText">Pronto</strong></div>
 
       <div class="meter">
         <div class="label">Dwell-click</div>
@@ -284,7 +284,7 @@ HTML_APP = r"""
       <h3>Obra em foco</h3>
       <div id="selected-title">Nenhuma obra em foco</div>
       <div id="selected-artist">Olhe para uma obra para ver a ficha. 1 piscada afasta. 2 piscadas aproximam.</div>
-      <div id="selected-description">No modo câmera fraca, o sistema mantém a permanência do olhar e troca o zoom de blink por distância do rosto e botões manuais.</div>
+      <div id="selected-description">No modo câmera fraca, o sistema mantém a permanência do olhar e troca o zoom de blink por distância do rosto e botões manuais; no modo híbrido, os dois funcionam juntos.</div>
     </div>
 
     <div class="card">
@@ -428,13 +428,15 @@ const state = {
     emaFast:0.27,
     baseline:0.27,
     baselineReady:false,
-    minBaseline:0.16,
+    warmupFrames:0,
+    stableFrames:0,
+    minBaseline:0.15,
     maxBaseline:0.42,
-    closeRatio:0.63,
-    openRatio:0.82,
+    closeRatio:0.72,
+    openRatio:0.86,
     threshClose:0.18,
     threshOpen:0.24,
-    minMs:40,
+    minMs:32,
     maxMs:420,
     closeFrames:0,
     openFrames:0,
@@ -443,14 +445,18 @@ const state = {
     pendingSingleTs:0,
     lastBlinkTs:0,
     lastEventTs:0,
-    doubleWindowMs:440,
-    debounceMs:100,
+    lastCycleMs:0,
+    doubleWindowMs:560,
+    debounceMs:88,
     eyeConfidence:0,
+    lastLeft:0.27,
+    lastRight:0.27,
+    ratio:1,
     debugLast:'init'
   },
 
   tracking:{
-    invertX:false,
+    invertX:true,
     history:[],
     historyMax:10,
     baselineReady:false,
@@ -462,12 +468,12 @@ const state = {
       pitch:0,
       size:0.22
     },
-    deadzoneX:0.010,
+    deadzoneX:0.012,
     deadzoneY:0.012,
-    centerGainX:1.40,
-    centerGainY:0.96,
-    yawGainX:0.40,
-    pitchGainY:0.24,
+    centerGainX:0.38,
+    centerGainY:0.78,
+    yawGainX:1.08,
+    pitchGainY:0.34,
     lastSizeRatio:1,
     sizeVelocity:0,
     videoBrightnessScore:0.6,
@@ -476,6 +482,7 @@ const state = {
     totalQuality:0.62,
     modeKind:'full',
     weakZoomCooldownUntil:0,
+    weakZoomArmed:true,
     lastModeTs:0,
     frameCounter:0
   },
@@ -498,7 +505,7 @@ const state = {
 
 const modeConfig = {
   full:{label:'Completo', allowBlink:true, usesFaceDistance:false},
-  hybrid:{label:'Híbrido', allowBlink:true, usesFaceDistance:false},
+  hybrid:{label:'Híbrido', allowBlink:true, usesFaceDistance:true},
   weak:{label:'Câmera fraca', allowBlink:false, usesFaceDistance:true}
 };
 
@@ -543,7 +550,9 @@ function setTrackingMode(kind){
   state.tracking.modeKind = kind;
   trackingModeText.textContent = cfg.label;
   weakZoomNote.textContent = cfg.usesFaceDistance
-    ? 'Câmera fraca detectada: blink desligado. O zoom responde pela distância do rosto e pelos botões.'
+    ? (cfg.allowBlink
+        ? 'Modo híbrido: blink continua ativo, mas o zoom também usa distância do rosto e botões como reforço.'
+        : 'Câmera fraca detectada: blink desligado. O zoom responde pela distância do rosto e pelos botões.')
     : 'Blink ativo. 1 piscada afasta, 2 piscadas rápidas aproximam a obra em foco.';
   if(kind === 'weak') {
     permNote.textContent = 'Câmera fraca detectada: cabeça continua controlando a direção, a obra entra por permanência do olhar e o zoom usa distância do rosto + botões.';
@@ -567,11 +576,17 @@ function resetBlinkState(){
   state.blink.pendingSingleTs = 0;
   state.blink.lastBlinkTs = 0;
   state.blink.lastEventTs = 0;
+  state.blink.lastCycleMs = 0;
   state.blink.ema = 0.27;
   state.blink.emaFast = 0.27;
   state.blink.baseline = 0.27;
   state.blink.baselineReady = false;
+  state.blink.warmupFrames = 0;
+  state.blink.stableFrames = 0;
   state.blink.eyeConfidence = 0;
+  state.blink.lastLeft = 0.27;
+  state.blink.lastRight = 0.27;
+  state.blink.ratio = 1;
   state.blink.debugLast = 'reset';
   setBlink('Pronto');
   gazeCursor.style.borderColor = 'rgba(255,255,255,.92)';
@@ -585,6 +600,7 @@ function resetTrackingState(){
   state.tracking.sizeVelocity = 0;
   state.tracking.totalQuality = 0.62;
   state.tracking.weakZoomCooldownUntil = 0;
+  state.tracking.weakZoomArmed = true;
   state.tracking.baseline = {
     centerX:0.5,
     centerY:0.5,
@@ -1063,42 +1079,56 @@ function processBlink(landmarks){
   const rightOpen = eyeContourOpenness(landmarks, [[386,374],[385,380],[387,373]], 362, 263);
   const now = Date.now();
 
-  const rawAvg = (leftOpen + rightOpen) * 0.5;
-  const asym = Math.abs(leftOpen - rightOpen);
-  const rawOpen = rawAvg * 0.82 + Math.min(leftOpen, rightOpen) * 0.18;
+  state.blink.lastLeft = lerp(state.blink.lastLeft, leftOpen, 0.36);
+  state.blink.lastRight = lerp(state.blink.lastRight, rightOpen, 0.36);
 
-  state.blink.emaFast = lerp(state.blink.emaFast, rawOpen, 0.42);
-  state.blink.ema = lerp(state.blink.ema, rawOpen, 0.19);
+  const rawAvg = (state.blink.lastLeft + state.blink.lastRight) * 0.5;
+  const asym = Math.abs(state.blink.lastLeft - state.blink.lastRight);
+  const rawOpen = rawAvg * 0.42 + Math.min(state.blink.lastLeft, state.blink.lastRight) * 0.58;
+
+  state.blink.emaFast = lerp(state.blink.emaFast, rawOpen, 0.44);
+  state.blink.ema = lerp(state.blink.ema, rawOpen, 0.18);
 
   if(state.blink.phase === 'open'){
+    state.blink.warmupFrames += 1;
+    const stableInput = Math.abs(state.blink.emaFast - state.blink.ema) < 0.022 && asym < 0.12;
+    if(stableInput) state.blink.stableFrames += 1;
+    else state.blink.stableFrames = Math.max(0, state.blink.stableFrames - 1);
+
     if(!state.blink.baselineReady){
-      state.blink.baseline = lerp(state.blink.baseline, state.blink.ema, 0.08);
-      if(Math.abs(state.blink.baseline - state.blink.ema) < 0.010){
+      state.blink.baseline = lerp(state.blink.baseline, clamp(state.blink.ema, state.blink.minBaseline, state.blink.maxBaseline), 0.08);
+      if(state.blink.warmupFrames > 10 && state.blink.stableFrames >= 6){
         state.blink.baselineReady = true;
       }
-    } else if(state.blink.ema > state.blink.baseline * 0.80){
+    } else if(state.blink.ema > state.blink.baseline * 0.82 && asym < 0.13){
       state.blink.baseline = lerp(
         state.blink.baseline,
         clamp(state.blink.ema, state.blink.minBaseline, state.blink.maxBaseline),
-        0.018
+        0.016
       );
     }
   }
 
   const baseline = clamp(state.blink.baseline, state.blink.minBaseline, state.blink.maxBaseline);
-  const closeThresh = clamp(baseline * state.blink.closeRatio, 0.10, 0.24);
-  const openThresh  = clamp(baseline * state.blink.openRatio, 0.16, 0.34);
+  const ratio = clamp(state.blink.emaFast / Math.max(0.001, baseline), 0, 1.5);
+  const closeThresh = clamp(state.blink.closeRatio, 0.58, 0.82);
+  const openThresh  = clamp(state.blink.openRatio, 0.76, 0.94);
+  state.blink.ratio = ratio;
   state.blink.threshClose = closeThresh;
   state.blink.threshOpen = openThresh;
 
-  const openness = Math.min(state.blink.emaFast, state.blink.ema * 1.05);
-  const eyeScore = clamp((baseline - 0.14) / 0.16, 0, 1) * 0.45 + clamp((0.085 - asym) / 0.085, 0, 1) * 0.25 + (state.blink.baselineReady ? 0.30 : 0.05);
+  const eyeScore = (
+    clamp((baseline - 0.14) / 0.16, 0, 1) * 0.34 +
+    clamp((0.11 - asym) / 0.11, 0, 1) * 0.20 +
+    clamp((0.03 - Math.abs(state.blink.emaFast - state.blink.ema)) / 0.03, 0, 1) * 0.20 +
+    (state.blink.baselineReady ? 0.26 : 0.05)
+  );
   state.blink.eyeConfidence = clamp(eyeScore, 0, 1);
 
-  if(openness < closeThresh){
+  if(ratio < closeThresh){
     state.blink.closeFrames += 1;
     state.blink.openFrames = 0;
-  } else if(openness > openThresh){
+  } else if(ratio > openThresh){
     state.blink.openFrames += 1;
     if(state.blink.phase === 'open') state.blink.closeFrames = 0;
   }
@@ -1113,8 +1143,9 @@ function processBlink(landmarks){
     return;
   }
 
-  if(!state.blink.baselineReady || state.blink.eyeConfidence < 0.55){
-    setBlink('Calibrando');
+  const minEyeScore = state.tracking.modeKind === 'hybrid' ? 0.44 : 0.54;
+  if(!state.blink.baselineReady || state.blink.eyeConfidence < minEyeScore){
+    setBlink(state.tracking.modeKind === 'hybrid' ? 'Opcional' : 'Calibrando');
     return;
   }
 
@@ -1129,6 +1160,7 @@ function processBlink(landmarks){
     state.blink.phase = 'open';
     state.blink.closeFrames = 0;
     state.blink.openFrames = 0;
+    state.blink.lastCycleMs = dur;
     state.blink.debugLast = 'open';
     gazeCursor.style.borderColor = 'rgba(255,255,255,.92)';
     if(dur >= state.blink.minMs && dur <= state.blink.maxMs){
@@ -1171,13 +1203,13 @@ function updateTrackingMode(){
   const eyeScore = state.blink.eyeConfidence || 0;
   const stability = clamp(1 - (Math.abs(gaze.targetX - gaze.x) + Math.abs(gaze.targetY - gaze.y)) * 1.8, 0, 1);
   state.tracking.stabilityScore = lerp(state.tracking.stabilityScore, stability, 0.22);
-  const total = 0.35 + 0.18*state.tracking.videoBrightnessScore + 0.14*state.tracking.videoSharpnessScore + 0.16*state.tracking.stabilityScore + 0.17*eyeScore;
+  const total = 0.30 + 0.20*state.tracking.videoBrightnessScore + 0.18*state.tracking.videoSharpnessScore + 0.18*state.tracking.stabilityScore + 0.14*eyeScore;
   state.tracking.totalQuality = lerp(state.tracking.totalQuality, clamp(total, 0, 1), 0.24);
 
   let next = 'weak';
-  if(state.tracking.totalQuality >= 0.77 && eyeScore >= 0.58 && state.tracking.videoSharpnessScore >= 0.22){
+  if(state.tracking.totalQuality >= 0.78 && eyeScore >= 0.55 && state.tracking.videoSharpnessScore >= 0.24){
     next = 'full';
-  } else if(state.tracking.totalQuality >= 0.60 && eyeScore >= 0.48){
+  } else if(state.tracking.totalQuality >= 0.58){
     next = 'hybrid';
   }
 
@@ -1187,9 +1219,12 @@ function updateTrackingMode(){
     if(next === 'weak'){
       flashBlinkIndicator('📷 câmera fraca → zoom por distância do rosto');
       log('Modo câmera fraca ativado. Blink desativado automaticamente.');
+    } else if(next === 'hybrid'){
+      flashBlinkIndicator('🧭 modo híbrido → cabeça + distância + blink opcional');
+      log('Modo híbrido ativado: cabeça principal, zoom por distância e blink opcional.');
     } else {
       flashBlinkIndicator('👁 blink ativo novamente');
-      log('Blink reativado no modo '+next+'.');
+      log('Blink reativado no modo completo.');
     }
   }
 
@@ -1199,18 +1234,30 @@ function updateTrackingMode(){
 }
 
 function processWeakZoom(now){
-  if(state.tracking.modeKind !== 'weak') return;
+  if(state.tracking.modeKind === 'full') return;
   if(now < state.tracking.weakZoomCooldownUntil) return;
+
   const ratio = state.tracking.lastSizeRatio || 1;
   const target = blinkTarget();
-  if(ratio > 1.14 && target){
-    zoomInToArtwork(target, 'distancia_rosto', 0.18);
-    flashBlinkIndicator('↗ rosto aproximou → zoom in');
-    state.tracking.weakZoomCooldownUntil = now + 640;
-  } else if(ratio < 0.90 && state.zoom.focusTarget > 0.02){
-    zoomOutStep('distancia_rosto');
-    flashBlinkIndicator('↘ rosto afastou → zoom out');
-    state.tracking.weakZoomCooldownUntil = now + 640;
+  const zoomInThresh = state.tracking.modeKind === 'weak' ? 1.10 : 1.16;
+  const zoomOutThresh = state.tracking.modeKind === 'weak' ? 0.92 : 0.88;
+
+  if(ratio > zoomInThresh && state.tracking.weakZoomArmed){
+    if(target){
+      zoomInToArtwork(target, state.tracking.modeKind === 'weak' ? 'distancia_rosto_weak' : 'distancia_rosto_hybrid', state.tracking.modeKind === 'weak' ? 0.18 : 0.14);
+      flashBlinkIndicator('↗ rosto aproximou → zoom in');
+    }
+    state.tracking.weakZoomCooldownUntil = now + 620;
+    state.tracking.weakZoomArmed = false;
+  } else if(ratio < zoomOutThresh && !state.tracking.weakZoomArmed){
+    if(state.zoom.focusTarget > 0.02){
+      zoomOutStep(state.tracking.modeKind === 'weak' ? 'distancia_rosto_weak' : 'distancia_rosto_hybrid');
+      flashBlinkIndicator('↘ rosto afastou → zoom out');
+    }
+    state.tracking.weakZoomCooldownUntil = now + 620;
+    state.tracking.weakZoomArmed = true;
+  } else if(ratio > 0.97 && ratio < 1.03 && now >= state.tracking.weakZoomCooldownUntil){
+    state.tracking.weakZoomArmed = true;
   }
 }
 
@@ -1363,24 +1410,24 @@ function mapFaceTracking(landmarks){
   const dyaw = hyaw - state.tracking.baseline.yaw;
   const dpitch = hpitch - state.tracking.baseline.pitch;
 
-  let combinedX = dx * state.tracking.centerGainX + dyaw * state.tracking.yawGainX;
+  let combinedX = dyaw * state.tracking.yawGainX + dx * state.tracking.centerGainX;
   let combinedY = dy * state.tracking.centerGainY + dpitch * state.tracking.pitchGainY;
 
   combinedX = remapDeadzone(combinedX, state.tracking.deadzoneX);
   combinedY = remapDeadzone(combinedY, state.tracking.deadzoneY);
 
   const targetX = clamp(0.5 + combinedX * 0.92 + state.calib.xOff, 0.02, 0.98);
-  const targetY = clamp(0.5 + combinedY * 0.84 + state.calib.yOff, 0.02, 0.98);
+  const targetY = clamp(0.5 + combinedY * 0.86 + state.calib.yOff, 0.02, 0.98);
 
-  gaze.targetX = smoothTowards(gaze.targetX, targetX, 0.08, 0.16);
-  gaze.targetY = smoothTowards(gaze.targetY, targetY, 0.08, 0.16);
+  gaze.targetX = smoothTowards(gaze.targetX, targetX, 0.07, 0.14);
+  gaze.targetY = smoothTowards(gaze.targetY, targetY, 0.07, 0.14);
 
   const sizeRatio = hsize / Math.max(0.001, state.tracking.baseline.size);
   state.tracking.sizeVelocity = lerp(state.tracking.sizeVelocity, sizeRatio - state.tracking.lastSizeRatio, 0.35);
   state.tracking.lastSizeRatio = lerp(state.tracking.lastSizeRatio, sizeRatio, 0.24);
 
-  const sym = 1 - Math.abs(dx * 0.72) - Math.abs(dyaw * 0.20) - Math.abs(hsize - state.tracking.baseline.size) * 0.35;
-  gaze.quality = clamp(sym, 0.56, 0.99);
+  const sym = 1 - Math.abs(dx * 0.30) - Math.abs(dyaw * 0.18) - Math.abs(hsize - state.tracking.baseline.size) * 0.26;
+  gaze.quality = clamp(sym, 0.58, 0.99);
 }
 
 // ─── DRAW ROOM ───
@@ -1667,9 +1714,9 @@ async function startTracking(){
     state.rafMedia=requestAnimationFrame(mediaLoop);
     state.usingMouse=false;
     setMode('Webcam');
-    permNote.textContent='Tracking ativo. Cabeça controla a direção. 1 piscada afasta e 2 piscadas rápidas aproximam quando a câmera estiver boa; em câmera fraca, o zoom troca automaticamente para distância do rosto + botões.';
+    permNote.textContent='Tracking ativo. A direção vem da pose da cabeça; 1 piscada afasta e 2 piscadas rápidas aproximam quando o olho estiver confiável. Em câmera fraca, o zoom cai para distância do rosto + botões.';
     setTrackingMode('full');
-    log('Tracking facial iniciado com malha facial, contorno dos olhos e fallback automático para câmera fraca.');
+    log('Tracking facial iniciado com malha facial, contorno dos olhos, direção por cabeça e fallback automático para câmera fraca.');
 
   } catch(err){
     state.usingMouse=true;
@@ -1711,7 +1758,7 @@ function calibrate(){
   }
   state.blink.baselineReady = false;
   calibText.textContent='Concluída';
-  permNote.textContent='Calibração aplicada. Se a direção lateral ainda parecer invertida, use o botão “Inverter X”.';
+  permNote.textContent='Calibração aplicada. A cabeça é o controle principal; se a direção lateral ainda parecer invertida, use o botão “Inverter X”.';
   log('Calibração aplicada. xOff='+state.calib.xOff.toFixed(3)+' yOff='+state.calib.yOff.toFixed(3));
 }
 
