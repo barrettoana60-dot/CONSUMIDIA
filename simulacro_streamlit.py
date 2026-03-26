@@ -4,7 +4,7 @@ import streamlit.components.v1 as components
 st.set_page_config(page_title="Sala 3D – Face Tracking Parallax", layout="wide")
 
 st.title("Sala 3D com Face Tracking + Parallax")
-st.caption("Tracking facial com direção lateral corrigida, blink recalibrado e zoom por piscadas refeito. 1 piscar aproxima, 2 piscadas rápidas afastam.")
+st.caption("Tracking facial com malha no rosto, direção lateral corrigida e blink calculado pelos landmarks dos olhos. 1 piscar aproxima, 2 piscadas rápidas afastam.")
 
 HTML_APP = r"""
 <div id="eye-room-root">
@@ -124,10 +124,18 @@ HTML_APP = r"""
     box-shadow:inset 0 1px 0 rgba(255,255,255,.03);
   }
   .card h3{font-size:13px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px}
-  #video{
-    width:100%;aspect-ratio:16/10;object-fit:cover;
-    border-radius:12px;border:1px solid rgba(255,255,255,.07);
+  .camera-wrap{position:relative;width:100%;aspect-ratio:16/10;border-radius:12px;overflow:hidden;border:1px solid rgba(255,255,255,.07);background:#020609}
+  #video,
+  #meshOverlay{
+    position:absolute;inset:0;
+    width:100%;height:100%;object-fit:cover;
     background:#020609;transform:scaleX(-1);
+  }
+  #video{z-index:1}
+  #meshOverlay{z-index:2;pointer-events:none}
+  #meshDebug{
+    display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;
+    font-family:'JetBrains Mono',monospace;
   }
   /* ── STATS ── */
   .stats-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
@@ -240,8 +248,12 @@ HTML_APP = r"""
   <div class="sidebar">
     <div class="card">
       <h3>Câmera</h3>
-      <video id="video" autoplay playsinline muted></video>
-      <div class="small-note">Câmera espelhada só na visualização. O mapeamento lateral da cabeça foi refeito para reduzir inversões.</div>
+      <div class="camera-wrap">
+        <video id="video" autoplay playsinline muted></video>
+        <canvas id="meshOverlay"></canvas>
+      </div>
+      <div class="small-note">Malha facial desenhada em cima da webcam para você ver o tracking em tempo real. A câmera continua espelhada só na visualização.</div>
+      <div class="small-note" id="meshDebug">Malha: aguardando webcam…</div>
     </div>
 
     <div class="card">
@@ -303,7 +315,10 @@ const heatmapCanvas= document.getElementById('heatmap');
 const revealCanvas = document.getElementById('reveal');
 const scenePanel   = document.querySelector('.scene-panel');
 const video        = document.getElementById('video');
+const meshCanvas   = document.getElementById('meshOverlay');
+const meshDebug    = document.getElementById('meshDebug');
 const ctx          = roomCanvas.getContext('2d');
+const meshCtx      = meshCanvas.getContext('2d');
 const heatCtx      = heatmapCanvas.getContext('2d');
 const revealCtx    = revealCanvas.getContext('2d');
 
@@ -343,6 +358,8 @@ function log(msg){
 logBox.textContent = 'Sala inicializada.';
 window.addEventListener('error', e => log('ERRO: '+(e.message||'?')));
 window.addEventListener('unhandledrejection', e => log('REJECT: '+String(e.reason)));
+video.addEventListener('loadedmetadata', syncMeshCanvasSize);
+window.addEventListener('resize', syncMeshCanvasSize);
 
 // ─── STATE ───
 const state = {
@@ -381,21 +398,18 @@ const state = {
   blink:{
     closed:false,
     closeTs:0,
-    ema:0.11,
-    emaFast:0.11,
-    leftEma:0.11,
-    rightEma:0.11,
-    baseline:0.11,
-    baselineFrames:0,
+    leftEma:0.24,
+    rightEma:0.24,
+    leftOpenRef:0.24,
+    rightOpenRef:0.24,
+    openScore:1,
+    openScoreEma:1,
+    readyFrames:0,
     baselineReady:false,
-    minBaseline:0.07,
-    maxBaseline:0.30,
-    closeRatio:0.60,
-    openRatio:0.80,
-    threshClose:0.07,
-    threshOpen:0.10,
-    minMs:35,
-    maxMs:520,
+    closeThresh:0.56,
+    openThresh:0.78,
+    minMs:45,
+    maxMs:460,
     closedFrames:0,
     openFrames:0,
     minClosedFrames:1,
@@ -405,8 +419,8 @@ const state = {
     pendingSingleTs:0,
     pendingSingleTimer:null,
     lastBlinkDuration:0,
-    doubleWindowMs:300,
-    cooldownMs:90,
+    doubleWindowMs:320,
+    cooldownMs:120,
     cooldownUntil:0,
     debugLast:'init'
   },
@@ -497,15 +511,17 @@ function resetBlinkState(){
   state.blink.pendingSingleTs = 0;
   state.blink.lastBlinkDuration = 0;
   state.blink.cooldownUntil = 0;
-  state.blink.ema = 0.11;
-  state.blink.emaFast = 0.11;
-  state.blink.leftEma = 0.11;
-  state.blink.rightEma = 0.11;
-  state.blink.baseline = 0.11;
-  state.blink.baselineFrames = 0;
+  state.blink.leftEma = 0.24;
+  state.blink.rightEma = 0.24;
+  state.blink.leftOpenRef = 0.24;
+  state.blink.rightOpenRef = 0.24;
+  state.blink.openScore = 1;
+  state.blink.openScoreEma = 1;
+  state.blink.readyFrames = 0;
   state.blink.baselineReady = false;
   state.blink.debugLast = 'reset';
   setBlink('Pronto');
+  if(meshDebug) meshDebug.textContent = 'Malha: aguardando baseline dos olhos…';
   gazeCursor.style.borderColor = 'rgba(255,255,255,.92)';
 }
 
@@ -523,6 +539,21 @@ function resetTrackingState(){
 }
 
 // ─── RESIZE ───
+function syncMeshCanvasSize(){
+  if(!meshCanvas || !meshCtx) return;
+  const r = video.getBoundingClientRect();
+  const dpr = window.devicePixelRatio||1;
+  const w = Math.max(1, Math.floor(r.width * dpr));
+  const h = Math.max(1, Math.floor(r.height * dpr));
+  if(meshCanvas.width !== w || meshCanvas.height !== h){
+    meshCanvas.width = w;
+    meshCanvas.height = h;
+    meshCanvas.style.width = r.width + 'px';
+    meshCanvas.style.height = r.height + 'px';
+    meshCtx.setTransform(dpr,0,0,dpr,0,0);
+  }
+}
+
 function resizeCanvases(){
   const r = scenePanel.getBoundingClientRect();
   const dpr = window.devicePixelRatio||1;
@@ -535,6 +566,7 @@ function resizeCanvases(){
   ctx.setTransform(dpr,0,0,dpr,0,0);
   heatCtx.setTransform(dpr,0,0,dpr,0,0);
   revealCtx.setTransform(dpr,0,0,dpr,0,0);
+  syncMeshCanvasSize();
 }
 
 function wrap(v,max){
@@ -885,9 +917,9 @@ function blinkTarget(){
         best = entry.art;
       }
     });
-    if(best && bestD < Math.min(r.width, r.height) * 0.34) return best;
+    if(best) return best;
   }
-  return null;
+  return artworks[0] || null;
 }
 
 function onSingleBlink(){
@@ -936,7 +968,7 @@ function registerBlink(now){
     return;
   }
 
-  if(state.blink.lastEventTs && (now - state.blink.lastEventTs) < 70){
+  if(state.blink.lastEventTs && (now - state.blink.lastEventTs) < 85){
     state.blink.debugLast = 'debounced';
     return;
   }
@@ -951,7 +983,7 @@ function registerBlink(now){
     }
     state.blink.pendingSingleTs = 0;
     state.blink.lastBlinkTs = 0;
-    state.blink.cooldownUntil = now + 180;
+    state.blink.cooldownUntil = now + 190;
     state.blink.debugLast = 'double';
     setBlink('2x');
     onDoubleBlink();
@@ -964,81 +996,170 @@ function registerBlink(now){
   queueSingleBlink(now);
 }
 
+const LEFT_EYE_CFG = {
+  outer:33,
+  inner:133,
+  upper:[159,160,158],
+  lower:[145,144,153],
+  ring:[33,246,161,160,159,158,157,173,133,155,154,153,145,144,163,7],
+  iris:[468,469,470,471,472]
+};
+const RIGHT_EYE_CFG = {
+  outer:362,
+  inner:263,
+  upper:[386,385,387],
+  lower:[374,380,373],
+  ring:[263,466,388,387,386,385,384,398,362,382,381,380,374,373,390,249],
+  iris:[473,474,475,476,477]
+};
 
-function eyeOpenness(lm,topIdx,botIdx,lIdx,rIdx){
-  const top=lm[topIdx], bot=lm[botIdx], left=lm[lIdx], right=lm[rIdx];
-  const vert=Math.hypot(top.x-bot.x, top.y-bot.y);
-  const horiz=Math.hypot(left.x-right.x, left.y-right.y);
-  return vert/Math.max(horiz,1e-6);
+function pointFromLm(lm, idx, w, h){
+  const p = lm[idx];
+  if(!p) return null;
+  return { x:p.x * w, y:p.y * h };
+}
+
+function distLm(lm, a, b){
+  const p1 = lm[a], p2 = lm[b];
+  if(!p1 || !p2) return 0;
+  return Math.hypot(p1.x - p2.x, p1.y - p2.y);
+}
+
+function eyeEAR(lm, cfg){
+  const width = distLm(lm, cfg.outer, cfg.inner);
+  if(width <= 1e-6) return 0;
+  const v1 = distLm(lm, cfg.upper[0], cfg.lower[0]);
+  const v2 = distLm(lm, cfg.upper[1], cfg.lower[1]);
+  const v3 = distLm(lm, cfg.upper[2], cfg.lower[2]);
+  return (v1 + v2 + v3) / (3 * width);
+}
+
+function clearFaceOverlay(){
+  if(!meshCtx || !meshCanvas) return;
+  syncMeshCanvasSize();
+  meshCtx.clearRect(0, 0, meshCanvas.width, meshCanvas.height);
+}
+
+function drawPathFromIndices(indices, landmarks, closePath, strokeStyle, lineWidth){
+  if(!meshCtx || !meshCanvas || !indices?.length) return;
+  const w = meshCanvas.clientWidth || meshCanvas.width;
+  const h = meshCanvas.clientHeight || meshCanvas.height;
+  meshCtx.beginPath();
+  indices.forEach((idx, i)=>{
+    const pt = pointFromLm(landmarks, idx, w, h);
+    if(!pt) return;
+    if(i === 0) meshCtx.moveTo(pt.x, pt.y);
+    else meshCtx.lineTo(pt.x, pt.y);
+  });
+  if(closePath) meshCtx.closePath();
+  meshCtx.strokeStyle = strokeStyle;
+  meshCtx.lineWidth = lineWidth;
+  meshCtx.stroke();
+}
+
+function drawFaceOverlay(landmarks){
+  if(!meshCtx || !meshCanvas || !video.videoWidth) return;
+  syncMeshCanvasSize();
+  const w = meshCanvas.clientWidth || meshCanvas.width;
+  const h = meshCanvas.clientHeight || meshCanvas.height;
+  meshCtx.clearRect(0, 0, w, h);
+
+  const tess = window.FACEMESH_TESSELATION || [];
+  meshCtx.lineWidth = 0.75;
+  meshCtx.strokeStyle = 'rgba(93,173,226,0.32)';
+  for(const edge of tess){
+    const a = landmarks[edge[0]], b = landmarks[edge[1]];
+    if(!a || !b) continue;
+    meshCtx.beginPath();
+    meshCtx.moveTo(a.x * w, a.y * h);
+    meshCtx.lineTo(b.x * w, b.y * h);
+    meshCtx.stroke();
+  }
+
+  const eyeColor = state.blink.closed ? 'rgba(243,156,18,0.95)' : 'rgba(46,204,113,0.95)';
+  drawPathFromIndices(LEFT_EYE_CFG.ring, landmarks, true, eyeColor, 1.8);
+  drawPathFromIndices(RIGHT_EYE_CFG.ring, landmarks, true, eyeColor, 1.8);
+  if(landmarks.length >= 478){
+    drawPathFromIndices(LEFT_EYE_CFG.iris, landmarks, true, 'rgba(255,255,255,0.92)', 1.3);
+    drawPathFromIndices(RIGHT_EYE_CFG.iris, landmarks, true, 'rgba(255,255,255,0.92)', 1.3);
+  }
+
+  const nose = pointFromLm(landmarks, 1, w, h);
+  if(nose){
+    meshCtx.beginPath();
+    meshCtx.arc(nose.x, nose.y, 4.5, 0, Math.PI * 2);
+    meshCtx.fillStyle = 'rgba(255,255,255,0.95)';
+    meshCtx.fill();
+  }
 }
 
 function processBlink(landmarks){
-  const leftOpenA  = eyeOpenness(landmarks,159,145,33,133);
-  const leftOpenB  = eyeOpenness(landmarks,160,144,33,133);
-  const rightOpenA = eyeOpenness(landmarks,386,374,362,263);
-  const rightOpenB = eyeOpenness(landmarks,385,380,362,263);
-
-  const leftOpen  = (leftOpenA + leftOpenB) * 0.5;
-  const rightOpen = (rightOpenA + rightOpenB) * 0.5;
-  if(!Number.isFinite(leftOpen) || !Number.isFinite(rightOpen)) return;
-
-  const rawAvg = (leftOpen + rightOpen) * 0.5;
-  const rawMin = Math.min(leftOpen, rightOpen);
-  const rawOpen = rawMin * 0.72 + rawAvg * 0.28;
   const now = Date.now();
-
-  state.blink.leftEma  = lerp(state.blink.leftEma,  leftOpen,  0.44);
-  state.blink.rightEma = lerp(state.blink.rightEma, rightOpen, 0.44);
-  state.blink.emaFast  = lerp(state.blink.emaFast,  rawOpen,   0.60);
-  state.blink.ema      = lerp(state.blink.ema,      rawOpen,   0.24);
-
-  const stableOpenRef = clamp(Math.max(rawAvg, rawOpen), state.blink.minBaseline, state.blink.maxBaseline);
-
-  if(!state.blink.closed){
-    if(!state.blink.baselineReady){
-      if(stableOpenRef > 0.04){
-        state.blink.baseline = lerp(state.blink.baseline, stableOpenRef, 0.18);
-        state.blink.baselineFrames += 1;
-      }
-      if(state.blink.baselineFrames >= 10){
-        state.blink.baselineReady = true;
-      }
-    } else if(stableOpenRef > state.blink.baseline * 0.68){
-      state.blink.baseline = lerp(state.blink.baseline, stableOpenRef, 0.028);
-    }
+  const leftEarRaw = eyeEAR(landmarks, LEFT_EYE_CFG);
+  const rightEarRaw = eyeEAR(landmarks, RIGHT_EYE_CFG);
+  if(!Number.isFinite(leftEarRaw) || !Number.isFinite(rightEarRaw) || leftEarRaw <= 0 || rightEarRaw <= 0){
+    state.blink.debugLast = 'invalid_eye';
+    return;
   }
 
-  const baseline = clamp(state.blink.baseline, state.blink.minBaseline, state.blink.maxBaseline);
-  const closeThresh = clamp(baseline * state.blink.closeRatio, 0.045, 0.18);
-  const openThresh  = clamp(baseline * state.blink.openRatio,  0.065, 0.24);
-  state.blink.threshClose = closeThresh;
-  state.blink.threshOpen = openThresh;
+  state.blink.leftEma = lerp(state.blink.leftEma, leftEarRaw, 0.46);
+  state.blink.rightEma = lerp(state.blink.rightEma, rightEarRaw, 0.46);
 
-  const openness = Math.min(state.blink.emaFast, state.blink.ema * 1.04);
-  const bothEyesClosed = openness < closeThresh || rawMin < closeThresh * 0.92;
-  const leftClosedHard = state.blink.leftEma < closeThresh * 0.82 && state.blink.rightEma < openThresh * 1.18;
-  const rightClosedHard = state.blink.rightEma < closeThresh * 0.82 && state.blink.leftEma < openThresh * 1.18;
-  const decisivelyClosed = bothEyesClosed || leftClosedHard || rightClosedHard;
-  const decisivelyOpen = (
-    openness > openThresh &&
-    state.blink.leftEma > closeThresh * 0.92 &&
-    state.blink.rightEma > closeThresh * 0.92
-  );
+  const leftEar = state.blink.leftEma;
+  const rightEar = state.blink.rightEma;
+  const avgEar = (leftEar + rightEar) * 0.5;
 
-  if(decisivelyClosed){
+  if(!state.blink.baselineReady){
+    if(avgEar > 0.12){
+      state.blink.leftOpenRef = lerp(state.blink.leftOpenRef, leftEar, 0.28);
+      state.blink.rightOpenRef = lerp(state.blink.rightOpenRef, rightEar, 0.28);
+      state.blink.readyFrames += 1;
+    }
+    if(state.blink.readyFrames >= 6){
+      state.blink.baselineReady = true;
+      state.blink.debugLast = 'baseline_ready';
+    }
+  } else if(!state.blink.closed){
+    if(leftEar > state.blink.leftOpenRef * 0.72) state.blink.leftOpenRef = lerp(state.blink.leftOpenRef, Math.max(leftEar, state.blink.leftOpenRef), 0.05);
+    if(rightEar > state.blink.rightOpenRef * 0.72) state.blink.rightOpenRef = lerp(state.blink.rightOpenRef, Math.max(rightEar, state.blink.rightOpenRef), 0.05);
+  }
+
+  state.blink.leftOpenRef = clamp(state.blink.leftOpenRef, 0.15, 0.42);
+  state.blink.rightOpenRef = clamp(state.blink.rightOpenRef, 0.15, 0.42);
+
+  const leftRatio = clamp(leftEar / Math.max(state.blink.leftOpenRef, 1e-6), 0, 1.35);
+  const rightRatio = clamp(rightEar / Math.max(state.blink.rightOpenRef, 1e-6), 0, 1.35);
+  const avgRatio = (leftRatio + rightRatio) * 0.5;
+  const minRatio = Math.min(leftRatio, rightRatio);
+  const openScoreRaw = minRatio * 0.76 + avgRatio * 0.24;
+  state.blink.openScore = openScoreRaw;
+  state.blink.openScoreEma = lerp(state.blink.openScoreEma, openScoreRaw, state.blink.closed ? 0.40 : 0.24);
+
+  const closeSignal = Math.min(state.blink.openScore, state.blink.openScoreEma);
+  const closedNow = closeSignal < state.blink.closeThresh || (minRatio < 0.42 && avgRatio < 0.72);
+  const openNow = state.blink.openScore > state.blink.openThresh && state.blink.openScoreEma > state.blink.openThresh * 0.92;
+
+  if(closedNow){
     state.blink.closedFrames += 1;
     state.blink.openFrames = 0;
-  } else if(decisivelyOpen){
+  } else if(openNow){
     state.blink.openFrames += 1;
     if(!state.blink.closed) state.blink.closedFrames = 0;
+  } else {
+    if(!state.blink.closed) state.blink.closedFrames = 0;
+    state.blink.openFrames = 0;
   }
 
-  if(!state.blink.closed && state.blink.closedFrames >= state.blink.minClosedFrames){
+  if(!state.blink.baselineReady){
+    setBlink('Calibrando');
+  }
+
+  if(!state.blink.closed && state.blink.baselineReady && state.blink.closedFrames >= state.blink.minClosedFrames){
     state.blink.closed = true;
     state.blink.closeTs = now;
     state.blink.debugLast = 'closed';
     setBlink('Fechado');
-    gazeCursor.style.borderColor = 'rgba(243,156,18,.9)';
+    gazeCursor.style.borderColor = 'rgba(243,156,18,.95)';
   } else if(state.blink.closed && state.blink.openFrames >= state.blink.minOpenFrames){
     const dur = now - state.blink.closeTs;
     state.blink.closed = false;
@@ -1052,8 +1173,12 @@ function processBlink(landmarks){
     if(dur >= state.blink.minMs && dur <= state.blink.maxMs){
       registerBlink(now);
     } else {
-      state.blink.debugLast = 'ignored_'+dur;
+      state.blink.debugLast = 'ignored_' + dur;
     }
+  }
+
+  if(meshDebug){
+    meshDebug.textContent = 'Malha OK • score ' + state.blink.openScore.toFixed(2) + ' • L ' + leftRatio.toFixed(2) + ' • R ' + rightRatio.toFixed(2) + ' • ref ' + state.blink.leftOpenRef.toFixed(3) + '/' + state.blink.rightOpenRef.toFixed(3);
   }
 }
 
@@ -1420,6 +1545,7 @@ async function startTracking(){
     });
     video.srcObject=state.stream;
     await video.play();
+    syncMeshCanvasSize();
     log('Webcam aberta.');
 
     state.faceMesh = new window.FaceMesh({
@@ -1431,11 +1557,16 @@ async function startTracking(){
     });
     state.faceMesh.onResults(results=>{
       if(!state.running) return;
-      if(!results.multiFaceLandmarks?.[0]){
+      syncMeshCanvasSize();
+      const face = results.multiFaceLandmarks?.[0];
+      if(!face){
+        clearFaceOverlay();
+        if(meshDebug) meshDebug.textContent = 'Malha: rosto não encontrado';
         setStatus(false,'Rosto não encontrado'); gaze.quality=.4; return;
       }
-      mapFaceTracking(results.multiFaceLandmarks[0]);
-      processBlink(results.multiFaceLandmarks[0]);
+      drawFaceOverlay(face);
+      mapFaceTracking(face);
+      processBlink(face);
       state.usingMouse=false;
       setMode('Webcam'); setStatus(true,'Tracking facial ativo');
     });
@@ -1450,8 +1581,9 @@ async function startTracking(){
     state.rafMedia=requestAnimationFrame(mediaLoop);
     state.usingMouse=false;
     setMode('Webcam');
-    permNote.textContent='Tracking facial ativo. Pisque normalmente: 1 piscada aproxima a obra em foco e 2 piscadas rápidas afastam.';
-    log('Tracking facial iniciado com eixo lateral recalculado e blink refeito.');
+    permNote.textContent='Tracking facial ativo com malha facial desenhada. Pisque normalmente: 1 piscada aproxima e 2 piscadas rápidas afastam.';
+    if(meshDebug) meshDebug.textContent = 'Malha: procurando baseline dos olhos…';
+    log('Tracking facial iniciado com malha facial + blink por EAR dinâmico.');
 
   } catch(err){
     state.usingMouse=true;
@@ -1469,6 +1601,8 @@ function stopTracking(){
   if(state.rafMedia){ cancelAnimationFrame(state.rafMedia); state.rafMedia=null; }
   if(state.stream){ state.stream.getTracks().forEach(t=>t.stop()); state.stream=null; }
   video.srcObject=null;
+  clearFaceOverlay();
+  if(meshDebug) meshDebug.textContent = 'Malha: tracking desligado';
   state.usingMouse=true;
   setMode('Parado'); setStatus(false,'Tracking desligado');
   permNote.textContent='Tracking desligado. Sala continua ativa.';
@@ -1490,8 +1624,9 @@ function calibrate(){
   state.tracking.history = [];
   state.tracking.baselineFrames = 0;
   state.tracking.baselineReady = false;
+  resetBlinkState();
   calibText.textContent='Concluída';
-  permNote.textContent='Calibração aplicada. O eixo lateral agora usa compensação espelhada + rotação da cabeça. Se ainda quiser inverter manualmente, use “Inverter X”.';
+  permNote.textContent='Calibração aplicada. A baseline do rosto e dos olhos foi reiniciada. Olhe normal por meio segundo e depois pisque para aproximar/afastar.';
   log('Calibração aplicada. xOff='+state.calib.xOff.toFixed(3)+' yOff='+state.calib.yOff.toFixed(3));
 }
 
