@@ -1,10 +1,10 @@
 import streamlit as st
 import streamlit.components.v1 as components
 
-st.set_page_config(page_title="Sala 3D – Face Tracking", layout="wide")
+st.set_page_config(page_title="Sala 3D – Face Tracking Parallax", layout="wide")
 
-st.title("Sala 3D com Face Tracking")
-st.caption("Tracking pelo rosto corrigido: virar o rosto para um lado move para o mesmo lado na tela. 1 piscar = zoom in, 2 piscadas rápidas = zoom out.")
+st.title("Sala 3D com Face Tracking + Parallax")
+st.caption("Tracking facial mais estável, zoom por piscadas mais confiável e efeito de parallax com profundidade. 1 piscar aproxima, 2 piscadas rápidas afastam.")
 
 HTML_APP = r"""
 <div id="eye-room-root">
@@ -199,12 +199,13 @@ HTML_APP = r"""
 <!-- TOPBAR -->
 <div class="topbar">
   <div class="headline">
-    <h2>🎨 Sala 3D – Face Tracking</h2>
-    <p>Tracking pelo rosto corrigido (direção natural). Vire o rosto para a direita e a cena acompanha para a direita. <strong>1 piscar</strong> → zoom na obra em foco &nbsp;|&nbsp; <strong>2 piscadas rápidas (&lt;500ms)</strong> → afasta o zoom.</p>
+    <h2>🎨 Sala 3D – Face Tracking + Parallax</h2>
+    <p>Tracking pelo rosto com filtragem mais estável, parallax multicamada e zoom por piscadas mais confiável. <strong>1 piscar</strong> → aproxima a obra em foco &nbsp;|&nbsp; <strong>2 piscadas rápidas</strong> → afasta o zoom.</p>
   </div>
   <div class="controls">
     <button class="btn primary" id="startBtn">▶ Iniciar tracking</button>
     <button class="btn warn" id="calibrateBtn">⊕ Calibrar</button>
+    <button class="btn subtle" id="invertXBtn">↔ Inverter X</button>
     <button class="btn subtle" id="resetHeatBtn">⬡ Limpar heatmap</button>
     <button class="btn" id="exportPdfBtn">↓ Exportar PDF</button>
     <button class="btn danger" id="stopBtn">■ Parar</button>
@@ -231,7 +232,7 @@ HTML_APP = r"""
       </div>
 
       <div id="blink-indicator">👁 Blink detectado</div>
-      <div id="permission-note">Sala carregada. Clique em "Iniciar tracking" para webcam. Nesta versão, virar o rosto para a direita leva o foco para a direita da tela. Sem câmera, o modo mouse funciona normalmente.</div>
+      <div id="permission-note">Sala carregada. Clique em "Iniciar tracking" para webcam. Se a direção lateral ainda parecer invertida no seu aparelho, use o botão “Inverter X”.</div>
     </div>
   </div>
 
@@ -327,6 +328,7 @@ const selArtist     = document.getElementById('selected-artist');
 const selDesc       = document.getElementById('selected-description');
 const artworkList   = document.getElementById('artwork-list');
 const logBox        = document.getElementById('logBox');
+const invertXBtn    = document.getElementById('invertXBtn');
 
 // ─── UTILS ───
 const clamp = (v,a,b) => Math.min(b, Math.max(a,v));
@@ -344,33 +346,87 @@ window.addEventListener('unhandledrejection', e => log('REJECT: '+String(e.reaso
 
 // ─── STATE ───
 const state = {
-  running:false, usingMouse:true,
-  faceMesh:null, stream:null, rafMedia:null,
+  running:false,
+  usingMouse:true,
+  faceMesh:null,
+  stream:null,
+  rafMedia:null,
   startedAt:null,
-  sampleIntervalMs:80, lastSampleTs:0,
-  hoverStartTs:0, dwellMs:1100,
-  hoveredId:null, selectedId:null,
-  fixations:0, inFixation:false,
-  stableFor:0, lastPointPx:null,
-  heatPoints:[], revealPoints:[], selections:[],
+
+  sampleIntervalMs:80,
+  lastSampleTs:0,
+  hoverStartTs:0,
+  dwellMs:1000,
+
+  hoveredId:null,
+  selectedId:null,
+
+  fixations:0,
+  inFixation:false,
+  stableFor:0,
+  lastPointPx:null,
+
+  heatPoints:[],
+  revealPoints:[],
+  selections:[],
   seenIds:new Set(),
 
-  // Calibração: depois de calibrar ajusta offsets
-  calib:{ xOff:0, yOff:0, gainX:1.12, gainY:1.06 },
-
-  // ── BLINK STATE (single/double) ──
-  blink:{
-    closed:false, closeTs:0,
-    threshold:0.175,   // razão vertical/horizontal abaixo = fechado
-    minMs:55,          // mínimo para contar como piscar
-    maxMs:420,         // máximo (acima = fechamento longo, ignora)
-    lastBlinkTs:0,     // timestamp do blink anterior
-    doubleWindowMs:500,// janela para detectar 2º piscar (double blink)
-    singleTimer:null,  // timer pendente do single blink
-    pendingSingle:false
+  calib:{
+    xOff:0,
+    yOff:0,
+    gainX:1.00,
+    gainY:0.94
   },
 
-  zoom:{ active:false, targetId:null, focus:0, focusTarget:0 }
+  blink:{
+    closed:false,
+    closeTs:0,
+    ema:0.27,
+    threshClose:0.168,
+    threshOpen:0.205,
+    minMs:55,
+    maxMs:360,
+    history:[],
+    singleTimer:null,
+    singleDelayMs:280,
+    doubleWindowMs:520
+  },
+
+  tracking:{
+    invertX:false,
+    history:[],
+    historyMax:8,
+    baselineReady:false,
+    baselineFrames:0,
+    baseline:{
+      centerX:0.5,
+      centerY:0.5,
+      yaw:0,
+      pitch:0,
+      size:0.22
+    },
+    deadzoneX:0.016,
+    deadzoneY:0.014,
+    centerGainX:1.18,
+    centerGainY:0.92,
+    yawGainX:0.62,
+    pitchGainY:0.18
+  },
+
+  parallax:{
+    inited:false,
+    starsFar:[],
+    starsMid:[],
+    orbs:[],
+    ribbons:[]
+  },
+
+  zoom:{
+    active:false,
+    targetId:null,
+    focus:0,
+    focusTarget:0
+  }
 };
 
 // ─── GAZE ───
@@ -421,6 +477,157 @@ function resizeCanvases(){
   heatCtx.setTransform(dpr,0,0,dpr,0,0);
   revealCtx.setTransform(dpr,0,0,dpr,0,0);
 }
+
+function wrap(v,max){
+  if(v<0) return max + (v % max);
+  if(v>max) return v % max;
+  return v;
+}
+
+function remapDeadzone(v, dz){
+  if(Math.abs(v) <= dz) return 0;
+  const s = Math.sign(v);
+  const m = Math.abs(v) - dz;
+  return s * m / (0.5 - dz);
+}
+
+function smoothTowards(curr, target, nearA, farA){
+  const d = Math.abs(target - curr);
+  const a = d > 0.08 ? farA : nearA;
+  return lerp(curr, target, a);
+}
+
+function clearNodeTimer(obj, key){
+  if(obj[key]){
+    clearTimeout(obj[key]);
+    obj[key] = null;
+  }
+}
+
+function pushTrackingHistory(sample){
+  state.tracking.history.push(sample);
+  if(state.tracking.history.length > state.tracking.historyMax){
+    state.tracking.history.shift();
+  }
+}
+
+function avgHistory(key){
+  if(!state.tracking.history.length) return 0;
+  return state.tracking.history.reduce((s,p)=>s+p[key],0) / state.tracking.history.length;
+}
+
+function initParallax(){
+  if(state.parallax.inited) return;
+  state.parallax.inited = true;
+
+  const far = [];
+  for(let i=0;i<64;i++){
+    far.push({
+      x:Math.random(),
+      y:Math.random(),
+      r:0.7 + Math.random()*1.2,
+      a:0.05 + Math.random()*0.16,
+      speed:0.08 + Math.random()*0.12
+    });
+  }
+  state.parallax.starsFar = far;
+
+  const mid = [];
+  for(let i=0;i<42;i++){
+    mid.push({
+      x:Math.random(),
+      y:Math.random(),
+      r:1.1 + Math.random()*2.2,
+      a:0.06 + Math.random()*0.18,
+      speed:0.18 + Math.random()*0.18
+    });
+  }
+  state.parallax.starsMid = mid;
+
+  const orbs = [];
+  for(let i=0;i<5;i++){
+    orbs.push({
+      x:0.12 + Math.random()*0.76,
+      y:0.08 + Math.random()*0.68,
+      r:80 + Math.random()*170,
+      hue:i%2===0 ? '93,173,226' : '165,105,189',
+      a:0.04 + Math.random()*0.06,
+      depth:0.18 + Math.random()*0.26
+    });
+  }
+  state.parallax.orbs = orbs;
+
+  const ribbons = [];
+  for(let i=0;i<4;i++){
+    ribbons.push({
+      x:Math.random(),
+      y:Math.random(),
+      w:180 + Math.random()*260,
+      h:18 + Math.random()*28,
+      a:0.03 + Math.random()*0.04,
+      depth:0.22 + Math.random()*0.25,
+      rot:(Math.random()*0.7 - 0.35)
+    });
+  }
+  state.parallax.ribbons = ribbons;
+}
+
+function drawParallaxBackdrop(r, gx, gy){
+  initParallax();
+
+  // distant nebulae
+  state.parallax.orbs.forEach(o=>{
+    const ox = r.width * o.x  + gx * r.width * o.depth * 0.34;
+    const oy = r.height * o.y + gy * r.height * o.depth * 0.24;
+    const rad = o.r;
+    const g = ctx.createRadialGradient(ox, oy, 0, ox, oy, rad);
+    g.addColorStop(0, 'rgba('+o.hue+','+o.a.toFixed(3)+')');
+    g.addColorStop(0.5, 'rgba('+o.hue+','+(o.a*0.42).toFixed(3)+')');
+    g.addColorStop(1, 'rgba('+o.hue+',0)');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(ox, oy, rad, 0, Math.PI*2);
+    ctx.fill();
+  });
+
+  // ribbons / light streaks
+  ctx.save();
+  state.parallax.ribbons.forEach(rb=>{
+    const x = r.width * rb.x + gx * r.width * rb.depth * 0.46;
+    const y = r.height * rb.y + gy * r.height * rb.depth * 0.38;
+    ctx.translate(x, y);
+    ctx.rotate(rb.rot + gx*0.08);
+    const grad = ctx.createLinearGradient(-rb.w/2, 0, rb.w/2, 0);
+    grad.addColorStop(0, 'rgba(93,173,226,0)');
+    grad.addColorStop(0.5, 'rgba(93,173,226,'+rb.a.toFixed(3)+')');
+    grad.addColorStop(1, 'rgba(165,105,189,0)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(-rb.w/2, -rb.h/2, rb.w, rb.h);
+    ctx.setTransform(1,0,0,1,0,0);
+  });
+  ctx.restore();
+
+  // far stars
+  state.parallax.starsFar.forEach(s=>{
+    const x = wrap(r.width * s.x + gx * r.width * s.speed * 0.22, r.width);
+    const y = wrap(r.height * s.y + gy * r.height * s.speed * 0.18, r.height);
+    ctx.fillStyle = 'rgba(255,255,255,'+s.a.toFixed(3)+')';
+    ctx.beginPath();
+    ctx.arc(x, y, s.r, 0, Math.PI*2);
+    ctx.fill();
+  });
+
+  // mid stars
+  state.parallax.starsMid.forEach(s=>{
+    const x = wrap(r.width * s.x + gx * r.width * s.speed * 0.34, r.width);
+    const y = wrap(r.height * s.y + gy * r.height * s.speed * 0.28, r.height);
+    ctx.fillStyle = 'rgba(191,214,246,'+s.a.toFixed(3)+')';
+    ctx.beginPath();
+    ctx.arc(x, y, s.r, 0, Math.PI*2);
+    ctx.fill();
+  });
+}
+
 
 // ─── PROJECTION ───
 function projectPt(x,y,z){
@@ -558,99 +765,112 @@ function updateSelPanel(art){
   selDesc.textContent=art.desc;
 }
 
-function selectArtwork(art,source){
-  state.selectedId=art.id;
-  state.zoom.active=true;
-  state.zoom.targetId=art.id;
-  state.zoom.focusTarget=1;
-  zoomText.textContent='Zoom';
+function zoomInToArtwork(art, source, amount){
+  if(!art) return;
+  state.selectedId = art.id;
+  state.zoom.active = true;
+  state.zoom.targetId = art.id;
+  state.zoom.focusTarget = clamp(Math.max(state.zoom.focusTarget, 0.18) + (amount || 0.32), 0, 1);
+  zoomText.textContent = state.zoom.focusTarget > 0.72 ? 'Próximo' : 'Ativo';
   updateSelPanel(art);
+
   if(!state.seenIds.has(art.id)){
     state.seenIds.add(art.id);
-    statArtworks.textContent=String(state.seenIds.size);
+    statArtworks.textContent = String(state.seenIds.size);
   }
-  state.selections.push({id:art.id,title:art.title,ts:Date.now(),source});
-  log('Obra: "'+art.title+'" via '+source);
+  state.selections.push({id:art.id,title:art.title,ts:Date.now(),source:source||'zoom_in'});
+  log('Zoom in "'+art.title+'" via '+(source||'zoom_in')+' ('+state.zoom.focusTarget.toFixed(2)+')');
+}
+
+function selectArtwork(art,source){
+  zoomInToArtwork(art, source || 'select', source === 'dwell' ? 0.22 : 0.28);
+}
+
+function zoomOutStep(source){
+  if(state.zoom.focusTarget <= 0.02){
+    resetZoom();
+    return;
+  }
+  state.zoom.focusTarget = clamp(state.zoom.focusTarget - 0.54, 0, 1);
+  if(state.zoom.focusTarget <= 0.06){
+    resetZoom();
+  } else {
+    state.zoom.active = true;
+    zoomText.textContent = 'Afastando';
+  }
+  log('Zoom out via '+(source||'zoom_out')+' ('+state.zoom.focusTarget.toFixed(2)+')');
 }
 
 function resetZoom(){
-  state.zoom.focusTarget=0;
-  state.zoom.active=false;
-  state.zoom.targetId=null;
-  state.selectedId=null;
-  zoomText.textContent='Normal';
+  state.zoom.focusTarget = 0;
+  state.zoom.active = false;
+  state.zoom.targetId = null;
+  state.selectedId = null;
+  zoomText.textContent = 'Normal';
   updateSelPanel(null);
 }
 
-// ─── BLINK: single vs double ───
-// Lógica:
-//   - Quando olho abre após blink válido:
-//     Se blink anterior foi há < doubleWindowMs → É DOUBLE BLINK → cancela timer single → executa ação double
-//     Senão → Agenda timer para ação single (se outro blink vier antes, cancela e dispara double)
 function onSingleBlink(){
-  const hovered=artById(state.hoveredId);
-  if(hovered){
-    selectArtwork(hovered,'single_blink');
-    flashBlinkIndicator('👁 1 piscar → zoom em "'+hovered.title+'"');
-    log('Single blink → zoom: '+hovered.title);
-  } else if(state.zoom.focusTarget>0){
-    resetZoom();
-    flashBlinkIndicator('👁 1 piscar → zoom resetado');
-    log('Single blink → zoom resetado (sem obra em foco)');
+  const hovered = artById(state.hoveredId);
+  const selected = artById(state.selectedId);
+  const target = hovered || selected;
+  if(target){
+    zoomInToArtwork(target, 'single_blink', hovered ? 0.34 : 0.26);
+    flashBlinkIndicator('👁 1 piscar → aproxima "'+target.title+'"');
+  } else {
+    flashBlinkIndicator('👁 1 piscar sem obra em foco');
+    log('Single blink sem obra em foco');
   }
 }
 
 function onDoubleBlink(){
-  clearTimeout(state.blink.singleTimer);
-  state.blink.pendingSingle=false;
-  if(state.zoom.focusTarget>0){
-    resetZoom();
-    flashBlinkIndicator('😮 2 piscadas → zoom afastado');
-    log('Double blink → afasta zoom');
-  } else {
-    flashBlinkIndicator('😮 2 piscadas (sem zoom ativo)');
-    log('Double blink sem zoom ativo');
+  zoomOutStep('double_blink');
+  flashBlinkIndicator('👁👁 2 piscadas → afasta');
+}
+
+function registerBlink(now){
+  state.blink.history = state.blink.history.filter(ts => now - ts < state.blink.doubleWindowMs);
+  state.blink.history.push(now);
+  clearNodeTimer(state.blink, 'singleTimer');
+
+  if(state.blink.history.length >= 2){
+    const prev = state.blink.history[state.blink.history.length - 2];
+    if(now - prev < state.blink.doubleWindowMs){
+      state.blink.history = [];
+      onDoubleBlink();
+      return;
+    }
   }
+
+  state.blink.singleTimer = setTimeout(()=>{
+    if(state.blink.history.length === 1){
+      onSingleBlink();
+    }
+    state.blink.history = [];
+  }, state.blink.singleDelayMs);
 }
 
 function processBlink(landmarks){
-  const eo=eyeOpenness;
+  const eo = eyeOpenness;
   const leftOpen  = eo(landmarks,159,145,33,133);
   const rightOpen = eo(landmarks,386,374,362,263);
-  const openness  = (leftOpen+rightOpen)/2;
-  const now=Date.now();
+  const rawOpen = (leftOpen + rightOpen) / 2;
+  state.blink.ema = lerp(state.blink.ema, rawOpen, 0.42);
+  const openness = state.blink.ema;
+  const now = Date.now();
 
-  if(openness < state.blink.threshold && !state.blink.closed){
-    state.blink.closed=true;
-    state.blink.closeTs=now;
+  if(openness < state.blink.threshClose && !state.blink.closed){
+    state.blink.closed = true;
+    state.blink.closeTs = now;
     setBlink('Fechado');
-    gazeCursor.style.borderColor='rgba(243,156,18,.9)';
-  } else if(openness >= state.blink.threshold && state.blink.closed){
-    const dur=now-state.blink.closeTs;
-    state.blink.closed=false;
+    gazeCursor.style.borderColor = 'rgba(243,156,18,.9)';
+  } else if(openness > state.blink.threshOpen && state.blink.closed){
+    const dur = now - state.blink.closeTs;
+    state.blink.closed = false;
     setBlink('Aberto');
-    gazeCursor.style.borderColor='rgba(255,255,255,.92)';
-
-    if(dur>=state.blink.minMs && dur<=state.blink.maxMs){
-      const timeSinceLast=now-state.blink.lastBlinkTs;
-
-      if(state.blink.pendingSingle && timeSinceLast < state.blink.doubleWindowMs){
-        // ── DOUBLE BLINK ──
-        onDoubleBlink();
-        state.blink.lastBlinkTs=0; // reset para não triggar terceiro
-      } else {
-        // ── POTENTIAL SINGLE BLINK ──
-        // Agendar com delay para confirmar que não vem o 2º piscar
-        state.blink.lastBlinkTs=now;
-        state.blink.pendingSingle=true;
-        clearTimeout(state.blink.singleTimer);
-        state.blink.singleTimer=setTimeout(()=>{
-          if(state.blink.pendingSingle){
-            state.blink.pendingSingle=false;
-            onSingleBlink();
-          }
-        }, state.blink.doubleWindowMs);
-      }
+    gazeCursor.style.borderColor = 'rgba(255,255,255,.92)';
+    if(dur >= state.blink.minMs && dur <= state.blink.maxMs){
+      registerBlink(now);
     }
   }
 }
@@ -672,8 +892,8 @@ function eyeOpenness(lm,topIdx,botIdx,lIdx,rIdx){
 // - combina translação do rosto com yaw (rotação lateral da cabeça)
 // - aplica zona morta e suavização para reduzir tremedeira
 function faceBox(lm){
-  const ids=[10,152,234,454,93,323,127,356];
-  const pts=ids.map(i=>lm[i]).filter(Boolean);
+  const ids = [10,152,234,454,93,323,127,356];
+  const pts = ids.map(i=>lm[i]).filter(Boolean);
   return {
     minX:Math.min(...pts.map(p=>p.x)),
     maxX:Math.max(...pts.map(p=>p.x)),
@@ -682,60 +902,117 @@ function faceBox(lm){
   };
 }
 
-function mapFaceTracking(landmarks){
-  const box = faceBox(landmarks);
-  const nose = landmarks[1];
-  const forehead = landmarks[10];
-  const chin = landmarks[152];
-  const leftEyeOuter = landmarks[33];
-  const rightEyeOuter = landmarks[263];
-  const leftTemple = landmarks[234];
-  const rightTemple = landmarks[454];
+function faceMetrics(lm){
+  const box = faceBox(lm);
+  const nose = lm[1];
+  const forehead = lm[10];
+  const chin = lm[152];
+  const leftEyeOuter = lm[33];
+  const rightEyeOuter = lm[263];
+  const leftCheek = lm[234];
+  const rightCheek = lm[454];
+  const mouthTop = lm[13];
+  const mouthBot = lm[14];
 
-  if(!nose || !forehead || !chin || !leftEyeOuter || !rightEyeOuter || !leftTemple || !rightTemple){
+  if(!nose || !forehead || !chin || !leftEyeOuter || !rightEyeOuter || !leftCheek || !rightCheek || !mouthTop || !mouthBot){
+    return null;
+  }
+
+  const eyeMidX = (leftEyeOuter.x + rightEyeOuter.x) * 0.5;
+  const faceWidth = Math.max(0.001, rightCheek.x - leftCheek.x);
+  const faceHeight = Math.max(0.001, chin.y - forehead.y);
+
+  const centerRawX = clamp(((nose.x * 0.62 + eyeMidX * 0.38) - box.minX) / Math.max(0.001, box.maxX - box.minX), 0, 1);
+  const centerRawY = clamp(((nose.y * 0.66 + ((mouthTop.y + mouthBot.y) * 0.5) * 0.34) - box.minY) / Math.max(0.001, box.maxY - box.minY), 0, 1);
+  const centerMirroredX = 1 - centerRawX;
+
+  const yawRaw = (nose.x - eyeMidX) / Math.max(0.001, rightEyeOuter.x - leftEyeOuter.x);
+  const faceMidY = (forehead.y + chin.y) * 0.5;
+  const pitchRaw = (nose.y - faceMidY) / faceHeight;
+  const sizeRaw = faceWidth;
+
+  return {
+    centerRawX,
+    centerMirroredX,
+    centerY:centerRawY,
+    yaw:-yawRaw, // compensa o espelhamento da visualização
+    pitch:pitchRaw,
+    size:sizeRaw
+  };
+}
+
+function updateTrackingBaseline(m){
+  const b = state.tracking.baseline;
+  if(!state.tracking.baselineReady){
+    state.tracking.baselineFrames += 1;
+    const t = Math.min(1, state.tracking.baselineFrames / 20);
+    b.centerX = lerp(b.centerX, m.centerMirroredX, 0.18 * t);
+    b.centerY = lerp(b.centerY, m.centerY, 0.18 * t);
+    b.yaw     = lerp(b.yaw,     m.yaw,     0.18 * t);
+    b.pitch   = lerp(b.pitch,   m.pitch,   0.18 * t);
+    b.size    = lerp(b.size,    m.size,    0.18 * t);
+    if(state.tracking.baselineFrames >= 20){
+      state.tracking.baselineReady = true;
+      calibText.textContent = 'Auto';
+      log('Baseline facial capturada.');
+    }
     return;
   }
 
-  const faceW = Math.max(.001, rightTemple.x - leftTemple.x);
-  const faceH = Math.max(.001, chin.y - forehead.y);
+  // adaptação lenta quando usuário fica relativamente estável
+  const stableCenter = Math.abs(m.centerMirroredX - b.centerX) < 0.06 && Math.abs(m.centerY - b.centerY) < 0.06;
+  if(stableCenter && !state.blink.closed){
+    b.centerX = lerp(b.centerX, m.centerMirroredX, 0.008);
+    b.centerY = lerp(b.centerY, m.centerY, 0.008);
+    b.yaw     = lerp(b.yaw,     m.yaw,     0.010);
+    b.pitch   = lerp(b.pitch,   m.pitch,   0.010);
+    b.size    = lerp(b.size,    m.size,    0.006);
+  }
+}
 
-  // posição do nariz dentro da caixa da face (frame original da câmera)
-  const noseXRaw = clamp((nose.x - box.minX) / Math.max(.001, box.maxX - box.minX), 0, 1);
-  const noseYRaw = clamp((nose.y - box.minY) / Math.max(.001, box.maxY - box.minY), 0, 1);
+function mapFaceTracking(landmarks){
+  const m = faceMetrics(landmarks);
+  if(!m) return;
 
-  // vídeo está espelhado na interface -> inverter X uma única vez
-  const noseXMirrored = 1 - noseXRaw;
+  updateTrackingBaseline(m);
 
-  // yaw estimado pela diferença entre nariz e centro dos olhos
-  const eyeMidX = (leftEyeOuter.x + rightEyeOuter.x) * 0.5;
-  const yawRaw = (nose.x - eyeMidX) / Math.max(.001, rightEyeOuter.x - leftEyeOuter.x);
+  const xBase = state.tracking.invertX ? (1 - m.centerMirroredX) : m.centerMirroredX;
+  const xRef  = state.tracking.invertX ? (1 - state.tracking.baseline.centerX) : state.tracking.baseline.centerX;
 
-  // como o vídeo está espelhado, yaw positivo precisa virar negativo na tela
-  const yawScreen = -yawRaw;
+  const sample = {
+    x:xBase,
+    y:m.centerY,
+    yaw:m.yaw,
+    pitch:m.pitch,
+    size:m.size
+  };
+  pushTrackingHistory(sample);
 
-  // pitch estimado pela posição vertical do nariz dentro da face
-  const faceMidY = (forehead.y + chin.y) * 0.5;
-  const pitchRaw = (nose.y - faceMidY) / faceH;
+  const hx = avgHistory('x');
+  const hy = avgHistory('y');
+  const hyaw = avgHistory('yaw');
+  const hpitch = avgHistory('pitch');
+  const hsize = avgHistory('size');
 
-  // combina movimento lateral do rosto com rotação da cabeça
-  let targetX = 0.5 + (noseXMirrored - 0.5) * state.calib.gainX + yawScreen * 0.55 + state.calib.xOff;
-  let targetY = 0.5 + (noseYRaw - 0.5) * state.calib.gainY + pitchRaw * 0.18 + state.calib.yOff;
+  const dx = hx - xRef;
+  const dy = hy - state.tracking.baseline.centerY;
+  const dyaw = hyaw - state.tracking.baseline.yaw;
+  const dpitch = hpitch - state.tracking.baseline.pitch;
 
-  // zona morta para reduzir jitter
-  const dx = targetX - 0.5;
-  const dy = targetY - 0.5;
-  if(Math.abs(dx) < 0.018) targetX = 0.5;
-  if(Math.abs(dy) < 0.018) targetY = 0.5;
+  let combinedX = dx * state.tracking.centerGainX + dyaw * state.tracking.yawGainX;
+  let combinedY = dy * state.tracking.centerGainY + dpitch * state.tracking.pitchGainY;
 
-  // suavização um pouco mais forte
-  targetX = clamp(targetX, .02, .98);
-  targetY = clamp(targetY, .02, .98);
-  gaze.targetX = clamp(lerp(gaze.targetX, targetX, .18), .02, .98);
-  gaze.targetY = clamp(lerp(gaze.targetY, targetY, .18), .02, .98);
+  combinedX = remapDeadzone(combinedX, state.tracking.deadzoneX);
+  combinedY = remapDeadzone(combinedY, state.tracking.deadzoneY);
 
-  // qualidade baseada em proporção e simetria mínimas
-  const symmetry = 1 - Math.abs((rightEyeOuter.x - eyeMidX) - (eyeMidX - leftEyeOuter.x)) * 8;
-  gaze.quality = clamp(symmetry, .5, .99);
+  const targetX = clamp(0.5 + combinedX * 0.88 + state.calib.xOff, 0.02, 0.98);
+  const targetY = clamp(0.5 + combinedY * 0.82 + state.calib.yOff, 0.02, 0.98);
+
+  gaze.targetX = smoothTowards(gaze.targetX, targetX, 0.08, 0.16);
+  gaze.targetY = smoothTowards(gaze.targetY, targetY, 0.08, 0.16);
+
+  const sym = 1 - Math.abs(dx * 0.8) - Math.abs(dyaw * 0.25) - Math.abs(hsize - state.tracking.baseline.size) * 0.4;
+  gaze.quality = clamp(sym, 0.56, 0.99);
 }
 
 // ─── DRAW ROOM ───
@@ -781,75 +1058,97 @@ function drawPedestal(x,z,color){
 }
 
 function drawRoom(){
-  const r=scenePanel.getBoundingClientRect();
+  const r = scenePanel.getBoundingClientRect();
   ctx.clearRect(0,0,r.width,r.height);
 
-  const bg=ctx.createLinearGradient(0,0,0,r.height);
-  bg.addColorStop(0,'#060d1a'); bg.addColorStop(1,'#020709');
-  ctx.fillStyle=bg; ctx.fillRect(0,0,r.width,r.height);
+  const bg = ctx.createLinearGradient(0,0,0,r.height);
+  bg.addColorStop(0,'#060d1a');
+  bg.addColorStop(1,'#020709');
+  ctx.fillStyle = bg;
+  ctx.fillRect(0,0,r.width,r.height);
 
-  const zoomArt=artById(state.zoom.targetId);
-  state.zoom.focus=lerp(state.zoom.focus, state.zoom.focusTarget, .07);
+  const gx = gaze.x - 0.5;
+  const gy = gaze.y - 0.5;
 
-  const gx=gaze.x-.5, gy=gaze.y-.5;
-  let fx=0,fy=2.0,fz=8.5;
+  drawParallaxBackdrop(r, gx, gy);
+
+  const zoomArt = artById(state.zoom.targetId);
+  state.zoom.focus = lerp(state.zoom.focus, state.zoom.focusTarget, 0.07);
+
+  let fx = 0, fy = 2.0, fz = 8.5;
   if(zoomArt){
-    fx=zoomArt.x; fy=zoomArt.y;
-    fz=zoomArt.z-(zoomArt.plane==='back'?1.9:0);
+    fx = zoomArt.x;
+    fy = zoomArt.y;
+    fz = zoomArt.z - (zoomArt.plane === 'back' ? 1.95 : 0);
   }
 
-  const f=state.zoom.focus;
-  cam.x     = lerp(gx*0.85,  fx*.18, f);
-  cam.y     = lerp(1.65-gy*.32, fy-.10, f);
-  cam.z     = lerp(-1.4, fz-6.45, f);
-  cam.yaw   = lerp(gx*.34,  fx*.016, f);
-  cam.pitch = lerp(-gy*.11, -.022, f);
-  cam.fov   = lerp(cam.baseFov, cam.baseFov*1.52, f);
+  const f = state.zoom.focus;
+  cam.x     = lerp(gx * 0.92,  fx * 0.19, f);
+  cam.y     = lerp(1.65 - gy * 0.35, fy - 0.10, f);
+  cam.z     = lerp(-1.4, fz - 6.5, f);
+  cam.yaw   = lerp(gx * 0.36,  fx * 0.016, f);
+  cam.pitch = lerp(-gy * 0.12, -0.022, f);
+  cam.fov   = lerp(cam.baseFov, cam.baseFov * 1.56, f);
 
-  const surfDefs=[
+  const surfDefs = [
     {pts:[[-5,0,0],[5,0,0],[5,0,10],[-5,0,10]],fill:'rgba(18,30,50,.98)',stroke:'rgba(255,255,255,.04)'},
-    {pts:[[-5,4,0],[5,4,0],[5,4,10],[-5,4,10]],fill:'rgba(9,16,32,.9)',stroke:'rgba(255,255,255,.04)'},
+    {pts:[[-5,4,0],[5,4,0],[5,4,10],[-5,4,10]],fill:'rgba(9,16,32,.90)',stroke:'rgba(255,255,255,.04)'},
     {pts:[[-5,0,0],[-5,0,10],[-5,4,10],[-5,4,0]],fill:'rgba(12,20,38,.94)',stroke:'rgba(255,255,255,.05)'},
     {pts:[[5,0,0],[5,0,10],[5,4,10],[5,4,0]],fill:'rgba(11,19,36,.94)',stroke:'rgba(255,255,255,.05)'},
     {pts:[[-5,0,10],[5,0,10],[5,4,10],[-5,4,10]],fill:'rgba(14,23,42,.96)',stroke:'rgba(255,255,255,.05)'}
   ];
-  surfDefs.forEach(s=>{
-    drawPoly(s.pts.map(p=>projectPt(...p)),s.fill,s.stroke,1);
-  });
+  surfDefs.forEach(s => drawPoly(s.pts.map(p=>projectPt(...p)), s.fill, s.stroke, 1));
 
-  // floor grid
+  // subtle floor grid
   for(let i=-4;i<=4;i++){
-    const a=projectPt(i,.001,.2),b=projectPt(i,.001,9.8);
-    if(a&&b){ctx.strokeStyle='rgba(255,255,255,.04)';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();}
+    const a = projectPt(i,0.001,0.2), b = projectPt(i,0.001,9.8);
+    if(a && b){
+      ctx.strokeStyle='rgba(255,255,255,.04)';
+      ctx.lineWidth=1;
+      ctx.beginPath();
+      ctx.moveTo(a.x,a.y);
+      ctx.lineTo(b.x,b.y);
+      ctx.stroke();
+    }
   }
   for(let z=1;z<=10;z++){
-    const a=projectPt(-4.8,.001,z),b=projectPt(4.8,.001,z);
-    if(a&&b){ctx.strokeStyle='rgba(255,255,255,.04)';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();}
+    const a = projectPt(-4.8,0.001,z), b = projectPt(4.8,0.001,z);
+    if(a && b){
+      ctx.strokeStyle='rgba(255,255,255,.04)';
+      ctx.lineWidth=1;
+      ctx.beginPath();
+      ctx.moveTo(a.x,a.y);
+      ctx.lineTo(b.x,b.y);
+      ctx.stroke();
+    }
   }
 
-  // ambient light
-  const sl=projectPt(gx*3,3.5,4.8);
+  // ambient spotlight follows gaze slightly
+  const sl = projectPt(gx * 3.2, 3.45, 4.8);
   if(sl){
-    const g=ctx.createRadialGradient(sl.x,sl.y,0,sl.x,sl.y,r.width*.34);
+    const g = ctx.createRadialGradient(sl.x,sl.y,0,sl.x,sl.y,r.width*0.34);
     g.addColorStop(0,'rgba(93,173,226,.18)');
     g.addColorStop(.5,'rgba(93,173,226,.06)');
     g.addColorStop(1,'rgba(93,173,226,0)');
-    ctx.fillStyle=g; ctx.beginPath(); ctx.arc(sl.x,sl.y,r.width*.34,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle=g;
+    ctx.beginPath();
+    ctx.arc(sl.x,sl.y,r.width*0.34,0,Math.PI*2);
+    ctx.fill();
   }
 
   drawPedestal(-1.8,3.0,'rgba(93,173,226,.95)');
   drawPedestal(1.8,3.35,'rgba(165,105,189,.95)');
 
-  projectedArtworks=[];
+  projectedArtworks = [];
   artworks.forEach(art=>{
-    const hl=state.hoveredId===art.id||state.selectedId===art.id||state.zoom.targetId===art.id;
-    const poly=drawArtwork(art,hl);
-    if(poly) projectedArtworks.push({art,poly});
+    const hl = state.hoveredId===art.id || state.selectedId===art.id || state.zoom.targetId===art.id;
+    const poly = drawArtwork(art, hl);
+    if(poly) projectedArtworks.push({art, poly});
   });
 
-  // gaze crosshair (sutil)
-  const gPx={x:gaze.x*r.width, y:gaze.y*r.height};
-  ctx.strokeStyle='rgba(255,255,255,.08)'; ctx.lineWidth=1;
+  const gPx = {x:gaze.x*r.width, y:gaze.y*r.height};
+  ctx.strokeStyle='rgba(255,255,255,.08)';
+  ctx.lineWidth=1;
   ctx.beginPath();
   ctx.moveTo(gPx.x,0); ctx.lineTo(gPx.x,r.height);
   ctx.moveTo(0,gPx.y); ctx.lineTo(r.width,gPx.y);
@@ -884,7 +1183,7 @@ function updateHoverDwell(now){
 
   if(progress>=1){
     selectArtwork(hit.art,'dwell');
-    state.hoverStartTs=now+400; // cooldown
+    state.hoverStartTs=now+380; // cooldown
   }
 }
 
@@ -985,7 +1284,6 @@ async function startTracking(){
 function stopTracking(){
   state.running=false;
   clearTimeout(state.blink.singleTimer);
-  state.blink.pendingSingle=false;
   if(state.rafMedia){ cancelAnimationFrame(state.rafMedia); state.rafMedia=null; }
   if(state.stream){ state.stream.getTracks().forEach(t=>t.stop()); state.stream=null; }
   video.srcObject=null;
@@ -1003,11 +1301,12 @@ function calibrate(){
     log('Calibração não necessária no modo mouse.');
     return;
   }
-  state.calib.xOff += (.5-gaze.targetX)*.28;
-  state.calib.yOff += (.5-gaze.targetY)*.28;
-  state.calib.gainX=1.12; state.calib.gainY=1.06;
+  state.calib.xOff += (0.5 - gaze.targetX) * 0.22;
+  state.calib.yOff += (0.5 - gaze.targetY) * 0.20;
+  state.calib.gainX = 1.00;
+  state.calib.gainY = 0.94;
   calibText.textContent='Concluída';
-  permNote.textContent='Calibração aplicada. Foque no centro da tela e recalibre se necessário.';
+  permNote.textContent='Calibração aplicada. Se a direção lateral ainda parecer invertida, use o botão “Inverter X”.';
   log('Calibração aplicada. xOff='+state.calib.xOff.toFixed(3)+' yOff='+state.calib.yOff.toFixed(3));
 }
 
@@ -1077,6 +1376,11 @@ document.getElementById('stopBtn').addEventListener('click', stopTracking);
 document.getElementById('calibrateBtn').addEventListener('click', calibrate);
 document.getElementById('resetHeatBtn').addEventListener('click', clearHeatmap);
 document.getElementById('exportPdfBtn').addEventListener('click', exportPdf);
+invertXBtn.addEventListener('click', ()=>{
+  state.tracking.invertX = !state.tracking.invertX;
+  permNote.textContent = state.tracking.invertX ? 'Eixo X invertido manualmente.' : 'Eixo X no modo normal.';
+  log('Inverter X = '+state.tracking.invertX);
+});
 
 // ─── ARTWORK LIST ───
 function buildList(){
@@ -1116,6 +1420,7 @@ function tick(now){
 
 // ─── INIT ───
 resizeCanvases();
+initParallax();
 buildList();
 updateSelPanel(null);
 setMode('Face tracking pronto');
