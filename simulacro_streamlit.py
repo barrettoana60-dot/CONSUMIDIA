@@ -123,6 +123,19 @@ HTML_APP = r"""
   #focus-card .title{font-size:16px;font-weight:800;line-height:1.15;margin-bottom:4px}
   #focus-card .meta{font-size:11.5px;color:#b9d2f6;margin-bottom:7px}
   #focus-card .desc{font-size:12px;line-height:1.45;color:var(--muted)}
+  #art-tooltip{
+    position:absolute;z-index:8;min-width:240px;max-width:min(360px,58%);
+    padding:11px 12px;border-radius:14px;
+    background:rgba(6,13,26,.92);border:1px solid rgba(93,173,226,.28);
+    box-shadow:0 18px 34px rgba(0,0,0,.32);
+    backdrop-filter:blur(12px);
+    transform:translate(-50%,-110%);
+    transition:opacity .16s ease, transform .16s ease;
+  }
+  #art-tooltip.hidden{opacity:0;transform:translate(-50%,-100%) scale(.98);pointer-events:none}
+  #art-tooltip .eyebrow{font-size:10px;letter-spacing:.7px;text-transform:uppercase;color:var(--muted);margin-bottom:4px}
+  #art-tooltip .title{font-size:14px;font-weight:800;line-height:1.15;margin-bottom:4px}
+  #art-tooltip .meta{font-size:11px;color:#b9d2f6;line-height:1.35}
   /* ── PERMISSION NOTE ── */
   #permission-note{
     position:absolute;left:14px;bottom:14px;z-index:7;max-width:66%;
@@ -262,6 +275,11 @@ HTML_APP = r"""
         <div class="meta" id="focus-meta">Aproxime o cursor/olhar de uma obra para ver a ficha.</div>
         <div class="desc" id="focus-desc">As informações da obra aparecem aqui assim que o foco entrar no quadro.</div>
       </div>
+      <div id="art-tooltip" class="hidden">
+        <div class="eyebrow" id="tooltip-eyebrow">pré-foco</div>
+        <div class="title" id="tooltip-title">Nenhuma obra</div>
+        <div class="meta" id="tooltip-meta">Olhe para uma obra para exibir a ficha diretamente sobre ela.</div>
+      </div>
       <div id="permission-note">Sala carregada. Clique em "Iniciar tracking" para webcam. O eixo lateral foi recalculado; se no seu aparelho ainda ficar ao contrário, use “Inverter X”.</div>
     </div>
   </div>
@@ -368,6 +386,10 @@ const focusEyebrow  = document.getElementById('focus-eyebrow');
 const focusTitle    = document.getElementById('focus-title');
 const focusMeta     = document.getElementById('focus-meta');
 const focusDesc     = document.getElementById('focus-desc');
+const artTooltip    = document.getElementById('art-tooltip');
+const tooltipEyebrow= document.getElementById('tooltip-eyebrow');
+const tooltipTitle  = document.getElementById('tooltip-title');
+const tooltipMeta   = document.getElementById('tooltip-meta');
 const artworkList   = document.getElementById('artwork-list');
 const logBox        = document.getElementById('logBox');
 const invertXBtn    = document.getElementById('invertXBtn');
@@ -433,26 +455,26 @@ const state = {
     openScoreEma:1,
     readyFrames:0,
     baselineReady:false,
-    closeThresh:0.70,
-    openThresh:0.90,
-    minMs:45,
-    maxMs:480,
+    closeThresh:0.82,
+    openThresh:0.88,
+    minMs:30,
+    maxMs:520,
     closedFrames:0,
     openFrames:0,
-    minClosedFrames:2,
-    minOpenFrames:2,
+    minClosedFrames:1,
+    minOpenFrames:1,
     lastBlinkTs:0,
     lastEventTs:0,
     pendingSingleTs:0,
     pendingSingleTimer:null,
     lastBlinkDuration:0,
-    doubleWindowMs:760,
-    cooldownMs:70,
+    doubleWindowMs:900,
+    cooldownMs:25,
     cooldownUntil:0,
     rearmUntil:0,
-    minInterBlinkMs:85,
-    minClosureDelta:0.20,
-    minClosedRatio:0.69,
+    minInterBlinkMs:55,
+    minClosureDelta:0.10,
+    minClosedRatio:0.80,
     minDuringBlink:1,
     preBlinkOpenRatio:1,
     stableOpenFrames:0,
@@ -887,6 +909,85 @@ function genericArtworkInfo(art){
   };
 }
 
+function projectedEntryByArtId(id){
+  return projectedArtworks.find(entry => entry.art.id === id) || null;
+}
+
+function polyCenter(poly){
+  if(!poly?.length) return null;
+  const s = poly.reduce((acc, p) => ({ x:acc.x + p.x, y:acc.y + p.y }), { x:0, y:0 });
+  return { x:s.x / poly.length, y:s.y / poly.length };
+}
+
+function pointSegDistance(px, py, a, b){
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const denom = dx * dx + dy * dy || 1;
+  const t = clamp(((px - a.x) * dx + (py - a.y) * dy) / denom, 0, 1);
+  const x = a.x + dx * t;
+  const y = a.y + dy * t;
+  return Math.hypot(px - x, py - y);
+}
+
+function pointPolyDistance(pt, poly){
+  if(!poly?.length) return Infinity;
+  if(ptInPoly(pt, poly)) return 0;
+  let best = Infinity;
+  for(let i = 0; i < poly.length; i++){
+    const a = poly[i];
+    const b = poly[(i + 1) % poly.length];
+    best = Math.min(best, pointSegDistance(pt.x, pt.y, a, b));
+  }
+  return best;
+}
+
+function findFocusHit(gPx){
+  if(!projectedArtworks?.length) return null;
+  let best = null;
+  let bestScore = Infinity;
+  for(const entry of projectedArtworks){
+    const dist = pointPolyDistance(gPx, entry.poly);
+    const c = polyCenter(entry.poly);
+    const diag = c ? Math.max(42, Math.hypot(entry.poly[1].x - entry.poly[0].x, entry.poly[3].y - entry.poly[0].y)) : 42;
+    const centerDist = c ? Math.hypot(gPx.x - c.x, gPx.y - c.y) : dist;
+    const focusRange = Math.max(62, diag * 0.42);
+    const nearEnough = dist <= focusRange || centerDist <= focusRange * 0.95;
+    if(!nearEnough) continue;
+    const score = dist * 1.18 + centerDist * 0.26;
+    if(score < bestScore){
+      bestScore = score;
+      best = entry;
+    }
+  }
+  return best;
+}
+
+function syncArtworkTooltip(entry, preview){
+  if(!artTooltip){
+    return;
+  }
+  if(!entry || !entry.art){
+    artTooltip.classList.add('hidden');
+    return;
+  }
+  const info = genericArtworkInfo(entry.art);
+  const center = entry.poly ? polyCenter(entry.poly) : null;
+  const r = scenePanel.getBoundingClientRect();
+  artTooltip.classList.remove('hidden');
+  tooltipEyebrow.textContent = preview ? 'olhando para' : 'obra travada';
+  tooltipTitle.textContent = entry.art.title;
+  tooltipMeta.textContent = info.meta;
+  if(center){
+    const x = clamp(center.x, 130, Math.max(130, r.width - 130));
+    const y = clamp(center.y - 12, 92, Math.max(92, r.height - 36));
+    artTooltip.style.left = x + 'px';
+    artTooltip.style.top = y + 'px';
+  } else {
+    artTooltip.style.left = '50%';
+    artTooltip.style.top = '88px';
+  }
+}
+
 function syncFocusCard(art, preview){
   if(!focusCard) return;
   if(!art){
@@ -911,6 +1012,7 @@ function updateSelPanel(art, preview){
     selArtist.textContent='Passe o olhar sobre uma obra para ver a ficha genérica; 2 piscadas aproximam e 1 afasta.';
     selDesc.textContent='As informações aparecem no hover/foco mesmo sem zoom. O heatmap fica guardado só para o PDF do relatório.';
     syncFocusCard(null, false);
+    syncArtworkTooltip(null, false);
     return;
   }
   const info = genericArtworkInfo(art);
@@ -998,6 +1100,7 @@ function resetZoom(){
   zoomText.textContent = 'Normal';
   const hovered = artById(state.hoveredId);
   updateSelPanel(hovered, !!hovered);
+  syncArtworkTooltip(hovered ? projectedEntryByArtId(hovered.id) : null, !!hovered);
 }
 
 function blinkTarget(){
@@ -1226,24 +1329,24 @@ function processBlink(landmarks){
     return;
   }
 
-  state.blink.leftEma = lerp(state.blink.leftEma, leftEarRaw, state.blink.closed ? 0.56 : 0.24);
-  state.blink.rightEma = lerp(state.blink.rightEma, rightEarRaw, state.blink.closed ? 0.56 : 0.24);
+  state.blink.leftEma = lerp(state.blink.leftEma, leftEarRaw, state.blink.closed ? 0.66 : 0.34);
+  state.blink.rightEma = lerp(state.blink.rightEma, rightEarRaw, state.blink.closed ? 0.66 : 0.34);
 
   const leftEar = state.blink.leftEma;
   const rightEar = state.blink.rightEma;
   const avgEar = (leftEar + rightEar) * 0.5;
 
   if(!state.blink.baselineReady){
-    const baselineOpenEnough = avgEar > 0.12 && leftEar > 0.10 && rightEar > 0.10;
+    const baselineOpenEnough = avgEar > 0.075 && leftEar > 0.055 && rightEar > 0.055;
     if(baselineOpenEnough){
-      state.blink.leftOpenRef = lerp(state.blink.leftOpenRef, leftEar, 0.22);
-      state.blink.rightOpenRef = lerp(state.blink.rightOpenRef, rightEar, 0.22);
+      state.blink.leftOpenRef = lerp(state.blink.leftOpenRef, leftEar, 0.28);
+      state.blink.rightOpenRef = lerp(state.blink.rightOpenRef, rightEar, 0.28);
       state.blink.readyFrames += 1;
     } else {
       state.blink.readyFrames = Math.max(0, state.blink.readyFrames - 1);
     }
 
-    if(state.blink.readyFrames >= 10){
+    if(state.blink.readyFrames >= 6){
       state.blink.baselineReady = true;
       state.blink.stableOpenFrames = 2;
       state.blink.debugLast = 'baseline_ready';
@@ -1253,26 +1356,26 @@ function processBlink(landmarks){
     }
   }
 
-  state.blink.leftOpenRef = clamp(state.blink.leftOpenRef, 0.12, 0.42);
-  state.blink.rightOpenRef = clamp(state.blink.rightOpenRef, 0.12, 0.42);
+  state.blink.leftOpenRef = clamp(state.blink.leftOpenRef, 0.09, 0.42);
+  state.blink.rightOpenRef = clamp(state.blink.rightOpenRef, 0.09, 0.42);
 
-  const leftRatio = clamp(leftEar / Math.max(state.blink.leftOpenRef, 1e-6), 0, 1.45);
-  const rightRatio = clamp(rightEar / Math.max(state.blink.rightOpenRef, 1e-6), 0, 1.45);
+  const leftRatio = clamp(leftEar / Math.max(state.blink.leftOpenRef, 1e-6), 0, 1.55);
+  const rightRatio = clamp(rightEar / Math.max(state.blink.rightOpenRef, 1e-6), 0, 1.55);
   const avgRatio = (leftRatio + rightRatio) * 0.5;
   const minRatio = Math.min(leftRatio, rightRatio);
   const maxRatio = Math.max(leftRatio, rightRatio);
   const asym = Math.abs(leftRatio - rightRatio);
 
-  const fullyOpen = avgRatio > 0.96 && minRatio > 0.84;
-  const reopened = (avgRatio > state.blink.openThresh && minRatio > 0.78) || (leftRatio > 0.93 && rightRatio > 0.93);
+  const reopened = avgRatio > state.blink.openThresh && minRatio > 0.70;
+  const fullyOpen = avgRatio > 0.94 && minRatio > 0.80;
   const strongClosure =
     (avgRatio < state.blink.closeThresh) ||
-    (minRatio < 0.58) ||
-    ((avgRatio < 0.78) && (minRatio < 0.68)) ||
-    ((asym < 0.42) && (maxRatio < 0.82));
+    (minRatio < 0.60) ||
+    ((avgRatio < 0.90) && (minRatio < 0.70)) ||
+    ((asym < 0.55) && (maxRatio < 0.90) && (avgRatio < 0.92));
 
   state.blink.openScore = avgRatio;
-  state.blink.openScoreEma = lerp(state.blink.openScoreEma, avgRatio, state.blink.closed ? 0.30 : 0.10);
+  state.blink.openScoreEma = lerp(state.blink.openScoreEma, avgRatio, state.blink.closed ? 0.36 : 0.16);
 
   if(fullyOpen){
     state.blink.stableOpenFrames = Math.min(state.blink.stableOpenFrames + 1, 8);
@@ -1281,25 +1384,32 @@ function processBlink(landmarks){
   }
 
   if(state.blink.baselineReady && !state.blink.closed){
-    const leftClearlyOpen = leftRatio > 0.92;
-    const rightClearlyOpen = rightRatio > 0.92;
-    if(leftClearlyOpen) state.blink.leftOpenRef = lerp(state.blink.leftOpenRef, Math.max(leftEar, state.blink.leftOpenRef), 0.018);
-    if(rightClearlyOpen) state.blink.rightOpenRef = lerp(state.blink.rightOpenRef, Math.max(rightEar, state.blink.rightOpenRef), 0.018);
+    if(leftRatio > 0.92) state.blink.leftOpenRef = lerp(state.blink.leftOpenRef, Math.max(leftEar, state.blink.leftOpenRef), 0.022);
+    if(rightRatio > 0.92) state.blink.rightOpenRef = lerp(state.blink.rightOpenRef, Math.max(rightEar, state.blink.rightOpenRef), 0.022);
   }
 
   if(!state.blink.closed){
     if(now < state.blink.rearmUntil){
       state.blink.closedFrames = 0;
-      state.blink.openFrames = fullyOpen ? Math.min(state.blink.openFrames + 1, 6) : 0;
       state.blink.debugLast = 'rearm';
-    } else if(strongClosure && state.blink.baselineReady){
+    } else if(state.blink.baselineReady && strongClosure){
       state.blink.closedFrames += 1;
-      state.blink.openFrames = 0;
       state.blink.debugLast = 'closing';
     } else {
       state.blink.closedFrames = Math.max(0, state.blink.closedFrames - 1);
-      state.blink.openFrames = fullyOpen ? Math.min(state.blink.openFrames + 1, 6) : 0;
-      if(state.blink.baselineReady) state.blink.debugLast = fullyOpen ? 'open' : 'idle';
+      if(state.blink.baselineReady) state.blink.debugLast = reopened ? 'open' : 'idle';
+    }
+
+    if(state.blink.baselineReady && state.blink.closedFrames >= state.blink.minClosedFrames){
+      state.blink.closed = true;
+      state.blink.closeTs = now;
+      state.blink.closedFrames = 0;
+      state.blink.openFrames = 0;
+      state.blink.minDuringBlink = minRatio;
+      state.blink.preBlinkOpenRatio = clamp(Math.max(state.blink.openScoreEma, avgRatio), 0.78, 1.24);
+      state.blink.debugLast = 'closed';
+      setBlink('Fechado');
+      gazeCursor.style.borderColor = 'rgba(243,156,18,.95)';
     }
   } else {
     state.blink.minDuringBlink = Math.min(state.blink.minDuringBlink, minRatio);
@@ -1308,42 +1418,29 @@ function processBlink(landmarks){
       state.blink.debugLast = 'opening';
     } else {
       state.blink.openFrames = 0;
-      state.blink.debugLast = 'closed_hold';
+      state.blink.debugLast = strongClosure ? 'closed_hold' : 'half_open';
     }
-  }
 
-  if(!state.blink.closed && state.blink.baselineReady && state.blink.closedFrames >= state.blink.minClosedFrames){
-    const openReady = state.blink.stableOpenFrames >= 1 || state.blink.openScoreEma > 0.92;
-    if(openReady){
-      state.blink.closed = true;
-      state.blink.closeTs = now;
+    if(state.blink.openFrames >= state.blink.minOpenFrames){
+      const dur = now - state.blink.closeTs;
+      const closureDrop = state.blink.preBlinkOpenRatio - state.blink.minDuringBlink;
+      const validClosure = closureDrop >= state.blink.minClosureDelta || state.blink.minDuringBlink <= state.blink.minClosedRatio;
+
+      state.blink.closed = false;
       state.blink.closedFrames = 0;
       state.blink.openFrames = 0;
-      state.blink.minDuringBlink = minRatio;
-      state.blink.preBlinkOpenRatio = clamp(Math.max(state.blink.openScoreEma, avgRatio), 0.76, 1.20);
-      state.blink.debugLast = 'closed';
-      setBlink('Fechado');
-      gazeCursor.style.borderColor = 'rgba(243,156,18,.95)';
-    }
-  } else if(state.blink.closed && state.blink.openFrames >= state.blink.minOpenFrames){
-    const dur = now - state.blink.closeTs;
-    const closureDrop = state.blink.preBlinkOpenRatio - state.blink.minDuringBlink;
-    const validClosure = closureDrop >= state.blink.minClosureDelta || state.blink.minDuringBlink <= state.blink.minClosedRatio;
+      state.blink.lastBlinkDuration = dur;
+      state.blink.rearmUntil = now + 35;
+      state.blink.stableOpenFrames = Math.max(state.blink.stableOpenFrames, 2);
+      setBlink('Aberto');
+      gazeCursor.style.borderColor = 'rgba(255,255,255,.92)';
 
-    state.blink.closed = false;
-    state.blink.closedFrames = 0;
-    state.blink.openFrames = 0;
-    state.blink.lastBlinkDuration = dur;
-    state.blink.rearmUntil = now + 55;
-    state.blink.stableOpenFrames = Math.max(state.blink.stableOpenFrames, 2);
-    setBlink('Aberto');
-    gazeCursor.style.borderColor = 'rgba(255,255,255,.92)';
-
-    if(validClosure && dur >= state.blink.minMs && dur <= state.blink.maxMs){
-      state.blink.debugLast = 'blink_' + closureDrop.toFixed(2);
-      registerBlink(now);
-    } else {
-      state.blink.debugLast = 'ignored_' + dur + '_' + closureDrop.toFixed(2);
+      if(validClosure && dur >= state.blink.minMs && dur <= state.blink.maxMs){
+        state.blink.debugLast = 'blink_' + closureDrop.toFixed(2);
+        registerBlink(now);
+      } else {
+        state.blink.debugLast = 'ignored_' + dur + '_' + closureDrop.toFixed(2);
+      }
     }
   }
 
@@ -1640,40 +1737,46 @@ function drawRoom(){
 
 // ─── HOVER / DWELL ───
 function updateHoverDwell(now){
-  const r=scenePanel.getBoundingClientRect();
-  const gPx={x:gaze.x*r.width, y:gaze.y*r.height};
-  const hit=projectedArtworks.find(e=>ptInPoly(gPx,e.poly));
+  const r = scenePanel.getBoundingClientRect();
+  const gPx = { x:gaze.x * r.width, y:gaze.y * r.height };
+  const hit = findFocusHit(gPx);
 
   const lockTarget = (now < state.zoom.lockUntil && state.zoom.targetId) ? artById(state.zoom.targetId) : null;
-  const activeHit = lockTarget ? { art: lockTarget } : hit;
+  const activeHit = lockTarget ? (projectedEntryByArtId(lockTarget.id) || { art:lockTarget, poly:null }) : hit;
 
   if(!activeHit){
-    if(state.hoveredId){ state.hoveredId=null; state.hoverStartTs=now; }
-    dwellFill.style.width='0%';
-    hoverText.textContent='—';
-    gazeCursor.style.width='26px'; gazeCursor.style.height='26px';
+    if(state.hoveredId){ state.hoveredId = null; state.hoverStartTs = now; }
+    dwellFill.style.width = '0%';
+    hoverText.textContent = '—';
+    gazeCursor.style.width = '26px';
+    gazeCursor.style.height = '26px';
     const selected = artById(state.selectedId);
     updateSelPanel(selected, false);
+    syncArtworkTooltip(selected ? projectedEntryByArtId(selected.id) : null, false);
     return;
   }
 
-  hoverText.textContent=activeHit.art.title;
-  if(state.hoveredId!==activeHit.art.id){
-    state.hoveredId=activeHit.art.id;
-    state.hoverStartTs=now;
-    gazeCursor.style.width='34px'; gazeCursor.style.height='34px';
+  hoverText.textContent = activeHit.art.title;
+  if(state.hoveredId !== activeHit.art.id){
+    state.hoveredId = activeHit.art.id;
+    state.hoverStartTs = now;
+    gazeCursor.style.width = '34px';
+    gazeCursor.style.height = '34px';
   }
 
-  updateSelPanel(activeHit.art, state.selectedId !== activeHit.art.id);
+  const preview = state.selectedId !== activeHit.art.id;
+  updateSelPanel(activeHit.art, preview);
+  syncArtworkTooltip(activeHit, preview);
 
-  const elapsed=now-state.hoverStartTs;
-  const progress=clamp(elapsed/state.dwellMs,0,1);
-  dwellFill.style.width=(progress*100).toFixed(1)+'%';
-  gazeCursor.style.borderColor=progress>.7?'rgba(46,204,113,.95)':'rgba(93,173,226,.95)';
+  const elapsed = now - state.hoverStartTs;
+  const progress = clamp(elapsed / state.dwellMs, 0, 1);
+  dwellFill.style.width = (progress * 100).toFixed(1) + '%';
+  gazeCursor.style.borderColor = progress > .7 ? 'rgba(46,204,113,.95)' : 'rgba(93,173,226,.95)';
 
-  if(progress>=1){
-    selectArtwork(activeHit.art,'dwell');
-    state.hoverStartTs=now+380; // cooldown
+  if(progress >= 1){
+    selectArtwork(activeHit.art, 'dwell');
+    syncArtworkTooltip(activeHit, false);
+    state.hoverStartTs = now + 380;
   }
 }
 
