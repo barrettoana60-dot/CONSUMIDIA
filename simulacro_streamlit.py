@@ -64,6 +64,7 @@ HTML_APP = r"""
   #scene-shell{position:absolute;inset:0}
   #room,#heatmap,#reveal{position:absolute;inset:0;width:100%;height:100%;display:block}
   #heatmap,#reveal{pointer-events:none}
+  #heatmap{display:none}
   /* ── GAZE CURSOR ── */
   #gaze-cursor{
     position:absolute;width:26px;height:26px;
@@ -107,7 +108,21 @@ HTML_APP = r"""
     font-family:'JetBrains Mono',monospace;
     opacity:0;transition:opacity .3s;
   }
+  
   #blink-indicator.show{opacity:1}
+  #focus-card{
+    position:absolute;left:16px;bottom:62px;z-index:7;max-width:min(420px,58%);
+    padding:14px 15px;border-radius:16px;
+    background:rgba(6,13,26,.88);border:1px solid rgba(255,255,255,.08);
+    box-shadow:0 16px 40px rgba(0,0,0,.28);
+    backdrop-filter:blur(12px);
+    transition:opacity .2s ease, transform .2s ease;
+  }
+  #focus-card.hidden{opacity:0;transform:translateY(6px);pointer-events:none}
+  #focus-card .eyebrow{font-size:10.5px;letter-spacing:.7px;text-transform:uppercase;color:var(--muted);margin-bottom:5px}
+  #focus-card .title{font-size:16px;font-weight:800;line-height:1.15;margin-bottom:4px}
+  #focus-card .meta{font-size:11.5px;color:#b9d2f6;margin-bottom:7px}
+  #focus-card .desc{font-size:12px;line-height:1.45;color:var(--muted)}
   /* ── PERMISSION NOTE ── */
   #permission-note{
     position:absolute;left:14px;bottom:14px;z-index:7;max-width:66%;
@@ -239,7 +254,14 @@ HTML_APP = r"""
         <div class="bar"><div id="dwellFill"></div></div>
       </div>
 
+
       <div id="blink-indicator">👁 Blink detectado</div>
+      <div id="focus-card" class="hidden">
+        <div class="eyebrow" id="focus-eyebrow">obra em foco</div>
+        <div class="title" id="focus-title">Nenhuma obra em foco</div>
+        <div class="meta" id="focus-meta">Aproxime o cursor/olhar de uma obra para ver a ficha.</div>
+        <div class="desc" id="focus-desc">As informações da obra aparecem aqui assim que o foco entrar no quadro.</div>
+      </div>
       <div id="permission-note">Sala carregada. Clique em "Iniciar tracking" para webcam. O eixo lateral foi recalculado; se no seu aparelho ainda ficar ao contrário, use “Inverter X”.</div>
     </div>
   </div>
@@ -273,8 +295,8 @@ HTML_APP = r"""
     <div class="card">
       <h3>Obra em foco</h3>
       <div id="selected-title">Nenhuma obra selecionada</div>
-      <div id="selected-artist">Vire o rosto e mantenha foco ~1s ou pisque 2× para aproximar</div>
-      <div id="selected-description">Mantenha o foco por 1 segundo (dwell) ou pisque duas vezes com a obra em foco para aproximar. 1 piscada afasta o zoom.</div>
+      <div id="selected-artist">Passe o olhar sobre uma obra para ver a ficha genérica; 2 piscadas aproximam e 1 afasta.</div>
+      <div id="selected-description">As informações já aparecem no foco/hover. O zoom entra em níveis mais estáveis para reduzir tranco e overshoot.</div>
     </div>
 
     <div class="card">
@@ -341,6 +363,11 @@ const statArtworks  = document.getElementById('statArtworks');
 const selTitle      = document.getElementById('selected-title');
 const selArtist     = document.getElementById('selected-artist');
 const selDesc       = document.getElementById('selected-description');
+const focusCard     = document.getElementById('focus-card');
+const focusEyebrow  = document.getElementById('focus-eyebrow');
+const focusTitle    = document.getElementById('focus-title');
+const focusMeta     = document.getElementById('focus-meta');
+const focusDesc     = document.getElementById('focus-desc');
 const artworkList   = document.getElementById('artwork-list');
 const logBox        = document.getElementById('logBox');
 const invertXBtn    = document.getElementById('invertXBtn');
@@ -466,7 +493,10 @@ const state = {
     active:false,
     targetId:null,
     focus:0,
-    focusTarget:0
+    focusTarget:0,
+    focusVel:0,
+    level:0,
+    lockUntil:0
   }
 };
 
@@ -483,11 +513,11 @@ const cam = { x:0, y:1.65, z:-1.4, yaw:0, pitch:0, baseFov:700, fov:700 };
 
 // ─── ARTWORKS ───
 const artworks = [
-  { id:'a1', title:'Memórias de Superfície', artist:'Lívia Andrade',  year:'2024', wall:'fundo',    color:'#e74c3c', desc:'Pintura em camadas com relevo cromático e estratos de memória afetiva.', plane:'back',  x:-2.8, y:2.1,  z:9.85, w:1.7, h:1.2 },
-  { id:'a2', title:'Campo Sensível',         artist:'Diego Marins',   year:'2025', wall:'fundo',    color:'#27ae60', desc:'Trabalho digital generativo com profundidade simulada por partículas.',  plane:'back',  x:0.0,  y:2.2,  z:9.85, w:1.7, h:1.2 },
-  { id:'a3', title:'Eco de Matéria',         artist:'Marina Teles',   year:'2026', wall:'fundo',    color:'#f39c12', desc:'Objeto expandido que evoca microscopia e holografia em simultaneidade.',  plane:'back',  x:2.8,  y:2.05, z:9.85, w:1.7, h:1.2 },
-  { id:'a4', title:'Horizonte Índigo',       artist:'Ciro Menezes',   year:'2023', wall:'esquerda', color:'#8e44ad', desc:'Composição geométrica com ilusão de profundidade e vibração cromática.',  plane:'left',  x:-4.85,y:2.1,  z:6.1,  w:1.6, h:1.1 },
-  { id:'a5', title:'Traço Latente',          artist:'Rafaela Costa',  year:'2022', wall:'direita',  color:'#2980b9', desc:'Pintura que exige leitura periférica e foco seletivo do observador.',     plane:'right', x:4.85, y:2.05, z:5.7,  w:1.6, h:1.1 }
+  { id:'a1', title:'Memórias de Superfície', artist:'Lívia Andrade',  year:'2024', wall:'fundo',    color:'#e74c3c', medium:'pintura expandida', category:'abstração matérico-cromática', desc:'Pintura em camadas com relevo cromático e estratos de memória afetiva.', plane:'back',  x:-2.8, y:2.1,  z:9.85, w:1.7, h:1.2 },
+  { id:'a2', title:'Campo Sensível',         artist:'Diego Marins',   year:'2025', wall:'fundo',    color:'#27ae60', medium:'arte digital generativa', category:'visualização computacional', desc:'Trabalho digital generativo com profundidade simulada por partículas.',  plane:'back',  x:0.0,  y:2.2,  z:9.85, w:1.7, h:1.2 },
+  { id:'a3', title:'Eco de Matéria',         artist:'Marina Teles',   year:'2026', wall:'fundo',    color:'#f39c12', medium:'objeto expandido', category:'pesquisa entre escultura e luz', desc:'Objeto expandido que evoca microscopia e holografia em simultaneidade.',  plane:'back',  x:2.8,  y:2.05, z:9.85, w:1.7, h:1.2 },
+  { id:'a4', title:'Horizonte Índigo',       artist:'Ciro Menezes',   year:'2023', wall:'esquerda', color:'#8e44ad', medium:'pintura geométrica', category:'cor e percepção espacial', desc:'Composição geométrica com ilusão de profundidade e vibração cromática.',  plane:'left',  x:-4.85,y:2.1,  z:6.1,  w:1.6, h:1.1 },
+  { id:'a5', title:'Traço Latente',          artist:'Rafaela Costa',  year:'2022', wall:'direita',  color:'#2980b9', medium:'pintura de observação', category:'atenção periférica', desc:'Pintura que exige leitura periférica e foco seletivo do observador.',     plane:'right', x:4.85, y:2.05, z:5.7,  w:1.6, h:1.1 }
 ];
 
 let projectedArtworks = [];
@@ -848,61 +878,126 @@ function updateCursor(){
 // ─── ARTWORK PANEL ───
 function artById(id){ return artworks.find(a=>a.id===id)||null; }
 
-function updateSelPanel(art){
-  if(!art){
-    selTitle.textContent='Nenhuma obra selecionada';
-    selArtist.textContent='Vire o rosto e mantenha foco ~1s ou pisque 2× para aproximar';
-    selDesc.textContent='A ficha aparece aqui após dwell-click ou blink. 1 piscada afasta e 2 piscadas rápidas aproximam.';
-    return;
-  }
-  selTitle.textContent=art.title;
-  selArtist.textContent=art.artist+' · '+art.year+' · parede '+art.wall;
-  selDesc.textContent=art.desc;
+function genericArtworkInfo(art){
+  const sizeCm = Math.round(art.w * 100) + ' × ' + Math.round(art.h * 100) + ' cm';
+  return {
+    eyebrow:'obra em foco',
+    meta:art.artist+' · '+art.year+' · parede '+art.wall+' · '+(art.medium||'obra')+' · '+sizeCm,
+    desc:(art.category ? 'Leitura genérica: '+art.category+'. ' : 'Leitura genérica: ') + art.desc
+  };
 }
 
-function zoomInToArtwork(art, source, amount){
+function syncFocusCard(art, preview){
+  if(!focusCard) return;
+  if(!art){
+    focusCard.classList.add('hidden');
+    focusEyebrow.textContent = 'obra em foco';
+    focusTitle.textContent = 'Nenhuma obra em foco';
+    focusMeta.textContent = 'Aproxime o cursor/olhar de uma obra para ver a ficha.';
+    focusDesc.textContent = 'As informações da obra aparecem aqui assim que o foco entrar no quadro.';
+    return;
+  }
+  const info = genericArtworkInfo(art);
+  focusCard.classList.remove('hidden');
+  focusEyebrow.textContent = preview ? 'pré-foco' : 'foco travado';
+  focusTitle.textContent = art.title;
+  focusMeta.textContent = info.meta;
+  focusDesc.textContent = info.desc;
+}
+
+function updateSelPanel(art, preview){
+  if(!art){
+    selTitle.textContent='Nenhuma obra selecionada';
+    selArtist.textContent='Passe o olhar sobre uma obra para ver a ficha genérica; 2 piscadas aproximam e 1 afasta.';
+    selDesc.textContent='As informações aparecem no hover/foco mesmo sem zoom. O heatmap fica guardado só para o PDF do relatório.';
+    syncFocusCard(null, false);
+    return;
+  }
+  const info = genericArtworkInfo(art);
+  selTitle.textContent=art.title;
+  selArtist.textContent=(preview?'Pré-foco · ':'Foco travado · ')+info.meta;
+  selDesc.textContent=info.desc;
+  syncFocusCard(art, !!preview);
+}
+
+function zoomProfile(art){
+  return art && art.plane === 'back' ? [0, 0.34, 0.56, 0.78, 0.92] : [0, 0.30, 0.50, 0.70, 0.86];
+}
+
+function zoomLabelFromLevel(level){
+  if(level >= 4) return 'Muito próximo';
+  if(level >= 3) return 'Próximo';
+  if(level >= 2) return 'Ativo';
+  if(level >= 1) return 'Leve';
+  return 'Normal';
+}
+
+function resolveNextZoomLevel(art, source){
+  const sameArt = state.zoom.targetId === art.id;
+  let level = sameArt ? state.zoom.level : 0;
+  if(source === 'double_blink') level = Math.min(level + 2, zoomProfile(art).length - 1);
+  else if(source === 'dwell') level = Math.max(level, sameArt ? Math.min(level + 1, 2) : 1);
+  else level = Math.min(level + 1, zoomProfile(art).length - 1);
+  return level;
+}
+
+function zoomInToArtwork(art, source){
   if(!art) return;
+  const profile = zoomProfile(art);
+  const nextLevel = resolveNextZoomLevel(art, source || 'zoom_in');
   state.selectedId = art.id;
-  state.zoom.active = true;
+  state.zoom.active = nextLevel > 0;
   state.zoom.targetId = art.id;
-  state.zoom.focusTarget = clamp(Math.max(state.zoom.focusTarget, 0.18) + (amount || 0.32), 0, 1);
-  zoomText.textContent = state.zoom.focusTarget > 0.72 ? 'Próximo' : 'Ativo';
-  updateSelPanel(art);
+  state.zoom.level = nextLevel;
+  state.zoom.focusTarget = profile[nextLevel];
+  state.zoom.lockUntil = Date.now() + ((source === 'double_blink' || source === 'single_blink') ? 620 : 260);
+  zoomText.textContent = zoomLabelFromLevel(nextLevel);
+  updateSelPanel(art, false);
 
   if(!state.seenIds.has(art.id)){
     state.seenIds.add(art.id);
     statArtworks.textContent = String(state.seenIds.size);
   }
   state.selections.push({id:art.id,title:art.title,ts:Date.now(),source:source||'zoom_in'});
-  log('Zoom in "'+art.title+'" via '+(source||'zoom_in')+' ('+state.zoom.focusTarget.toFixed(2)+')');
+  log('Zoom in "'+art.title+'" via '+(source||'zoom_in')+' (lvl '+nextLevel+' / '+state.zoom.focusTarget.toFixed(2)+')');
 }
 
 function selectArtwork(art,source){
-  zoomInToArtwork(art, source || 'select', source === 'dwell' ? 0.22 : 0.28);
+  zoomInToArtwork(art, source || 'select');
 }
 
 function zoomOutStep(source){
-  if(state.zoom.focusTarget <= 0.02){
+  const art = artById(state.zoom.targetId || state.selectedId);
+  if(!art || state.zoom.level <= 0 || state.zoom.focusTarget <= 0.02){
     resetZoom();
     return;
   }
-  state.zoom.focusTarget = clamp(state.zoom.focusTarget - 0.54, 0, 1);
-  if(state.zoom.focusTarget <= 0.06){
+  const profile = zoomProfile(art);
+  state.zoom.level = Math.max(0, state.zoom.level - 1);
+  state.zoom.focusTarget = profile[state.zoom.level] || 0;
+  state.zoom.lockUntil = Date.now() + 180;
+  if(state.zoom.level === 0){
     resetZoom();
   } else {
     state.zoom.active = true;
-    zoomText.textContent = 'Afastando';
+    zoomText.textContent = zoomLabelFromLevel(state.zoom.level);
+    updateSelPanel(art, false);
   }
-  log('Zoom out via '+(source||'zoom_out')+' ('+state.zoom.focusTarget.toFixed(2)+')');
+  log('Zoom out via '+(source||'zoom_out')+' (lvl '+state.zoom.level+' / '+state.zoom.focusTarget.toFixed(2)+')');
 }
 
 function resetZoom(){
   state.zoom.focusTarget = 0;
+  state.zoom.focusVel = 0;
+  state.zoom.focus = 0;
+  state.zoom.level = 0;
   state.zoom.active = false;
   state.zoom.targetId = null;
+  state.zoom.lockUntil = 0;
   state.selectedId = null;
   zoomText.textContent = 'Normal';
-  updateSelPanel(null);
+  const hovered = artById(state.hoveredId);
+  updateSelPanel(hovered, !!hovered);
 }
 
 function blinkTarget(){
@@ -1454,22 +1549,29 @@ function drawRoom(){
   drawParallaxBackdrop(r, gx, gy);
 
   const zoomArt = artById(state.zoom.targetId);
-  state.zoom.focus = lerp(state.zoom.focus, state.zoom.focusTarget, 0.07);
+  state.zoom.focusVel = lerp(state.zoom.focusVel, state.zoom.focusTarget - state.zoom.focus, 0.24);
+  state.zoom.focusVel *= 0.84;
+  state.zoom.focus = clamp(state.zoom.focus + state.zoom.focusVel * 0.26, 0, 1);
 
   let fx = 0, fy = 2.0, fz = 8.5;
+  let zoomShift = 6.2;
+  let fovScale = 1.58;
   if(zoomArt){
     fx = zoomArt.x;
     fy = zoomArt.y;
-    fz = zoomArt.z - (zoomArt.plane === 'back' ? 1.95 : 0);
+    fz = zoomArt.z - (zoomArt.plane === 'back' ? 1.92 : 0);
+    zoomShift = zoomArt.plane === 'back' ? 6.85 : 5.7;
+    fovScale = zoomArt.plane === 'back' ? 1.82 : 1.66;
   }
 
   const f = state.zoom.focus;
-  cam.x     = lerp(gx * 0.92,  fx * 0.19, f);
-  cam.y     = lerp(1.65 - gy * 0.35, fy - 0.10, f);
-  cam.z     = lerp(-1.4, fz - 6.5, f);
-  cam.yaw   = lerp(gx * 0.36,  fx * 0.016, f);
-  cam.pitch = lerp(-gy * 0.12, -0.022, f);
-  cam.fov   = lerp(cam.baseFov, cam.baseFov * 1.56, f);
+  const easedFocus = f * f * (3 - 2 * f);
+  cam.x     = lerp(gx * 0.92,  fx * (zoomArt && zoomArt.plane !== 'back' ? 0.22 : 0.18), easedFocus);
+  cam.y     = lerp(1.65 - gy * 0.35, fy - (zoomArt && zoomArt.plane === 'back' ? 0.06 : 0.02), easedFocus);
+  cam.z     = lerp(-1.4, fz - zoomShift, easedFocus);
+  cam.yaw   = lerp(gx * 0.36,  fx * 0.015, easedFocus);
+  cam.pitch = lerp(-gy * 0.12, zoomArt && zoomArt.plane === 'back' ? -0.016 : -0.010, easedFocus);
+  cam.fov   = lerp(cam.baseFov, cam.baseFov * fovScale, easedFocus);
 
   const surfDefs = [
     {pts:[[-5,0,0],[5,0,0],[5,0,10],[-5,0,10]],fill:'rgba(18,30,50,.98)',stroke:'rgba(255,255,255,.04)'},
@@ -1542,20 +1644,27 @@ function updateHoverDwell(now){
   const gPx={x:gaze.x*r.width, y:gaze.y*r.height};
   const hit=projectedArtworks.find(e=>ptInPoly(gPx,e.poly));
 
-  if(!hit){
+  const lockTarget = (now < state.zoom.lockUntil && state.zoom.targetId) ? artById(state.zoom.targetId) : null;
+  const activeHit = lockTarget ? { art: lockTarget } : hit;
+
+  if(!activeHit){
     if(state.hoveredId){ state.hoveredId=null; state.hoverStartTs=now; }
     dwellFill.style.width='0%';
     hoverText.textContent='—';
     gazeCursor.style.width='26px'; gazeCursor.style.height='26px';
+    const selected = artById(state.selectedId);
+    updateSelPanel(selected, false);
     return;
   }
 
-  hoverText.textContent=hit.art.title;
-  if(state.hoveredId!==hit.art.id){
-    state.hoveredId=hit.art.id;
+  hoverText.textContent=activeHit.art.title;
+  if(state.hoveredId!==activeHit.art.id){
+    state.hoveredId=activeHit.art.id;
     state.hoverStartTs=now;
     gazeCursor.style.width='34px'; gazeCursor.style.height='34px';
   }
+
+  updateSelPanel(activeHit.art, state.selectedId !== activeHit.art.id);
 
   const elapsed=now-state.hoverStartTs;
   const progress=clamp(elapsed/state.dwellMs,0,1);
@@ -1563,7 +1672,7 @@ function updateHoverDwell(now){
   gazeCursor.style.borderColor=progress>.7?'rgba(46,204,113,.95)':'rgba(93,173,226,.95)';
 
   if(progress>=1){
-    selectArtwork(hit.art,'dwell');
+    selectArtwork(activeHit.art,'dwell');
     state.hoverStartTs=now+380; // cooldown
   }
 }
@@ -1658,7 +1767,7 @@ async function startTracking(){
     state.rafMedia=requestAnimationFrame(mediaLoop);
     state.usingMouse=false;
     setMode('Webcam');
-    permNote.textContent='Tracking facial ativo com malha facial desenhada. Pisque normalmente: 1 piscada afasta e 2 piscadas rápidas aproximam.';
+    permNote.textContent='Tracking facial ativo com malha facial desenhada. A ficha genérica aparece no foco da obra; o heatmap fica reservado ao PDF. Pisque normalmente: 1 piscada afasta e 2 piscadas rápidas aproximam.';
     if(meshDebug) meshDebug.textContent = 'Malha: procurando baseline dos olhos…';
     log('Tracking facial iniciado com malha facial + blink por EAR dinâmico.');
 
@@ -1703,7 +1812,7 @@ function calibrate(){
   state.tracking.baselineReady = false;
   resetBlinkState();
   calibText.textContent='Concluída';
-  permNote.textContent='Calibração aplicada. A baseline do rosto e dos olhos foi reiniciada. Olhe normal por meio segundo; depois faça 1 piscada para afastar ou 2 piscadas rápidas para aproximar.';
+  permNote.textContent='Calibração aplicada. A baseline do rosto e dos olhos foi reiniciada. Olhe normal por meio segundo; depois faça 1 piscada para afastar ou 2 piscadas rápidas para aproximar. A ficha da obra entra só de focar nela.';
   log('Calibração aplicada. xOff='+state.calib.xOff.toFixed(3)+' yOff='+state.calib.yOff.toFixed(3));
 }
 
@@ -1735,7 +1844,7 @@ async function exportPdf(){
     lines.forEach(l=>{ pdf.text(l,12,y); y+=5; });
     y+=4;
     pdf.setFont('helvetica','bold');
-    pdf.text('Cena + Heatmap',12,y); y+=3;
+    pdf.text('Cena + Heatmap (heatmap visível apenas no relatório)',12,y); y+=3;
     pdf.addImage(sceneImg,'PNG',12,y,88,66,undefined,'FAST');
     pdf.addImage(heatImg,'PNG',108,y,88,66,undefined,'FAST');
     y+=72;
