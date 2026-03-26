@@ -457,6 +457,7 @@ const state = {
 
   tracking:{
     invertX:false,
+    mirrorInput:true,
     history:[],
     historyMax:10,
     baselineReady:false,
@@ -468,11 +469,11 @@ const state = {
       pitch:0,
       size:0.22
     },
-    deadzoneX:0.016,
+    deadzoneX:0.018,
     deadzoneY:0.012,
-    centerGainX:0.05,
+    centerGainX:0.015,
     centerGainY:0.78,
-    yawGainX:1.72,
+    yawGainX:2.08,
     pitchGainY:0.34,
     lastSizeRatio:1,
     sizeVelocity:0,
@@ -1456,15 +1457,22 @@ function faceMetrics(lm){
     return null;
   }
 
-  const eyeMidX = (leftEyeOuter.x + rightEyeOuter.x) * 0.5;
+  const mapX = x => state.tracking.mirrorInput ? (1 - x) : x;
+  const noseX = mapX(nose.x);
+  const leftEyeX = mapX(leftEyeOuter.x);
+  const rightEyeX = mapX(rightEyeOuter.x);
+  const leftCheekX = mapX(leftCheek.x);
+  const rightCheekX = mapX(rightCheek.x);
+
+  const eyeMidX = (leftEyeX + rightEyeX) * 0.5;
   const mouthMidY = (mouthTop.y + mouthBot.y) * 0.5;
-  const faceWidth = Math.max(0.001, rightCheek.x - leftCheek.x);
+  const faceWidth = Math.max(0.001, Math.abs(rightCheekX - leftCheekX));
   const faceHeight = Math.max(0.001, chin.y - forehead.y);
   const faceMidY = (forehead.y + chin.y) * 0.5;
 
-  const centerX = clamp(nose.x * 0.58 + eyeMidX * 0.42, 0, 1);
+  const centerX = clamp(noseX * 0.64 + eyeMidX * 0.36, 0, 1);
   const centerY = clamp(nose.y * 0.68 + mouthMidY * 0.32, 0, 1);
-  const yawRaw = (nose.x - eyeMidX) / Math.max(0.001, rightEyeOuter.x - leftEyeOuter.x);
+  const yawRaw = (noseX - eyeMidX) / Math.max(0.001, Math.abs(rightEyeX - leftEyeX));
   const pitchRaw = (nose.y - faceMidY) / faceHeight;
   const sizeRaw = faceWidth;
 
@@ -1536,13 +1544,14 @@ function mapFaceTracking(landmarks){
 
   const horizontalYaw = dyaw * state.tracking.yawGainX;
   const horizontalCenter = dx * state.tracking.centerGainX;
-  let combinedX = dirSign * (horizontalYaw + horizontalCenter);
+  const horizontalMix = horizontalYaw * 0.94 + horizontalCenter * 0.06;
+  let combinedX = dirSign * horizontalMix;
   let combinedY = dy * state.tracking.centerGainY + dpitch * state.tracking.pitchGainY;
 
   combinedX = remapDeadzone(combinedX, state.tracking.deadzoneX);
   combinedY = remapDeadzone(combinedY, state.tracking.deadzoneY);
 
-  const targetX = clamp(0.5 + combinedX * 0.92 + state.calib.xOff, 0.02, 0.98);
+  const targetX = clamp(0.5 + combinedX * state.calib.gainX + state.calib.xOff, 0.02, 0.98);
   const targetY = clamp(0.5 + combinedY * 0.86 + state.calib.yOff, 0.02, 0.98);
 
   gaze.targetX = smoothTowards(gaze.targetX, targetX, 0.065, 0.13);
@@ -1886,9 +1895,9 @@ async function startTracking(){
     state.rafMedia=requestAnimationFrame(mediaLoop);
     state.usingMouse=false;
     setMode('Webcam');
-    permNote.textContent='Tracking ativo. A lateral agora usa compensação espelhada por padrão e quase todo o movimento horizontal vem do yaw da cabeça. O foco entra por permanência do olhar e o zoom principal vem da distância do rosto + botões.';
+    permNote.textContent='Tracking ativo. O eixo horizontal agora segue o mesmo espelhamento visível da câmera, com lateral quase toda pelo yaw da cabeça. O foco entra por permanência do olhar e o zoom principal vem da distância do rosto + botões.';
     setTrackingMode('full');
-    log('Tracking facial iniciado com compensação espelhada no eixo X, lateral baseada em yaw da cabeça, foco por permanência e zoom principal por distância do rosto + botões.');
+    log('Tracking facial iniciado com eixo horizontal alinhado ao preview espelhado, lateral baseada em yaw e zoom principal por distância do rosto + botões.');
 
   } catch(err){
     state.usingMouse=true;
@@ -1921,9 +1930,9 @@ function calibrate(){
     log('Calibração não necessária no modo mouse.');
     return;
   }
-  state.calib.xOff += (0.5 - gaze.targetX) * 0.22;
-  state.calib.yOff += (0.5 - gaze.targetY) * 0.20;
-  state.calib.gainX = 1.00;
+  state.calib.xOff = clamp((0.5 - gaze.targetX) * 0.55, -0.18, 0.18);
+  state.calib.yOff = clamp((0.5 - gaze.targetY) * 0.50, -0.16, 0.16);
+  state.calib.gainX = 0.94;
   state.calib.gainY = 0.94;
   state.tracking.history = [];
   state.tracking.baselineReady = false;
@@ -1932,9 +1941,9 @@ function calibrate(){
   state.tracking.distanceNeutralFrames = 0;
   state.blink.baselineReady = false;
   state.zoom.dwellLevel = 0;
-  calibText.textContent='Concluída';
-  permNote.textContent='Calibração aplicada. A cabeça é o controle principal; se a lateral ainda parecer invertida, use o botão “Inverter X”.';
-  log('Calibração aplicada. xOff='+state.calib.xOff.toFixed(3)+' yOff='+state.calib.yOff.toFixed(3));
+  calibText.textContent='Centralizando';
+  permNote.textContent='Calibração aplicada. O eixo horizontal foi alinhado ao espelhamento visível da câmera; use “Inverter X” só se a sua webcam ainda vier ao contrário.';
+  log('Calibração centralizada. xOff='+state.calib.xOff.toFixed(3)+' yOff='+state.calib.yOff.toFixed(3)+' mirrorInput='+(state.tracking.mirrorInput ? 'on' : 'off'));
 }
 
 // ─── EXPORT PDF ───
@@ -2024,7 +2033,7 @@ document.getElementById('resetHeatBtn').addEventListener('click', clearHeatmap);
 document.getElementById('exportPdfBtn').addEventListener('click', exportPdf);
 invertXBtn.addEventListener('click', ()=>{
   state.tracking.invertX = !state.tracking.invertX;
-  permNote.textContent = state.tracking.invertX ? 'Compensação espelhada ligada: yaw invertido para webcams em modo selfie.' : 'Compensação espelhada desligada: direção direta da cabeça como padrão.';
+  permNote.textContent = state.tracking.invertX ? 'Inverter X ligado: o yaw foi invertido manualmente para webcams com direção oposta.' : 'Inverter X desligado: o yaw segue o mesmo espelhamento visível da câmera.';
   resetTrackingState();
   state.tracking.history = [];
   log('Inverter X = '+state.tracking.invertX);
@@ -2079,7 +2088,7 @@ setStatus(true,'Cena carregada');
 window.addEventListener('resize',resizeCanvases);
 video.addEventListener('loadedmetadata', syncVideoOverlaySize);
 requestAnimationFrame(tick);
-log('Sala pronta. Clique em "Iniciar tracking" para usar webcam com direção por pose da cabeça, zoom manual corrigido e parallax de profundidade reforçado na galeria.');
+log('Sala pronta. Clique em "Iniciar tracking" para usar webcam com eixo horizontal alinhado ao preview, zoom manual corrigido e parallax de profundidade reforçado na galeria.');
 
 })();
 </script>
