@@ -3,8 +3,8 @@ import streamlit.components.v1 as components
 
 st.set_page_config(page_title="Sala 3D – Face Tracking Parallax", layout="wide")
 
-st.title("Sala 3D com Face Tracking + Parallax")
-st.caption("Tracking facial com malha no rosto, direção lateral corrigida e blink calculado pelos landmarks dos olhos. 1 piscar afasta, 2 piscadas rápidas aproximam.")
+st.title("Sala 3D com Face Tracking Robusto")
+st.caption("Cabeça/rosto como navegação principal, malha facial com contorno dos olhos, blink robusto para zoom e fallback automático para câmera fraca com zoom por distância do rosto.")
 
 HTML_APP = r"""
 <div id="eye-room-root">
@@ -63,8 +63,8 @@ HTML_APP = r"""
   }
   #scene-shell{position:absolute;inset:0}
   #room,#heatmap,#reveal{position:absolute;inset:0;width:100%;height:100%;display:block}
-  #heatmap,#reveal{pointer-events:none}
   #heatmap{display:none}
+  #heatmap,#reveal{pointer-events:none}
   /* ── GAZE CURSOR ── */
   #gaze-cursor{
     position:absolute;width:26px;height:26px;
@@ -108,34 +108,7 @@ HTML_APP = r"""
     font-family:'JetBrains Mono',monospace;
     opacity:0;transition:opacity .3s;
   }
-  
   #blink-indicator.show{opacity:1}
-  #focus-card{
-    position:absolute;left:16px;bottom:62px;z-index:7;max-width:min(420px,58%);
-    padding:14px 15px;border-radius:16px;
-    background:rgba(6,13,26,.88);border:1px solid rgba(255,255,255,.08);
-    box-shadow:0 16px 40px rgba(0,0,0,.28);
-    backdrop-filter:blur(12px);
-    transition:opacity .2s ease, transform .2s ease;
-  }
-  #focus-card.hidden{opacity:0;transform:translateY(6px);pointer-events:none}
-  #focus-card .eyebrow{font-size:10.5px;letter-spacing:.7px;text-transform:uppercase;color:var(--muted);margin-bottom:5px}
-  #focus-card .title{font-size:16px;font-weight:800;line-height:1.15;margin-bottom:4px}
-  #focus-card .meta{font-size:11.5px;color:#b9d2f6;margin-bottom:7px}
-  #focus-card .desc{font-size:12px;line-height:1.45;color:var(--muted)}
-  #art-tooltip{
-    position:absolute;z-index:8;min-width:240px;max-width:min(360px,58%);
-    padding:11px 12px;border-radius:14px;
-    background:rgba(6,13,26,.92);border:1px solid rgba(93,173,226,.28);
-    box-shadow:0 18px 34px rgba(0,0,0,.32);
-    backdrop-filter:blur(12px);
-    transform:translate(-50%,-110%);
-    transition:opacity .16s ease, transform .16s ease;
-  }
-  #art-tooltip.hidden{opacity:0;transform:translate(-50%,-100%) scale(.98);pointer-events:none}
-  #art-tooltip .eyebrow{font-size:10px;letter-spacing:.7px;text-transform:uppercase;color:var(--muted);margin-bottom:4px}
-  #art-tooltip .title{font-size:14px;font-weight:800;line-height:1.15;margin-bottom:4px}
-  #art-tooltip .meta{font-size:11px;color:#b9d2f6;line-height:1.35}
   /* ── PERMISSION NOTE ── */
   #permission-note{
     position:absolute;left:14px;bottom:14px;z-index:7;max-width:66%;
@@ -152,19 +125,27 @@ HTML_APP = r"""
     box-shadow:inset 0 1px 0 rgba(255,255,255,.03);
   }
   .card h3{font-size:13px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px}
-  .camera-wrap{position:relative;width:100%;aspect-ratio:16/10;border-radius:12px;overflow:hidden;border:1px solid rgba(255,255,255,.07);background:#020609}
-  #video,
-  #meshOverlay{
-    position:absolute;inset:0;
+  #video{
     width:100%;height:100%;object-fit:cover;
+    border-radius:12px;
     background:#020609;transform:scaleX(-1);
   }
-  #video{z-index:1}
-  #meshOverlay{z-index:2;pointer-events:none}
-  #meshDebug{
-    display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;
-    font-family:'JetBrains Mono',monospace;
+  #meshOverlay{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+  .manual-zoom{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
+  .manual-zoom .btn{width:100%;text-align:center}
+  .status-note{margin-top:8px;font-size:11.5px;color:var(--muted);line-height:1.4}
+
+  #focus-info-card{
+    position:absolute;z-index:8;min-width:210px;max-width:280px;padding:12px 14px;
+    border-radius:14px;background:rgba(6,13,26,.90);border:1px solid rgba(93,173,226,.22);
+    backdrop-filter:blur(14px);box-shadow:0 16px 40px rgba(0,0,0,.32);
+    pointer-events:none;opacity:0;transform:translate(-50%,-120%);transition:opacity .15s ease, transform .15s ease;
   }
+  #focus-info-card.show{opacity:1}
+  #focus-info-card .ttl{font-size:13px;font-weight:800;color:var(--text);margin-bottom:4px}
+  #focus-info-card .sub{font-size:11px;color:var(--cyan);font-weight:700;margin-bottom:5px}
+  #focus-info-card .txt{font-size:11px;color:var(--muted);line-height:1.35}
+  .video-wrap{position:relative;width:100%;aspect-ratio:16/10;border-radius:12px;overflow:hidden;border:1px solid rgba(255,255,255,.07);background:#020609}
   /* ── STATS ── */
   .stats-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
   .stat{background:rgba(255,255,255,.025);border:1px solid rgba(255,255,255,.06);border-radius:12px;padding:10px}
@@ -235,8 +216,8 @@ HTML_APP = r"""
 <!-- TOPBAR -->
 <div class="topbar">
   <div class="headline">
-    <h2>🎨 Sala 3D – Face Tracking + Parallax</h2>
-    <p>Tracking pelo rosto com filtragem mais estável, blink adaptativo, parallax multicamada e zoom por piscadas mais confiável. <strong>1 piscar</strong> → afasta o zoom &nbsp;|&nbsp; <strong>2 piscadas rápidas</strong> → aproxima a obra em foco.</p>
+    <h2>Sala 3D – Tracking robusto por cabeça + malha facial</h2>
+    <p><strong>Cabeça/rosto</strong> controlam a direção, a malha facial e o contorno dos olhos dão suporte ao tracking, e o sistema alterna automaticamente entre <strong>modo completo</strong> e <strong>modo câmera fraca</strong>. <strong>1 piscada</strong> afasta. <strong>2 piscadas rápidas</strong> aproximam.</p>
   </div>
   <div class="controls">
     <button class="btn primary" id="startBtn">▶ Iniciar tracking</button>
@@ -257,6 +238,7 @@ HTML_APP = r"""
       <canvas id="heatmap"></canvas>
       <canvas id="reveal"></canvas>
       <div id="gaze-cursor"></div>
+      <div id="focus-info-card"><div class="ttl">Obra em foco</div><div class="sub">Aguardando foco</div><div class="txt">Olhe para uma obra para exibir a ficha.</div></div>
 
       <div class="chip" id="statusChip"><span id="statusDot" class="dot"></span><span id="statusText">Aguardando</span></div>
       <div class="chip" id="modeChip">Modo: <strong id="modeText">Cena ativa</strong></div>
@@ -267,20 +249,8 @@ HTML_APP = r"""
         <div class="bar"><div id="dwellFill"></div></div>
       </div>
 
-
       <div id="blink-indicator">👁 Blink detectado</div>
-      <div id="focus-card" class="hidden">
-        <div class="eyebrow" id="focus-eyebrow">obra em foco</div>
-        <div class="title" id="focus-title">Nenhuma obra em foco</div>
-        <div class="meta" id="focus-meta">Aproxime o cursor/olhar de uma obra para ver a ficha.</div>
-        <div class="desc" id="focus-desc">As informações da obra aparecem aqui assim que o foco entrar no quadro.</div>
-      </div>
-      <div id="art-tooltip" class="hidden">
-        <div class="eyebrow" id="tooltip-eyebrow">pré-foco</div>
-        <div class="title" id="tooltip-title">Nenhuma obra</div>
-        <div class="meta" id="tooltip-meta">Olhe para uma obra para exibir a ficha diretamente sobre ela.</div>
-      </div>
-      <div id="permission-note">Sala carregada. Clique em "Iniciar tracking" para webcam. O eixo lateral foi recalculado; se no seu aparelho ainda ficar ao contrário, use “Inverter X”.</div>
+      <div id="permission-note">Sala carregada. Clique em "Iniciar tracking". Cabeça controla a direção, a obra entra em foco por permanência do olhar e o sistema ativa ou desativa o blink automaticamente conforme a qualidade da câmera.</div>
     </div>
   </div>
 
@@ -288,12 +258,11 @@ HTML_APP = r"""
   <div class="sidebar">
     <div class="card">
       <h3>Câmera</h3>
-      <div class="camera-wrap">
+      <div class="video-wrap">
         <video id="video" autoplay playsinline muted></video>
         <canvas id="meshOverlay"></canvas>
       </div>
-      <div class="small-note">Malha facial desenhada em cima da webcam para você ver o tracking em tempo real. A câmera continua espelhada só na visualização.</div>
-      <div class="small-note" id="meshDebug">Malha: aguardando webcam…</div>
+      <div class="small-note">Malha facial geral e contorno dos olhos sobre a câmera. A imagem segue espelhada só na visualização; a cabeça continua sendo o controle principal.</div>
     </div>
 
     <div class="card">
@@ -305,6 +274,7 @@ HTML_APP = r"""
         <div class="stat"><div class="k">Obras vistas</div><div class="v" id="statArtworks">0</div></div>
       </div>
       <div class="meta-line"><span>Qualidade</span><strong id="qualityText">—</strong></div>
+      <div class="meta-line"><span>Modo</span><strong id="trackingModeText">Aguardando</strong></div>
       <div class="meta-line"><span>Hover atual</span><strong id="hoverText">—</strong></div>
       <div class="meta-line"><span>Calibração</span><strong id="calibrationText">Pendente</strong></div>
       <div class="meta-line"><span>Zoom</span><strong id="zoomText">Normal</strong></div>
@@ -312,25 +282,35 @@ HTML_APP = r"""
 
     <div class="card">
       <h3>Obra em foco</h3>
-      <div id="selected-title">Nenhuma obra selecionada</div>
-      <div id="selected-artist">Passe o olhar sobre uma obra para ver a ficha genérica; 2 piscadas aproximam e 1 afasta.</div>
-      <div id="selected-description">As informações já aparecem no foco/hover. O zoom entra em níveis mais estáveis para reduzir tranco e overshoot.</div>
+      <div id="selected-title">Nenhuma obra em foco</div>
+      <div id="selected-artist">Olhe para uma obra para ver a ficha. 1 piscada afasta. 2 piscadas aproximam.</div>
+      <div id="selected-description">No modo câmera fraca, o sistema mantém a permanência do olhar e troca o zoom de blink por distância do rosto e botões manuais.</div>
     </div>
 
     <div class="card">
       <h3>Guia de blinks</h3>
       <div class="blink-guide">
         <div class="blink-card">
-          <div class="icon">😉</div>
-          <div class="bl">1 piscar</div>
+          <div class="icon">1×</div>
+          <div class="bl">1 piscada</div>
           <div class="desc">Afasta o zoom</div>
         </div>
         <div class="blink-card">
-          <div class="icon">😮</div>
+          <div class="icon">2×</div>
           <div class="bl">2 piscadas rápidas</div>
           <div class="desc">Aproxima a obra em foco</div>
         </div>
       </div>
+    </div>
+
+
+    <div class="card">
+      <h3>Zoom manual / câmera fraca</h3>
+      <div class="manual-zoom">
+        <button class="btn primary" id="zoomInBtn">+ Aproximar</button>
+        <button class="btn warn" id="zoomOutBtn">− Afastar</button>
+      </div>
+      <div class="status-note" id="weakZoomNote">Quando a webcam estiver ruim, o blink é desligado automaticamente e o zoom passa a responder pela distância do rosto e pelos botões.</div>
     </div>
 
     <div class="card">
@@ -355,12 +335,15 @@ const heatmapCanvas= document.getElementById('heatmap');
 const revealCanvas = document.getElementById('reveal');
 const scenePanel   = document.querySelector('.scene-panel');
 const video        = document.getElementById('video');
-const meshCanvas   = document.getElementById('meshOverlay');
-const meshDebug    = document.getElementById('meshDebug');
+const meshOverlay  = document.getElementById('meshOverlay');
+const focusInfoCard= document.getElementById('focus-info-card');
 const ctx          = roomCanvas.getContext('2d');
-const meshCtx      = meshCanvas.getContext('2d');
 const heatCtx      = heatmapCanvas.getContext('2d');
 const revealCtx    = revealCanvas.getContext('2d');
+const meshCtx      = meshOverlay.getContext('2d');
+const analysisCanvas = document.createElement('canvas');
+analysisCanvas.width = 160; analysisCanvas.height = 120;
+const analysisCtx = analysisCanvas.getContext('2d', {willReadFrequently:true});
 
 const gazeCursor    = document.getElementById('gaze-cursor');
 const dwellFill     = document.getElementById('dwellFill');
@@ -371,6 +354,7 @@ const blinkText     = document.getElementById('blinkText');
 const blinkIndicator= document.getElementById('blink-indicator');
 const permNote      = document.getElementById('permission-note');
 const qualityText   = document.getElementById('qualityText');
+const trackingModeText = document.getElementById('trackingModeText');
 const hoverText     = document.getElementById('hoverText');
 const calibText     = document.getElementById('calibrationText');
 const zoomText      = document.getElementById('zoomText');
@@ -381,23 +365,18 @@ const statArtworks  = document.getElementById('statArtworks');
 const selTitle      = document.getElementById('selected-title');
 const selArtist     = document.getElementById('selected-artist');
 const selDesc       = document.getElementById('selected-description');
-const focusCard     = document.getElementById('focus-card');
-const focusEyebrow  = document.getElementById('focus-eyebrow');
-const focusTitle    = document.getElementById('focus-title');
-const focusMeta     = document.getElementById('focus-meta');
-const focusDesc     = document.getElementById('focus-desc');
-const artTooltip    = document.getElementById('art-tooltip');
-const tooltipEyebrow= document.getElementById('tooltip-eyebrow');
-const tooltipTitle  = document.getElementById('tooltip-title');
-const tooltipMeta   = document.getElementById('tooltip-meta');
 const artworkList   = document.getElementById('artwork-list');
 const logBox        = document.getElementById('logBox');
 const invertXBtn    = document.getElementById('invertXBtn');
+const zoomInBtn     = document.getElementById('zoomInBtn');
+const zoomOutBtn    = document.getElementById('zoomOutBtn');
+const weakZoomNote  = document.getElementById('weakZoomNote');
 
 // ─── UTILS ───
 const clamp = (v,a,b) => Math.min(b, Math.max(a,v));
 const lerp  = (a,b,t) => a + (b-a)*t;
 const avgKey= (pts,k) => pts.reduce((s,p)=>s+p[k],0) / Math.max(1,pts.length);
+const dist2 = (a,b,c,d) => Math.hypot(a-c,b-d);
 
 function log(msg){
   const line = '['+new Date().toLocaleTimeString()+'] '+msg;
@@ -407,8 +386,6 @@ function log(msg){
 logBox.textContent = 'Sala inicializada.';
 window.addEventListener('error', e => log('ERRO: '+(e.message||'?')));
 window.addEventListener('unhandledrejection', e => log('REJECT: '+String(e.reason)));
-video.addEventListener('loadedmetadata', syncMeshCanvasSize);
-window.addEventListener('resize', syncMeshCanvasSize);
 
 // ─── STATE ───
 const state = {
@@ -422,7 +399,7 @@ const state = {
   sampleIntervalMs:80,
   lastSampleTs:0,
   hoverStartTs:0,
-  dwellMs:1000,
+  dwellMs:950,
 
   hoveredId:null,
   selectedId:null,
@@ -445,39 +422,30 @@ const state = {
   },
 
   blink:{
-    closed:false,
+    phase:'open',
     closeTs:0,
-    leftEma:0.24,
-    rightEma:0.24,
-    leftOpenRef:0.24,
-    rightOpenRef:0.24,
-    openScore:1,
-    openScoreEma:1,
-    readyFrames:0,
+    ema:0.27,
+    emaFast:0.27,
+    baseline:0.27,
     baselineReady:false,
-    closeThresh:0.82,
-    openThresh:0.88,
-    minMs:30,
-    maxMs:520,
-    closedFrames:0,
+    minBaseline:0.16,
+    maxBaseline:0.42,
+    closeRatio:0.63,
+    openRatio:0.82,
+    threshClose:0.18,
+    threshOpen:0.24,
+    minMs:40,
+    maxMs:420,
+    closeFrames:0,
     openFrames:0,
-    minClosedFrames:1,
-    minOpenFrames:1,
+    minCloseFrames:2,
+    minOpenFrames:2,
+    pendingSingleTs:0,
     lastBlinkTs:0,
     lastEventTs:0,
-    pendingSingleTs:0,
-    pendingSingleTimer:null,
-    lastBlinkDuration:0,
-    doubleWindowMs:900,
-    cooldownMs:25,
-    cooldownUntil:0,
-    rearmUntil:0,
-    minInterBlinkMs:55,
-    minClosureDelta:0.10,
-    minClosedRatio:0.80,
-    minDuringBlink:1,
-    preBlinkOpenRatio:1,
-    stableOpenFrames:0,
+    doubleWindowMs:440,
+    debounceMs:100,
+    eyeConfidence:0,
     debugLast:'init'
   },
 
@@ -494,13 +462,22 @@ const state = {
       pitch:0,
       size:0.22
     },
-    deadzoneX:0.012,
-    deadzoneY:0.014,
-    centerGainX:0.92,
-    centerGainY:1.02,
-    yawGainX:1.18,
-    pitchGainY:0.48,
-    mirrorCompensation:true
+    deadzoneX:0.010,
+    deadzoneY:0.012,
+    centerGainX:1.40,
+    centerGainY:0.96,
+    yawGainX:0.40,
+    pitchGainY:0.24,
+    lastSizeRatio:1,
+    sizeVelocity:0,
+    videoBrightnessScore:0.6,
+    videoSharpnessScore:0.55,
+    stabilityScore:0.6,
+    totalQuality:0.62,
+    modeKind:'full',
+    weakZoomCooldownUntil:0,
+    lastModeTs:0,
+    frameCounter:0
   },
 
   parallax:{
@@ -515,12 +492,25 @@ const state = {
     active:false,
     targetId:null,
     focus:0,
-    focusTarget:0,
-    focusVel:0,
-    level:0,
-    lockUntil:0
+    focusTarget:0
   }
 };
+
+const modeConfig = {
+  full:{label:'Completo', allowBlink:true, usesFaceDistance:false},
+  hybrid:{label:'Híbrido', allowBlink:true, usesFaceDistance:false},
+  weak:{label:'Câmera fraca', allowBlink:false, usesFaceDistance:true}
+};
+
+const FACE_OVAL = [10,338,297,332,284,251,389,356,454,323,361,288,397,365,379,378,400,377,152,148,176,149,150,136,172,58,132,93,234,127,162,21,54,103,67,109,10];
+const LEFT_EYE = [33,160,158,133,153,144,33];
+const RIGHT_EYE = [362,385,387,263,373,380,362];
+const LEFT_BROW = [70,63,105,66,107];
+const RIGHT_BROW = [336,296,334,293,300];
+const NOSE_LINE = [168,6,197,195,5,4,1,19,94,2];
+const MOUTH_OUTER = [61,146,91,181,84,17,314,405,321,375,291,308,324,318,402,317,14,87,178,88,95,78,61];
+const LEFT_IRIS = [468,469,470,471,472,468];
+const RIGHT_IRIS = [473,474,475,476,477,473];
 
 // ─── GAZE ───
 const gaze = {
@@ -535,11 +525,11 @@ const cam = { x:0, y:1.65, z:-1.4, yaw:0, pitch:0, baseFov:700, fov:700 };
 
 // ─── ARTWORKS ───
 const artworks = [
-  { id:'a1', title:'Memórias de Superfície', artist:'Lívia Andrade',  year:'2024', wall:'fundo',    color:'#e74c3c', medium:'pintura expandida', category:'abstração matérico-cromática', desc:'Pintura em camadas com relevo cromático e estratos de memória afetiva.', plane:'back',  x:-2.8, y:2.1,  z:9.85, w:1.7, h:1.2 },
-  { id:'a2', title:'Campo Sensível',         artist:'Diego Marins',   year:'2025', wall:'fundo',    color:'#27ae60', medium:'arte digital generativa', category:'visualização computacional', desc:'Trabalho digital generativo com profundidade simulada por partículas.',  plane:'back',  x:0.0,  y:2.2,  z:9.85, w:1.7, h:1.2 },
-  { id:'a3', title:'Eco de Matéria',         artist:'Marina Teles',   year:'2026', wall:'fundo',    color:'#f39c12', medium:'objeto expandido', category:'pesquisa entre escultura e luz', desc:'Objeto expandido que evoca microscopia e holografia em simultaneidade.',  plane:'back',  x:2.8,  y:2.05, z:9.85, w:1.7, h:1.2 },
-  { id:'a4', title:'Horizonte Índigo',       artist:'Ciro Menezes',   year:'2023', wall:'esquerda', color:'#8e44ad', medium:'pintura geométrica', category:'cor e percepção espacial', desc:'Composição geométrica com ilusão de profundidade e vibração cromática.',  plane:'left',  x:-4.85,y:2.1,  z:6.1,  w:1.6, h:1.1 },
-  { id:'a5', title:'Traço Latente',          artist:'Rafaela Costa',  year:'2022', wall:'direita',  color:'#2980b9', medium:'pintura de observação', category:'atenção periférica', desc:'Pintura que exige leitura periférica e foco seletivo do observador.',     plane:'right', x:4.85, y:2.05, z:5.7,  w:1.6, h:1.1 }
+  { id:'a1', title:'Memórias de Superfície', artist:'Lívia Andrade',  year:'2024', wall:'fundo',    color:'#e74c3c', desc:'Pintura em camadas com relevo cromático e estratos de memória afetiva.', plane:'back',  x:-2.8, y:2.1,  z:9.85, w:1.7, h:1.2 },
+  { id:'a2', title:'Campo Sensível',         artist:'Diego Marins',   year:'2025', wall:'fundo',    color:'#27ae60', desc:'Trabalho digital generativo com profundidade simulada por partículas.',  plane:'back',  x:0.0,  y:2.2,  z:9.85, w:1.7, h:1.2 },
+  { id:'a3', title:'Eco de Matéria',         artist:'Marina Teles',   year:'2026', wall:'fundo',    color:'#f39c12', desc:'Objeto expandido que evoca microscopia e holografia em simultaneidade.',  plane:'back',  x:2.8,  y:2.05, z:9.85, w:1.7, h:1.2 },
+  { id:'a4', title:'Horizonte Índigo',       artist:'Ciro Menezes',   year:'2023', wall:'esquerda', color:'#8e44ad', desc:'Composição geométrica com ilusão de profundidade e vibração cromática.',  plane:'left',  x:-4.85,y:2.1,  z:6.1,  w:1.6, h:1.1 },
+  { id:'a5', title:'Traço Latente',          artist:'Rafaela Costa',  year:'2022', wall:'direita',  color:'#2980b9', desc:'Pintura que exige leitura periférica e foco seletivo do observador.',     plane:'right', x:4.85, y:2.05, z:5.7,  w:1.6, h:1.1 }
 ];
 
 let projectedArtworks = [];
@@ -548,6 +538,19 @@ let projectedArtworks = [];
 function setStatus(on,t){ statusDot.classList.toggle('on',!!on); statusText.textContent=t; }
 function setMode(t){ modeText.textContent=t; }
 function setBlink(t){ blinkText.textContent=t; }
+function setTrackingMode(kind){
+  const cfg = modeConfig[kind] || modeConfig.full;
+  state.tracking.modeKind = kind;
+  trackingModeText.textContent = cfg.label;
+  weakZoomNote.textContent = cfg.usesFaceDistance
+    ? 'Câmera fraca detectada: blink desligado. O zoom responde pela distância do rosto e pelos botões.'
+    : 'Blink ativo. 1 piscada afasta, 2 piscadas rápidas aproximam a obra em foco.';
+  if(kind === 'weak') {
+    permNote.textContent = 'Câmera fraca detectada: cabeça continua controlando a direção, a obra entra por permanência do olhar e o zoom usa distância do rosto + botões.';
+  } else {
+    permNote.textContent = 'Tracking ativo. Cabeça controla a direção. 1 piscada afasta e 2 piscadas rápidas aproximam quando a câmera estiver boa; em câmera fraca, o zoom troca automaticamente para distância do rosto + botões.';
+  }
+}
 
 function flashBlinkIndicator(msg){
   blinkIndicator.textContent = msg;
@@ -557,34 +560,20 @@ function flashBlinkIndicator(msg){
 }
 
 function resetBlinkState(){
-  if(state.blink.pendingSingleTimer){
-    clearTimeout(state.blink.pendingSingleTimer);
-    state.blink.pendingSingleTimer = null;
-  }
-  state.blink.closed = false;
+  state.blink.phase = 'open';
   state.blink.closeTs = 0;
-  state.blink.closedFrames = 0;
+  state.blink.closeFrames = 0;
   state.blink.openFrames = 0;
+  state.blink.pendingSingleTs = 0;
   state.blink.lastBlinkTs = 0;
   state.blink.lastEventTs = 0;
-  state.blink.pendingSingleTs = 0;
-  state.blink.lastBlinkDuration = 0;
-  state.blink.cooldownUntil = 0;
-  state.blink.rearmUntil = 0;
-  state.blink.leftEma = 0.24;
-  state.blink.rightEma = 0.24;
-  state.blink.leftOpenRef = 0.24;
-  state.blink.rightOpenRef = 0.24;
-  state.blink.openScore = 1;
-  state.blink.openScoreEma = 1;
-  state.blink.minDuringBlink = 1;
-  state.blink.preBlinkOpenRatio = 1;
-  state.blink.readyFrames = 0;
-  state.blink.stableOpenFrames = 0;
+  state.blink.ema = 0.27;
+  state.blink.emaFast = 0.27;
+  state.blink.baseline = 0.27;
   state.blink.baselineReady = false;
+  state.blink.eyeConfidence = 0;
   state.blink.debugLast = 'reset';
   setBlink('Pronto');
-  if(meshDebug) meshDebug.textContent = 'Malha: aguardando baseline dos olhos…';
   gazeCursor.style.borderColor = 'rgba(255,255,255,.92)';
 }
 
@@ -592,6 +581,10 @@ function resetTrackingState(){
   state.tracking.history = [];
   state.tracking.baselineReady = false;
   state.tracking.baselineFrames = 0;
+  state.tracking.lastSizeRatio = 1;
+  state.tracking.sizeVelocity = 0;
+  state.tracking.totalQuality = 0.62;
+  state.tracking.weakZoomCooldownUntil = 0;
   state.tracking.baseline = {
     centerX:0.5,
     centerY:0.5,
@@ -599,22 +592,18 @@ function resetTrackingState(){
     pitch:0,
     size:0.22
   };
+  setTrackingMode('full');
 }
 
 // ─── RESIZE ───
-function syncMeshCanvasSize(){
-  if(!meshCanvas || !meshCtx) return;
+function syncVideoOverlaySize(){
   const r = video.getBoundingClientRect();
-  const dpr = window.devicePixelRatio||1;
-  const w = Math.max(1, Math.floor(r.width * dpr));
-  const h = Math.max(1, Math.floor(r.height * dpr));
-  if(meshCanvas.width !== w || meshCanvas.height !== h){
-    meshCanvas.width = w;
-    meshCanvas.height = h;
-    meshCanvas.style.width = r.width + 'px';
-    meshCanvas.style.height = r.height + 'px';
-    meshCtx.setTransform(dpr,0,0,dpr,0,0);
-  }
+  const dpr = window.devicePixelRatio || 1;
+  meshOverlay.width = Math.max(1, Math.floor(r.width * dpr));
+  meshOverlay.height = Math.max(1, Math.floor(r.height * dpr));
+  meshOverlay.style.width = r.width + 'px';
+  meshOverlay.style.height = r.height + 'px';
+  meshCtx.setTransform(dpr,0,0,dpr,0,0);
 }
 
 function resizeCanvases(){
@@ -629,7 +618,7 @@ function resizeCanvases(){
   ctx.setTransform(dpr,0,0,dpr,0,0);
   heatCtx.setTransform(dpr,0,0,dpr,0,0);
   revealCtx.setTransform(dpr,0,0,dpr,0,0);
-  syncMeshCanvasSize();
+  syncVideoOverlaySize();
 }
 
 function wrap(v,max){
@@ -844,7 +833,6 @@ function addHeat(xN,yN){
   if(state.revealPoints.length>280) state.revealPoints.shift();
 
   statPoints.textContent=String(state.heatPoints.length);
-  qualityText.textContent=Math.round(gaze.quality*100)+'%';
 
   // fixação
   if(state.lastPointPx){
@@ -900,207 +888,91 @@ function updateCursor(){
 // ─── ARTWORK PANEL ───
 function artById(id){ return artworks.find(a=>a.id===id)||null; }
 
-function genericArtworkInfo(art){
-  const sizeCm = Math.round(art.w * 100) + ' × ' + Math.round(art.h * 100) + ' cm';
-  return {
-    eyebrow:'obra em foco',
-    meta:art.artist+' · '+art.year+' · parede '+art.wall+' · '+(art.medium||'obra')+' · '+sizeCm,
-    desc:(art.category ? 'Leitura genérica: '+art.category+'. ' : 'Leitura genérica: ') + art.desc
-  };
-}
-
-function projectedEntryByArtId(id){
-  return projectedArtworks.find(entry => entry.art.id === id) || null;
-}
-
-function polyCenter(poly){
-  if(!poly?.length) return null;
-  const s = poly.reduce((acc, p) => ({ x:acc.x + p.x, y:acc.y + p.y }), { x:0, y:0 });
-  return { x:s.x / poly.length, y:s.y / poly.length };
-}
-
-function pointSegDistance(px, py, a, b){
-  const dx = b.x - a.x;
-  const dy = b.y - a.y;
-  const denom = dx * dx + dy * dy || 1;
-  const t = clamp(((px - a.x) * dx + (py - a.y) * dy) / denom, 0, 1);
-  const x = a.x + dx * t;
-  const y = a.y + dy * t;
-  return Math.hypot(px - x, py - y);
-}
-
-function pointPolyDistance(pt, poly){
-  if(!poly?.length) return Infinity;
-  if(ptInPoly(pt, poly)) return 0;
-  let best = Infinity;
-  for(let i = 0; i < poly.length; i++){
-    const a = poly[i];
-    const b = poly[(i + 1) % poly.length];
-    best = Math.min(best, pointSegDistance(pt.x, pt.y, a, b));
-  }
-  return best;
-}
-
-function findFocusHit(gPx){
-  if(!projectedArtworks?.length) return null;
-  let best = null;
-  let bestScore = Infinity;
-  for(const entry of projectedArtworks){
-    const dist = pointPolyDistance(gPx, entry.poly);
-    const c = polyCenter(entry.poly);
-    const diag = c ? Math.max(42, Math.hypot(entry.poly[1].x - entry.poly[0].x, entry.poly[3].y - entry.poly[0].y)) : 42;
-    const centerDist = c ? Math.hypot(gPx.x - c.x, gPx.y - c.y) : dist;
-    const focusRange = Math.max(62, diag * 0.42);
-    const nearEnough = dist <= focusRange || centerDist <= focusRange * 0.95;
-    if(!nearEnough) continue;
-    const score = dist * 1.18 + centerDist * 0.26;
-    if(score < bestScore){
-      bestScore = score;
-      best = entry;
-    }
-  }
-  return best;
-}
-
-function syncArtworkTooltip(entry, preview){
-  if(!artTooltip){
-    return;
-  }
-  if(!entry || !entry.art){
-    artTooltip.classList.add('hidden');
-    return;
-  }
-  const info = genericArtworkInfo(entry.art);
-  const center = entry.poly ? polyCenter(entry.poly) : null;
-  const r = scenePanel.getBoundingClientRect();
-  artTooltip.classList.remove('hidden');
-  tooltipEyebrow.textContent = preview ? 'olhando para' : 'obra travada';
-  tooltipTitle.textContent = entry.art.title;
-  tooltipMeta.textContent = info.meta;
-  if(center){
-    const x = clamp(center.x, 130, Math.max(130, r.width - 130));
-    const y = clamp(center.y - 12, 92, Math.max(92, r.height - 36));
-    artTooltip.style.left = x + 'px';
-    artTooltip.style.top = y + 'px';
-  } else {
-    artTooltip.style.left = '50%';
-    artTooltip.style.top = '88px';
-  }
-}
-
-function syncFocusCard(art, preview){
-  if(!focusCard) return;
+function updateSelPanel(art){
   if(!art){
-    focusCard.classList.add('hidden');
-    focusEyebrow.textContent = 'obra em foco';
-    focusTitle.textContent = 'Nenhuma obra em foco';
-    focusMeta.textContent = 'Aproxime o cursor/olhar de uma obra para ver a ficha.';
-    focusDesc.textContent = 'As informações da obra aparecem aqui assim que o foco entrar no quadro.';
+    selTitle.textContent='Nenhuma obra em foco';
+    selArtist.textContent='Olhe para uma obra para ver a ficha. 1 piscada afasta. 2 piscadas rápidas aproximam.';
+    selDesc.textContent='Se a câmera estiver fraca, o sistema desliga o blink sozinho e usa permanência do olhar + distância do rosto + botões.';
     return;
   }
-  const info = genericArtworkInfo(art);
-  focusCard.classList.remove('hidden');
-  focusEyebrow.textContent = preview ? 'pré-foco' : 'foco travado';
-  focusTitle.textContent = art.title;
-  focusMeta.textContent = info.meta;
-  focusDesc.textContent = info.desc;
-}
-
-function updateSelPanel(art, preview){
-  if(!art){
-    selTitle.textContent='Nenhuma obra selecionada';
-    selArtist.textContent='Passe o olhar sobre uma obra para ver a ficha genérica; 2 piscadas aproximam e 1 afasta.';
-    selDesc.textContent='As informações aparecem no hover/foco mesmo sem zoom. O heatmap fica guardado só para o PDF do relatório.';
-    syncFocusCard(null, false);
-    syncArtworkTooltip(null, false);
-    return;
-  }
-  const info = genericArtworkInfo(art);
   selTitle.textContent=art.title;
-  selArtist.textContent=(preview?'Pré-foco · ':'Foco travado · ')+info.meta;
-  selDesc.textContent=info.desc;
-  syncFocusCard(art, !!preview);
+  selArtist.textContent=art.artist+' · '+art.year+' · parede '+art.wall;
+  selDesc.textContent=art.desc;
 }
 
-function zoomProfile(art){
-  return art && art.plane === 'back' ? [0, 0.34, 0.56, 0.78, 0.92] : [0, 0.30, 0.50, 0.70, 0.86];
+function updateFocusInfoCard(){
+  const activeId = state.hoveredId || state.selectedId || state.zoom.targetId;
+  const activeArt = artById(activeId);
+  if(!activeArt || !projectedArtworks.length){
+    focusInfoCard.classList.remove('show');
+    return;
+  }
+  const entry = projectedArtworks.find(p=>p.art.id===activeArt.id);
+  if(!entry || !entry.center){
+    focusInfoCard.classList.remove('show');
+    return;
+  }
+  const r = scenePanel.getBoundingClientRect();
+  focusInfoCard.querySelector('.ttl').textContent = activeArt.title;
+  focusInfoCard.querySelector('.sub').textContent = activeArt.artist+' · '+activeArt.year;
+  focusInfoCard.querySelector('.txt').textContent = activeArt.desc;
+  focusInfoCard.style.left = clamp(entry.center.x, 90, r.width-90) + 'px';
+  focusInfoCard.style.top = clamp(entry.center.y - 16, 70, r.height-26) + 'px';
+  focusInfoCard.classList.add('show');
 }
 
-function zoomLabelFromLevel(level){
-  if(level >= 4) return 'Muito próximo';
-  if(level >= 3) return 'Próximo';
-  if(level >= 2) return 'Ativo';
-  if(level >= 1) return 'Leve';
-  return 'Normal';
-}
-
-function resolveNextZoomLevel(art, source){
-  const sameArt = state.zoom.targetId === art.id;
-  let level = sameArt ? state.zoom.level : 0;
-  if(source === 'double_blink') level = Math.min(level + 2, zoomProfile(art).length - 1);
-  else if(source === 'dwell') level = Math.max(level, sameArt ? Math.min(level + 1, 2) : 1);
-  else level = Math.min(level + 1, zoomProfile(art).length - 1);
-  return level;
-}
-
-function zoomInToArtwork(art, source){
+function zoomInToArtwork(art, source, amount){
   if(!art) return;
-  const profile = zoomProfile(art);
-  const nextLevel = resolveNextZoomLevel(art, source || 'zoom_in');
   state.selectedId = art.id;
-  state.zoom.active = nextLevel > 0;
+  state.zoom.active = true;
   state.zoom.targetId = art.id;
-  state.zoom.level = nextLevel;
-  state.zoom.focusTarget = profile[nextLevel];
-  state.zoom.lockUntil = Date.now() + ((source === 'double_blink' || source === 'single_blink') ? 620 : 260);
-  zoomText.textContent = zoomLabelFromLevel(nextLevel);
-  updateSelPanel(art, false);
+  state.zoom.focusTarget = clamp(Math.max(state.zoom.focusTarget, 0.16) + (amount || 0.26), 0, 1);
+  zoomText.textContent = state.zoom.focusTarget > 0.72 ? 'Próximo' : 'Ativo';
+  updateSelPanel(art);
 
   if(!state.seenIds.has(art.id)){
     state.seenIds.add(art.id);
     statArtworks.textContent = String(state.seenIds.size);
   }
   state.selections.push({id:art.id,title:art.title,ts:Date.now(),source:source||'zoom_in'});
-  log('Zoom in "'+art.title+'" via '+(source||'zoom_in')+' (lvl '+nextLevel+' / '+state.zoom.focusTarget.toFixed(2)+')');
+  log('Zoom in "'+art.title+'" via '+(source||'zoom_in')+' ('+state.zoom.focusTarget.toFixed(2)+')');
 }
 
 function selectArtwork(art,source){
-  zoomInToArtwork(art, source || 'select');
+  if(!art) return;
+  state.selectedId = art.id;
+  updateSelPanel(art);
+  if(source === 'dwell'){
+    zoomInToArtwork(art, source || 'select', 0.16);
+  } else if(source && source.startsWith('manual')){
+    zoomInToArtwork(art, source, 0.24);
+  } else {
+    state.zoom.targetId = art.id;
+  }
 }
 
 function zoomOutStep(source){
-  const art = artById(state.zoom.targetId || state.selectedId);
-  if(!art || state.zoom.level <= 0 || state.zoom.focusTarget <= 0.02){
+  if(state.zoom.focusTarget <= 0.02){
     resetZoom();
     return;
   }
-  const profile = zoomProfile(art);
-  state.zoom.level = Math.max(0, state.zoom.level - 1);
-  state.zoom.focusTarget = profile[state.zoom.level] || 0;
-  state.zoom.lockUntil = Date.now() + 180;
-  if(state.zoom.level === 0){
+  state.zoom.focusTarget = clamp(state.zoom.focusTarget - 0.30, 0, 1);
+  if(state.zoom.focusTarget <= 0.05){
     resetZoom();
   } else {
     state.zoom.active = true;
-    zoomText.textContent = zoomLabelFromLevel(state.zoom.level);
-    updateSelPanel(art, false);
+    zoomText.textContent = 'Afastando';
   }
-  log('Zoom out via '+(source||'zoom_out')+' (lvl '+state.zoom.level+' / '+state.zoom.focusTarget.toFixed(2)+')');
+  log('Zoom out via '+(source||'zoom_out')+' ('+state.zoom.focusTarget.toFixed(2)+')');
 }
 
 function resetZoom(){
   state.zoom.focusTarget = 0;
-  state.zoom.focusVel = 0;
-  state.zoom.focus = 0;
-  state.zoom.level = 0;
   state.zoom.active = false;
   state.zoom.targetId = null;
-  state.zoom.lockUntil = 0;
   state.selectedId = null;
   zoomText.textContent = 'Normal';
-  const hovered = artById(state.hoveredId);
-  updateSelPanel(hovered, !!hovered);
-  syncArtworkTooltip(hovered ? projectedEntryByArtId(hovered.id) : null, !!hovered);
+  updateSelPanel(state.hoveredId ? artById(state.hoveredId) : null);
 }
 
 function blinkTarget(){
@@ -1108,8 +980,6 @@ function blinkTarget(){
   const selected = artById(state.selectedId);
   if(hovered) return hovered;
   if(selected) return selected;
-
-  // fallback: usa a obra mais próxima do cursor atual
   if(projectedArtworks && projectedArtworks.length){
     const r = scenePanel.getBoundingClientRect();
     const gx = gaze.x * r.width;
@@ -1117,30 +987,29 @@ function blinkTarget(){
     let best = null;
     let bestD = Infinity;
     projectedArtworks.forEach(entry=>{
-      const poly = entry.poly;
-      const cx = (poly[0].x + poly[1].x + poly[2].x + poly[3].x) / 4;
-      const cy = (poly[0].y + poly[1].y + poly[2].y + poly[3].y) / 4;
+      const cx = entry.center?.x ?? ((entry.poly[0].x + entry.poly[1].x + entry.poly[2].x + entry.poly[3].x) / 4);
+      const cy = entry.center?.y ?? ((entry.poly[0].y + entry.poly[1].y + entry.poly[2].y + entry.poly[3].y) / 4);
       const d = Math.hypot(cx - gx, cy - gy);
       if(d < bestD){
         bestD = d;
         best = entry.art;
       }
     });
-    if(best) return best;
+    if(best && bestD < Math.min(r.width, r.height) * 0.30) return best;
   }
-  return artworks[0] || null;
+  return null;
 }
 
 function onSingleBlink(){
   zoomOutStep('single_blink');
-  flashBlinkIndicator('👁 1 piscar → afasta');
+  flashBlinkIndicator('👁 1 piscada → afasta');
   log('Single blink → afasta');
 }
 
 function onDoubleBlink(){
   const target = blinkTarget();
   if(target){
-    zoomInToArtwork(target, 'double_blink', target.id === state.hoveredId ? 0.42 : 0.36);
+    zoomInToArtwork(target, 'double_blink', target.id === state.hoveredId ? 0.30 : 0.24);
     flashBlinkIndicator('👁👁 2 piscadas → aproxima "'+target.title+'"');
     log('Double blink → aproxima ' + target.title);
   } else {
@@ -1149,306 +1018,235 @@ function onDoubleBlink(){
   }
 }
 
-function commitPendingSingleBlink(){
+function flushPendingSingleBlink(now){
   if(!state.blink.pendingSingleTs) return;
-  state.blink.pendingSingleTs = 0;
-  if(state.blink.pendingSingleTimer){
-    clearTimeout(state.blink.pendingSingleTimer);
-    state.blink.pendingSingleTimer = null;
+  if((now - state.blink.pendingSingleTs) >= state.blink.doubleWindowMs){
+    state.blink.pendingSingleTs = 0;
+    state.blink.debugLast = 'single_fire';
+    setBlink('1x');
+    onSingleBlink();
   }
-  state.blink.debugLast = 'single_commit';
-  setBlink('1x');
-  onSingleBlink();
-}
-
-function queueSingleBlink(now){
-  if(state.blink.pendingSingleTimer){
-    clearTimeout(state.blink.pendingSingleTimer);
-  }
-  state.blink.pendingSingleTs = now;
-  state.blink.pendingSingleTimer = setTimeout(()=>{
-    commitPendingSingleBlink();
-  }, state.blink.doubleWindowMs + 48);
 }
 
 function registerBlink(now){
-  const pendingDelta = state.blink.pendingSingleTs ? (now - state.blink.pendingSingleTs) : Infinity;
-  const sinceLastBlink = state.blink.lastBlinkTs ? (now - state.blink.lastBlinkTs) : Infinity;
-  const sinceLastEvent = state.blink.lastEventTs ? (now - state.blink.lastEventTs) : Infinity;
+  if((now - state.blink.lastEventTs) < state.blink.debounceMs){
+    state.blink.debugLast = 'debounced';
+    return;
+  }
 
-  // Primeiro tenta resolver duplo blink. Antes o cooldown barrava esse caminho.
-  if(state.blink.pendingSingleTs && pendingDelta <= state.blink.doubleWindowMs){
-    if(sinceLastEvent < 45){
-      state.blink.debugLast = 'double_debounced';
-      return;
-    }
-    if(sinceLastBlink < Math.max(55, state.blink.minInterBlinkMs * 0.72)){
-      state.blink.debugLast = 'double_too_fast';
-      return;
-    }
-    if(state.blink.pendingSingleTimer){
-      clearTimeout(state.blink.pendingSingleTimer);
-      state.blink.pendingSingleTimer = null;
-    }
+  if(state.blink.pendingSingleTs && (now - state.blink.pendingSingleTs) <= state.blink.doubleWindowMs){
     state.blink.pendingSingleTs = 0;
     state.blink.lastBlinkTs = now;
     state.blink.lastEventTs = now;
-    state.blink.cooldownUntil = now + 90;
     state.blink.debugLast = 'double';
     setBlink('2x');
     onDoubleBlink();
     return;
   }
 
-  if(now < state.blink.cooldownUntil){
-    state.blink.debugLast = 'cooldown';
-    return;
-  }
-
-  if(sinceLastEvent < 55){
-    state.blink.debugLast = 'debounced';
-    return;
-  }
-
-  if(sinceLastBlink < state.blink.minInterBlinkMs){
-    state.blink.debugLast = 'too_fast';
-    return;
-  }
-
-  state.blink.lastEventTs = now;
-  state.blink.cooldownUntil = now + state.blink.cooldownMs;
+  state.blink.pendingSingleTs = now;
   state.blink.lastBlinkTs = now;
-  state.blink.debugLast = 'single_pending';
-  setBlink('1x?');
-  queueSingleBlink(now);
+  state.blink.lastEventTs = now;
+  state.blink.debugLast = 'single_wait';
+  setBlink('1?');
 }
 
-const LEFT_EYE_CFG = {
-  outer:33,
-  inner:133,
-  upper:[159,160,158],
-  lower:[145,144,153],
-  ring:[33,246,161,160,159,158,157,173,133,155,154,153,145,144,163,7],
-  iris:[468,469,470,471,472]
-};
-const RIGHT_EYE_CFG = {
-  outer:362,
-  inner:263,
-  upper:[386,385,387],
-  lower:[374,380,373],
-  ring:[263,466,388,387,386,385,384,398,362,382,381,380,374,373,390,249],
-  iris:[473,474,475,476,477]
-};
-
-function pointFromLm(lm, idx, w, h){
-  const p = lm[idx];
-  if(!p) return null;
-  return { x:p.x * w, y:p.y * h };
-}
-
-function distLm(lm, a, b){
-  const p1 = lm[a], p2 = lm[b];
-  if(!p1 || !p2) return 0;
-  return Math.hypot(p1.x - p2.x, p1.y - p2.y);
-}
-
-function eyeEAR(lm, cfg){
-  const width = distLm(lm, cfg.outer, cfg.inner);
-  if(width <= 1e-6) return 0;
-  const v1 = distLm(lm, cfg.upper[0], cfg.lower[0]);
-  const v2 = distLm(lm, cfg.upper[1], cfg.lower[1]);
-  const v3 = distLm(lm, cfg.upper[2], cfg.lower[2]);
-  return (v1 + v2 + v3) / (3 * width);
-}
-
-function clearFaceOverlay(){
-  if(!meshCtx || !meshCanvas) return;
-  syncMeshCanvasSize();
-  meshCtx.clearRect(0, 0, meshCanvas.width, meshCanvas.height);
-}
-
-function drawPathFromIndices(indices, landmarks, closePath, strokeStyle, lineWidth){
-  if(!meshCtx || !meshCanvas || !indices?.length) return;
-  const w = meshCanvas.clientWidth || meshCanvas.width;
-  const h = meshCanvas.clientHeight || meshCanvas.height;
-  meshCtx.beginPath();
-  indices.forEach((idx, i)=>{
-    const pt = pointFromLm(landmarks, idx, w, h);
-    if(!pt) return;
-    if(i === 0) meshCtx.moveTo(pt.x, pt.y);
-    else meshCtx.lineTo(pt.x, pt.y);
-  });
-  if(closePath) meshCtx.closePath();
-  meshCtx.strokeStyle = strokeStyle;
-  meshCtx.lineWidth = lineWidth;
-  meshCtx.stroke();
-}
-
-function drawFaceOverlay(landmarks){
-  if(!meshCtx || !meshCanvas || !video.videoWidth) return;
-  syncMeshCanvasSize();
-  const w = meshCanvas.clientWidth || meshCanvas.width;
-  const h = meshCanvas.clientHeight || meshCanvas.height;
-  meshCtx.clearRect(0, 0, w, h);
-
-  const tess = window.FACEMESH_TESSELATION || [];
-  meshCtx.lineWidth = 0.75;
-  meshCtx.strokeStyle = 'rgba(93,173,226,0.32)';
-  for(const edge of tess){
-    const a = landmarks[edge[0]], b = landmarks[edge[1]];
-    if(!a || !b) continue;
-    meshCtx.beginPath();
-    meshCtx.moveTo(a.x * w, a.y * h);
-    meshCtx.lineTo(b.x * w, b.y * h);
-    meshCtx.stroke();
-  }
-
-  const eyeColor = state.blink.closed ? 'rgba(243,156,18,0.95)' : 'rgba(46,204,113,0.95)';
-  drawPathFromIndices(LEFT_EYE_CFG.ring, landmarks, true, eyeColor, 1.8);
-  drawPathFromIndices(RIGHT_EYE_CFG.ring, landmarks, true, eyeColor, 1.8);
-  if(landmarks.length >= 478){
-    drawPathFromIndices(LEFT_EYE_CFG.iris, landmarks, true, 'rgba(255,255,255,0.92)', 1.3);
-    drawPathFromIndices(RIGHT_EYE_CFG.iris, landmarks, true, 'rgba(255,255,255,0.92)', 1.3);
-  }
-
-  const nose = pointFromLm(landmarks, 1, w, h);
-  if(nose){
-    meshCtx.beginPath();
-    meshCtx.arc(nose.x, nose.y, 4.5, 0, Math.PI * 2);
-    meshCtx.fillStyle = 'rgba(255,255,255,0.95)';
-    meshCtx.fill();
-  }
+function eyeContourOpenness(lm, verts, outerIdx, innerIdx){
+  const horizontal = dist2(lm[outerIdx].x, lm[outerIdx].y, lm[innerIdx].x, lm[innerIdx].y);
+  const verticals = verts.map(pair => dist2(lm[pair[0]].x, lm[pair[0]].y, lm[pair[1]].x, lm[pair[1]].y));
+  const avgVert = verticals.reduce((s,v)=>s+v,0) / Math.max(1, verticals.length);
+  return avgVert / Math.max(horizontal, 1e-6);
 }
 
 function processBlink(landmarks){
+  const leftOpen  = eyeContourOpenness(landmarks, [[159,145],[160,144],[158,153]], 33, 133);
+  const rightOpen = eyeContourOpenness(landmarks, [[386,374],[385,380],[387,373]], 362, 263);
   const now = Date.now();
-  const leftEarRaw = eyeEAR(landmarks, LEFT_EYE_CFG);
-  const rightEarRaw = eyeEAR(landmarks, RIGHT_EYE_CFG);
-  if(!Number.isFinite(leftEarRaw) || !Number.isFinite(rightEarRaw) || leftEarRaw <= 0 || rightEarRaw <= 0){
-    state.blink.debugLast = 'invalid_eye';
+
+  const rawAvg = (leftOpen + rightOpen) * 0.5;
+  const asym = Math.abs(leftOpen - rightOpen);
+  const rawOpen = rawAvg * 0.82 + Math.min(leftOpen, rightOpen) * 0.18;
+
+  state.blink.emaFast = lerp(state.blink.emaFast, rawOpen, 0.42);
+  state.blink.ema = lerp(state.blink.ema, rawOpen, 0.19);
+
+  if(state.blink.phase === 'open'){
+    if(!state.blink.baselineReady){
+      state.blink.baseline = lerp(state.blink.baseline, state.blink.ema, 0.08);
+      if(Math.abs(state.blink.baseline - state.blink.ema) < 0.010){
+        state.blink.baselineReady = true;
+      }
+    } else if(state.blink.ema > state.blink.baseline * 0.80){
+      state.blink.baseline = lerp(
+        state.blink.baseline,
+        clamp(state.blink.ema, state.blink.minBaseline, state.blink.maxBaseline),
+        0.018
+      );
+    }
+  }
+
+  const baseline = clamp(state.blink.baseline, state.blink.minBaseline, state.blink.maxBaseline);
+  const closeThresh = clamp(baseline * state.blink.closeRatio, 0.10, 0.24);
+  const openThresh  = clamp(baseline * state.blink.openRatio, 0.16, 0.34);
+  state.blink.threshClose = closeThresh;
+  state.blink.threshOpen = openThresh;
+
+  const openness = Math.min(state.blink.emaFast, state.blink.ema * 1.05);
+  const eyeScore = clamp((baseline - 0.14) / 0.16, 0, 1) * 0.45 + clamp((0.085 - asym) / 0.085, 0, 1) * 0.25 + (state.blink.baselineReady ? 0.30 : 0.05);
+  state.blink.eyeConfidence = clamp(eyeScore, 0, 1);
+
+  if(openness < closeThresh){
+    state.blink.closeFrames += 1;
+    state.blink.openFrames = 0;
+  } else if(openness > openThresh){
+    state.blink.openFrames += 1;
+    if(state.blink.phase === 'open') state.blink.closeFrames = 0;
+  }
+
+  if(state.tracking.modeKind === 'weak'){
+    state.blink.debugLast = 'blink_disabled_weak';
+    setBlink('Auto off');
+    state.blink.phase = 'open';
+    state.blink.closeFrames = 0;
+    state.blink.openFrames = 0;
+    state.blink.pendingSingleTs = 0;
     return;
   }
 
-  state.blink.leftEma = lerp(state.blink.leftEma, leftEarRaw, state.blink.closed ? 0.66 : 0.34);
-  state.blink.rightEma = lerp(state.blink.rightEma, rightEarRaw, state.blink.closed ? 0.66 : 0.34);
+  if(!state.blink.baselineReady || state.blink.eyeConfidence < 0.55){
+    setBlink('Calibrando');
+    return;
+  }
 
-  const leftEar = state.blink.leftEma;
-  const rightEar = state.blink.rightEma;
-  const avgEar = (leftEar + rightEar) * 0.5;
-
-  if(!state.blink.baselineReady){
-    const baselineOpenEnough = avgEar > 0.075 && leftEar > 0.055 && rightEar > 0.055;
-    if(baselineOpenEnough){
-      state.blink.leftOpenRef = lerp(state.blink.leftOpenRef, leftEar, 0.28);
-      state.blink.rightOpenRef = lerp(state.blink.rightOpenRef, rightEar, 0.28);
-      state.blink.readyFrames += 1;
+  if(state.blink.phase === 'open' && state.blink.closeFrames >= state.blink.minCloseFrames){
+    state.blink.phase = 'closed';
+    state.blink.closeTs = now;
+    state.blink.debugLast = 'closed';
+    setBlink('Fechado');
+    gazeCursor.style.borderColor = 'rgba(243,156,18,.9)';
+  } else if(state.blink.phase === 'closed' && state.blink.openFrames >= state.blink.minOpenFrames){
+    const dur = now - state.blink.closeTs;
+    state.blink.phase = 'open';
+    state.blink.closeFrames = 0;
+    state.blink.openFrames = 0;
+    state.blink.debugLast = 'open';
+    gazeCursor.style.borderColor = 'rgba(255,255,255,.92)';
+    if(dur >= state.blink.minMs && dur <= state.blink.maxMs){
+      registerBlink(now);
     } else {
-      state.blink.readyFrames = Math.max(0, state.blink.readyFrames - 1);
+      state.blink.debugLast = 'ignored_'+dur;
     }
+  }
+}
 
-    if(state.blink.readyFrames >= 6){
-      state.blink.baselineReady = true;
-      state.blink.stableOpenFrames = 2;
-      state.blink.debugLast = 'baseline_ready';
-      setBlink('Pronto');
+function updateVideoQuality(){
+  if(video.readyState < 2) return;
+  analysisCtx.drawImage(video, 0, 0, analysisCanvas.width, analysisCanvas.height);
+  const data = analysisCtx.getImageData(0,0,analysisCanvas.width,analysisCanvas.height).data;
+  let lumSum = 0;
+  let sharp = 0;
+  let count = 0;
+  const w = analysisCanvas.width;
+  const h = analysisCanvas.height;
+  for(let y=0; y<h-2; y+=2){
+    for(let x=0; x<w-2; x+=2){
+      const i = (y*w + x) * 4;
+      const l = data[i]*0.299 + data[i+1]*0.587 + data[i+2]*0.114;
+      const ir = i + 8;
+      const ib = i + w*4*2;
+      const lr = data[ir]*0.299 + data[ir+1]*0.587 + data[ir+2]*0.114;
+      const lb = data[ib]*0.299 + data[ib+1]*0.587 + data[ib+2]*0.114;
+      lumSum += l;
+      sharp += Math.abs(l-lr) + Math.abs(l-lb);
+      count += 1;
+    }
+  }
+  const avgLum = lumSum / Math.max(1, count);
+  const avgSharp = sharp / Math.max(1, count);
+  state.tracking.videoBrightnessScore = lerp(state.tracking.videoBrightnessScore, clamp((avgLum - 42) / 92, 0, 1), 0.25);
+  state.tracking.videoSharpnessScore = lerp(state.tracking.videoSharpnessScore, clamp((avgSharp - 10) / 30, 0, 1), 0.25);
+}
+
+function updateTrackingMode(){
+  const eyeScore = state.blink.eyeConfidence || 0;
+  const stability = clamp(1 - (Math.abs(gaze.targetX - gaze.x) + Math.abs(gaze.targetY - gaze.y)) * 1.8, 0, 1);
+  state.tracking.stabilityScore = lerp(state.tracking.stabilityScore, stability, 0.22);
+  const total = 0.35 + 0.18*state.tracking.videoBrightnessScore + 0.14*state.tracking.videoSharpnessScore + 0.16*state.tracking.stabilityScore + 0.17*eyeScore;
+  state.tracking.totalQuality = lerp(state.tracking.totalQuality, clamp(total, 0, 1), 0.24);
+
+  let next = 'weak';
+  if(state.tracking.totalQuality >= 0.77 && eyeScore >= 0.58 && state.tracking.videoSharpnessScore >= 0.22){
+    next = 'full';
+  } else if(state.tracking.totalQuality >= 0.60 && eyeScore >= 0.48){
+    next = 'hybrid';
+  }
+
+  if(next !== state.tracking.modeKind){
+    setTrackingMode(next);
+    state.tracking.lastModeTs = Date.now();
+    if(next === 'weak'){
+      flashBlinkIndicator('📷 câmera fraca → zoom por distância do rosto');
+      log('Modo câmera fraca ativado. Blink desativado automaticamente.');
     } else {
-      setBlink('Calibrando');
+      flashBlinkIndicator('👁 blink ativo novamente');
+      log('Blink reativado no modo '+next+'.');
     }
   }
 
-  state.blink.leftOpenRef = clamp(state.blink.leftOpenRef, 0.09, 0.42);
-  state.blink.rightOpenRef = clamp(state.blink.rightOpenRef, 0.09, 0.42);
+  const label = Math.round(state.tracking.totalQuality * 100)+'% · luz '+Math.round(state.tracking.videoBrightnessScore*100)+' · nitidez '+Math.round(state.tracking.videoSharpnessScore*100)+' · olho '+Math.round(eyeScore*100);
+  qualityText.textContent = label;
+  setMode('Webcam · '+modeConfig[state.tracking.modeKind].label);
+}
 
-  const leftRatio = clamp(leftEar / Math.max(state.blink.leftOpenRef, 1e-6), 0, 1.55);
-  const rightRatio = clamp(rightEar / Math.max(state.blink.rightOpenRef, 1e-6), 0, 1.55);
-  const avgRatio = (leftRatio + rightRatio) * 0.5;
-  const minRatio = Math.min(leftRatio, rightRatio);
-  const maxRatio = Math.max(leftRatio, rightRatio);
-  const asym = Math.abs(leftRatio - rightRatio);
-
-  const reopened = avgRatio > state.blink.openThresh && minRatio > 0.70;
-  const fullyOpen = avgRatio > 0.94 && minRatio > 0.80;
-  const strongClosure =
-    (avgRatio < state.blink.closeThresh) ||
-    (minRatio < 0.60) ||
-    ((avgRatio < 0.90) && (minRatio < 0.70)) ||
-    ((asym < 0.55) && (maxRatio < 0.90) && (avgRatio < 0.92));
-
-  state.blink.openScore = avgRatio;
-  state.blink.openScoreEma = lerp(state.blink.openScoreEma, avgRatio, state.blink.closed ? 0.36 : 0.16);
-
-  if(fullyOpen){
-    state.blink.stableOpenFrames = Math.min(state.blink.stableOpenFrames + 1, 8);
-  } else {
-    state.blink.stableOpenFrames = Math.max(0, state.blink.stableOpenFrames - 1);
+function processWeakZoom(now){
+  if(state.tracking.modeKind !== 'weak') return;
+  if(now < state.tracking.weakZoomCooldownUntil) return;
+  const ratio = state.tracking.lastSizeRatio || 1;
+  const target = blinkTarget();
+  if(ratio > 1.14 && target){
+    zoomInToArtwork(target, 'distancia_rosto', 0.18);
+    flashBlinkIndicator('↗ rosto aproximou → zoom in');
+    state.tracking.weakZoomCooldownUntil = now + 640;
+  } else if(ratio < 0.90 && state.zoom.focusTarget > 0.02){
+    zoomOutStep('distancia_rosto');
+    flashBlinkIndicator('↘ rosto afastou → zoom out');
+    state.tracking.weakZoomCooldownUntil = now + 640;
   }
+}
 
-  if(state.blink.baselineReady && !state.blink.closed){
-    if(leftRatio > 0.92) state.blink.leftOpenRef = lerp(state.blink.leftOpenRef, Math.max(leftEar, state.blink.leftOpenRef), 0.022);
-    if(rightRatio > 0.92) state.blink.rightOpenRef = lerp(state.blink.rightOpenRef, Math.max(rightEar, state.blink.rightOpenRef), 0.022);
-  }
+function drawMeshOverlay(landmarks){
+  syncVideoOverlaySize();
+  const w = meshOverlay.clientWidth;
+  const h = meshOverlay.clientHeight;
+  meshCtx.clearRect(0,0,w,h);
+  if(!landmarks || !w || !h) return;
+  const toPt = idx => ({x:(1-landmarks[idx].x) * w, y:landmarks[idx].y * h});
+  const strokeSeq = (indices, color, width) => {
+    meshCtx.beginPath();
+    indices.forEach((idx, n)=>{
+      if(!landmarks[idx]) return;
+      const p = toPt(idx);
+      if(n===0) meshCtx.moveTo(p.x,p.y);
+      else meshCtx.lineTo(p.x,p.y);
+    });
+    meshCtx.strokeStyle = color;
+    meshCtx.lineWidth = width;
+    meshCtx.stroke();
+  };
+  strokeSeq(FACE_OVAL, 'rgba(93,173,226,.52)', 1.4);
+  strokeSeq(LEFT_BROW, 'rgba(255,255,255,.44)', 1.2);
+  strokeSeq(RIGHT_BROW, 'rgba(255,255,255,.44)', 1.2);
+  strokeSeq(LEFT_EYE, 'rgba(46,204,113,.75)', 1.6);
+  strokeSeq(RIGHT_EYE, 'rgba(46,204,113,.75)', 1.6);
+  strokeSeq(NOSE_LINE, 'rgba(255,255,255,.32)', 1.1);
+  strokeSeq(MOUTH_OUTER, 'rgba(165,105,189,.30)', 1.0);
+  if(landmarks[468]) strokeSeq(LEFT_IRIS, 'rgba(240,192,64,.65)', 1.1);
+  if(landmarks[473]) strokeSeq(RIGHT_IRIS, 'rgba(240,192,64,.65)', 1.1);
+}
 
-  if(!state.blink.closed){
-    if(now < state.blink.rearmUntil){
-      state.blink.closedFrames = 0;
-      state.blink.debugLast = 'rearm';
-    } else if(state.blink.baselineReady && strongClosure){
-      state.blink.closedFrames += 1;
-      state.blink.debugLast = 'closing';
-    } else {
-      state.blink.closedFrames = Math.max(0, state.blink.closedFrames - 1);
-      if(state.blink.baselineReady) state.blink.debugLast = reopened ? 'open' : 'idle';
-    }
-
-    if(state.blink.baselineReady && state.blink.closedFrames >= state.blink.minClosedFrames){
-      state.blink.closed = true;
-      state.blink.closeTs = now;
-      state.blink.closedFrames = 0;
-      state.blink.openFrames = 0;
-      state.blink.minDuringBlink = minRatio;
-      state.blink.preBlinkOpenRatio = clamp(Math.max(state.blink.openScoreEma, avgRatio), 0.78, 1.24);
-      state.blink.debugLast = 'closed';
-      setBlink('Fechado');
-      gazeCursor.style.borderColor = 'rgba(243,156,18,.95)';
-    }
-  } else {
-    state.blink.minDuringBlink = Math.min(state.blink.minDuringBlink, minRatio);
-    if(reopened){
-      state.blink.openFrames += 1;
-      state.blink.debugLast = 'opening';
-    } else {
-      state.blink.openFrames = 0;
-      state.blink.debugLast = strongClosure ? 'closed_hold' : 'half_open';
-    }
-
-    if(state.blink.openFrames >= state.blink.minOpenFrames){
-      const dur = now - state.blink.closeTs;
-      const closureDrop = state.blink.preBlinkOpenRatio - state.blink.minDuringBlink;
-      const validClosure = closureDrop >= state.blink.minClosureDelta || state.blink.minDuringBlink <= state.blink.minClosedRatio;
-
-      state.blink.closed = false;
-      state.blink.closedFrames = 0;
-      state.blink.openFrames = 0;
-      state.blink.lastBlinkDuration = dur;
-      state.blink.rearmUntil = now + 35;
-      state.blink.stableOpenFrames = Math.max(state.blink.stableOpenFrames, 2);
-      setBlink('Aberto');
-      gazeCursor.style.borderColor = 'rgba(255,255,255,.92)';
-
-      if(validClosure && dur >= state.blink.minMs && dur <= state.blink.maxMs){
-        state.blink.debugLast = 'blink_' + closureDrop.toFixed(2);
-        registerBlink(now);
-      } else {
-        state.blink.debugLast = 'ignored_' + dur + '_' + closureDrop.toFixed(2);
-      }
-    }
-  }
-
-  if(meshDebug){
-    const mode = state.blink.closed ? 'fechado' : 'aberto';
-    const drop = Math.max(0, state.blink.preBlinkOpenRatio - state.blink.minDuringBlink);
-    meshDebug.textContent = 'Malha OK • ' + mode + ' • avg ' + avgRatio.toFixed(2) + ' • L ' + leftRatio.toFixed(2) + ' • R ' + rightRatio.toFixed(2) + ' • drop ' + drop.toFixed(2) + ' • ref ' + state.blink.leftOpenRef.toFixed(3) + '/' + state.blink.rightOpenRef.toFixed(3) + ' • ' + state.blink.debugLast;
-  }
+function clearMeshOverlay(){
+  syncVideoOverlaySize();
+  meshCtx.clearRect(0,0,meshOverlay.clientWidth, meshOverlay.clientHeight);
 }
 
 // ─── FACE TRACKING / HEAD POSE MAPPING ───
@@ -1503,7 +1301,8 @@ function faceMetrics(lm){
     centerY,
     yaw:yawRaw,
     pitch:pitchRaw,
-    size:sizeRaw
+    size:sizeRaw,
+    faceHeight
   };
 }
 
@@ -1525,9 +1324,8 @@ function updateTrackingBaseline(m){
     return;
   }
 
-  // adaptação lenta quando usuário fica relativamente estável
   const stableCenter = Math.abs(m.centerX - b.centerX) < 0.05 && Math.abs(m.centerY - b.centerY) < 0.05;
-  if(stableCenter && !state.blink.closed){
+  if(stableCenter && state.blink.phase !== 'closed'){
     b.centerX = lerp(b.centerX, m.centerX, 0.010);
     b.centerY = lerp(b.centerY, m.centerY, 0.008);
     b.yaw     = lerp(b.yaw,     m.yaw,     0.010);
@@ -1542,20 +1340,13 @@ function mapFaceTracking(landmarks){
 
   updateTrackingBaseline(m);
 
-  const mirrorX = state.tracking.mirrorCompensation ? -1 : 1;
-  const manualX = state.tracking.invertX ? -1 : 1;
-  const xSign = mirrorX * manualX;
-  const yawSign = mirrorX * manualX;
-
-  const xBase = 0.5 + (m.centerX - 0.5) * xSign;
-  const xRef  = 0.5 + (state.tracking.baseline.centerX - 0.5) * xSign;
-  const yawBase = m.yaw * yawSign;
-  const yawRef  = state.tracking.baseline.yaw * yawSign;
+  const xBase = state.tracking.invertX ? (1 - m.centerX) : m.centerX;
+  const xRef  = state.tracking.invertX ? (1 - state.tracking.baseline.centerX) : state.tracking.baseline.centerX;
 
   const sample = {
     x:xBase,
     y:m.centerY,
-    yaw:yawBase,
+    yaw:m.yaw,
     pitch:m.pitch,
     size:m.size
   };
@@ -1569,7 +1360,7 @@ function mapFaceTracking(landmarks){
 
   const dx = hx - xRef;
   const dy = hy - state.tracking.baseline.centerY;
-  const dyaw = hyaw - yawRef;
+  const dyaw = hyaw - state.tracking.baseline.yaw;
   const dpitch = hpitch - state.tracking.baseline.pitch;
 
   let combinedX = dx * state.tracking.centerGainX + dyaw * state.tracking.yawGainX;
@@ -1578,14 +1369,18 @@ function mapFaceTracking(landmarks){
   combinedX = remapDeadzone(combinedX, state.tracking.deadzoneX);
   combinedY = remapDeadzone(combinedY, state.tracking.deadzoneY);
 
-  const targetX = clamp(0.5 + combinedX * 0.98 + state.calib.xOff, 0.02, 0.98);
-  const targetY = clamp(0.5 + combinedY * 0.88 + state.calib.yOff, 0.02, 0.98);
+  const targetX = clamp(0.5 + combinedX * 0.92 + state.calib.xOff, 0.02, 0.98);
+  const targetY = clamp(0.5 + combinedY * 0.84 + state.calib.yOff, 0.02, 0.98);
 
-  gaze.targetX = smoothTowards(gaze.targetX, targetX, 0.10, 0.19);
-  gaze.targetY = smoothTowards(gaze.targetY, targetY, 0.09, 0.17);
+  gaze.targetX = smoothTowards(gaze.targetX, targetX, 0.08, 0.16);
+  gaze.targetY = smoothTowards(gaze.targetY, targetY, 0.08, 0.16);
 
-  const sym = 1 - Math.abs(dx * 0.34) - Math.abs(dyaw * 0.18) - Math.abs(hsize - state.tracking.baseline.size) * 0.30;
-  gaze.quality = clamp(sym, 0.58, 0.995);
+  const sizeRatio = hsize / Math.max(0.001, state.tracking.baseline.size);
+  state.tracking.sizeVelocity = lerp(state.tracking.sizeVelocity, sizeRatio - state.tracking.lastSizeRatio, 0.35);
+  state.tracking.lastSizeRatio = lerp(state.tracking.lastSizeRatio, sizeRatio, 0.24);
+
+  const sym = 1 - Math.abs(dx * 0.72) - Math.abs(dyaw * 0.20) - Math.abs(hsize - state.tracking.baseline.size) * 0.35;
+  gaze.quality = clamp(sym, 0.56, 0.99);
 }
 
 // ─── DRAW ROOM ───
@@ -1610,7 +1405,7 @@ function drawArtwork(art,highlight){
   ctx.fillStyle='rgba(200,215,255,.75)';
   ctx.font='11.5px "Space Grotesk",sans-serif';
   ctx.fillText(art.artist,cx,cy+13);
-  return poly;
+  return {poly, center:{x:cx, y:cy}};
 }
 
 function drawPedestal(x,z,color){
@@ -1646,29 +1441,22 @@ function drawRoom(){
   drawParallaxBackdrop(r, gx, gy);
 
   const zoomArt = artById(state.zoom.targetId);
-  state.zoom.focusVel = lerp(state.zoom.focusVel, state.zoom.focusTarget - state.zoom.focus, 0.24);
-  state.zoom.focusVel *= 0.84;
-  state.zoom.focus = clamp(state.zoom.focus + state.zoom.focusVel * 0.26, 0, 1);
+  state.zoom.focus = lerp(state.zoom.focus, state.zoom.focusTarget, 0.07);
 
   let fx = 0, fy = 2.0, fz = 8.5;
-  let zoomShift = 6.2;
-  let fovScale = 1.58;
   if(zoomArt){
     fx = zoomArt.x;
     fy = zoomArt.y;
-    fz = zoomArt.z - (zoomArt.plane === 'back' ? 1.92 : 0);
-    zoomShift = zoomArt.plane === 'back' ? 6.85 : 5.7;
-    fovScale = zoomArt.plane === 'back' ? 1.82 : 1.66;
+    fz = zoomArt.z - (zoomArt.plane === 'back' ? 1.95 : 0);
   }
 
   const f = state.zoom.focus;
-  const easedFocus = f * f * (3 - 2 * f);
-  cam.x     = lerp(gx * 0.92,  fx * (zoomArt && zoomArt.plane !== 'back' ? 0.22 : 0.18), easedFocus);
-  cam.y     = lerp(1.65 - gy * 0.35, fy - (zoomArt && zoomArt.plane === 'back' ? 0.06 : 0.02), easedFocus);
-  cam.z     = lerp(-1.4, fz - zoomShift, easedFocus);
-  cam.yaw   = lerp(gx * 0.36,  fx * 0.015, easedFocus);
-  cam.pitch = lerp(-gy * 0.12, zoomArt && zoomArt.plane === 'back' ? -0.016 : -0.010, easedFocus);
-  cam.fov   = lerp(cam.baseFov, cam.baseFov * fovScale, easedFocus);
+  cam.x     = lerp(gx * 0.92,  fx * 0.19, f);
+  cam.y     = lerp(1.65 - gy * 0.35, fy - 0.10, f);
+  cam.z     = lerp(-1.4, fz - 6.5, f);
+  cam.yaw   = lerp(gx * 0.36,  fx * 0.016, f);
+  cam.pitch = lerp(-gy * 0.12, -0.022, f);
+  cam.fov   = lerp(cam.baseFov, cam.baseFov * 1.56, f);
 
   const surfDefs = [
     {pts:[[-5,0,0],[5,0,0],[5,0,10],[-5,0,10]],fill:'rgba(18,30,50,.98)',stroke:'rgba(255,255,255,.04)'},
@@ -1722,9 +1510,10 @@ function drawRoom(){
   projectedArtworks = [];
   artworks.forEach(art=>{
     const hl = state.hoveredId===art.id || state.selectedId===art.id || state.zoom.targetId===art.id;
-    const poly = drawArtwork(art, hl);
-    if(poly) projectedArtworks.push({art, poly});
+    const drawn = drawArtwork(art, hl);
+    if(drawn) projectedArtworks.push({art, poly:drawn.poly, center:drawn.center});
   });
+  updateFocusInfoCard();
 
   const gPx = {x:gaze.x*r.width, y:gaze.y*r.height};
   ctx.strokeStyle='rgba(255,255,255,.08)';
@@ -1737,46 +1526,51 @@ function drawRoom(){
 
 // ─── HOVER / DWELL ───
 function updateHoverDwell(now){
-  const r = scenePanel.getBoundingClientRect();
-  const gPx = { x:gaze.x * r.width, y:gaze.y * r.height };
-  const hit = findFocusHit(gPx);
+  const r=scenePanel.getBoundingClientRect();
+  const gPx={x:gaze.x*r.width, y:gaze.y*r.height};
+  let hit=projectedArtworks.find(e=>ptInPoly(gPx,e.poly));
 
-  const lockTarget = (now < state.zoom.lockUntil && state.zoom.targetId) ? artById(state.zoom.targetId) : null;
-  const activeHit = lockTarget ? (projectedEntryByArtId(lockTarget.id) || { art:lockTarget, poly:null }) : hit;
+  if(!hit && projectedArtworks.length){
+    let best=null;
+    let bestD=Infinity;
+    projectedArtworks.forEach(entry=>{
+      const cx = entry.center?.x ?? ((entry.poly[0].x + entry.poly[1].x + entry.poly[2].x + entry.poly[3].x)/4);
+      const cy = entry.center?.y ?? ((entry.poly[0].y + entry.poly[1].y + entry.poly[2].y + entry.poly[3].y)/4);
+      const d = Math.hypot(cx - gPx.x, cy - gPx.y);
+      if(d < bestD){
+        bestD = d;
+        best = entry;
+      }
+    });
+    if(best && bestD < Math.min(r.width, r.height) * 0.18){
+      hit = best;
+    }
+  }
 
-  if(!activeHit){
-    if(state.hoveredId){ state.hoveredId = null; state.hoverStartTs = now; }
-    dwellFill.style.width = '0%';
-    hoverText.textContent = '—';
-    gazeCursor.style.width = '26px';
-    gazeCursor.style.height = '26px';
-    const selected = artById(state.selectedId);
-    updateSelPanel(selected, false);
-    syncArtworkTooltip(selected ? projectedEntryByArtId(selected.id) : null, false);
+  if(!hit){
+    if(state.hoveredId){ state.hoveredId=null; state.hoverStartTs=now; updateSelPanel(state.selectedId ? artById(state.selectedId) : null); }
+    dwellFill.style.width='0%';
+    hoverText.textContent='—';
+    gazeCursor.style.width='26px'; gazeCursor.style.height='26px';
     return;
   }
 
-  hoverText.textContent = activeHit.art.title;
-  if(state.hoveredId !== activeHit.art.id){
-    state.hoveredId = activeHit.art.id;
-    state.hoverStartTs = now;
-    gazeCursor.style.width = '34px';
-    gazeCursor.style.height = '34px';
+  hoverText.textContent=hit.art.title;
+  updateSelPanel(hit.art);
+  if(state.hoveredId!==hit.art.id){
+    state.hoveredId=hit.art.id;
+    state.hoverStartTs=now;
+    gazeCursor.style.width='34px'; gazeCursor.style.height='34px';
   }
 
-  const preview = state.selectedId !== activeHit.art.id;
-  updateSelPanel(activeHit.art, preview);
-  syncArtworkTooltip(activeHit, preview);
+  const elapsed=now-state.hoverStartTs;
+  const progress=clamp(elapsed/state.dwellMs,0,1);
+  dwellFill.style.width=(progress*100).toFixed(1)+'%';
+  gazeCursor.style.borderColor=progress>.7?'rgba(46,204,113,.95)':'rgba(93,173,226,.95)';
 
-  const elapsed = now - state.hoverStartTs;
-  const progress = clamp(elapsed / state.dwellMs, 0, 1);
-  dwellFill.style.width = (progress * 100).toFixed(1) + '%';
-  gazeCursor.style.borderColor = progress > .7 ? 'rgba(46,204,113,.95)' : 'rgba(93,173,226,.95)';
-
-  if(progress >= 1){
-    selectArtwork(activeHit.art, 'dwell');
-    syncArtworkTooltip(activeHit, false);
-    state.hoverStartTs = now + 380;
+  if(progress>=1){
+    selectArtwork(hit.art,'dwell');
+    state.hoverStartTs=now+340;
   }
 }
 
@@ -1834,7 +1628,6 @@ async function startTracking(){
     });
     video.srcObject=state.stream;
     await video.play();
-    syncMeshCanvasSize();
     log('Webcam aberta.');
 
     state.faceMesh = new window.FaceMesh({
@@ -1846,18 +1639,22 @@ async function startTracking(){
     });
     state.faceMesh.onResults(results=>{
       if(!state.running) return;
-      syncMeshCanvasSize();
-      const face = results.multiFaceLandmarks?.[0];
-      if(!face){
-        clearFaceOverlay();
-        if(meshDebug) meshDebug.textContent = 'Malha: rosto não encontrado';
-        setStatus(false,'Rosto não encontrado'); gaze.quality=.4; return;
+      if(!results.multiFaceLandmarks?.[0]){
+        clearMeshOverlay();
+        setStatus(false,'Rosto não encontrado');
+        gaze.quality=.4;
+        setBlink('Sem rosto');
+        return;
       }
-      drawFaceOverlay(face);
-      mapFaceTracking(face);
-      processBlink(face);
+      const lm = results.multiFaceLandmarks[0];
+      drawMeshOverlay(lm);
+      mapFaceTracking(lm);
+      processBlink(lm);
+      if((state.tracking.frameCounter++ % 4) === 0) updateVideoQuality();
+      updateTrackingMode();
+      processWeakZoom(Date.now());
       state.usingMouse=false;
-      setMode('Webcam'); setStatus(true,'Tracking facial ativo');
+      setStatus(true,'Tracking facial ativo');
     });
 
     async function mediaLoop(){
@@ -1870,9 +1667,9 @@ async function startTracking(){
     state.rafMedia=requestAnimationFrame(mediaLoop);
     state.usingMouse=false;
     setMode('Webcam');
-    permNote.textContent='Tracking facial ativo com malha facial desenhada. A ficha genérica aparece no foco da obra; o heatmap fica reservado ao PDF. Pisque normalmente: 1 piscada afasta e 2 piscadas rápidas aproximam.';
-    if(meshDebug) meshDebug.textContent = 'Malha: procurando baseline dos olhos…';
-    log('Tracking facial iniciado com malha facial + blink por EAR dinâmico.');
+    permNote.textContent='Tracking ativo. Cabeça controla a direção. 1 piscada afasta e 2 piscadas rápidas aproximam quando a câmera estiver boa; em câmera fraca, o zoom troca automaticamente para distância do rosto + botões.';
+    setTrackingMode('full');
+    log('Tracking facial iniciado com malha facial, contorno dos olhos e fallback automático para câmera fraca.');
 
   } catch(err){
     state.usingMouse=true;
@@ -1890,8 +1687,7 @@ function stopTracking(){
   if(state.rafMedia){ cancelAnimationFrame(state.rafMedia); state.rafMedia=null; }
   if(state.stream){ state.stream.getTracks().forEach(t=>t.stop()); state.stream=null; }
   video.srcObject=null;
-  clearFaceOverlay();
-  if(meshDebug) meshDebug.textContent = 'Malha: tracking desligado';
+  clearMeshOverlay();
   state.usingMouse=true;
   setMode('Parado'); setStatus(false,'Tracking desligado');
   permNote.textContent='Tracking desligado. Sala continua ativa.';
@@ -1906,16 +1702,16 @@ function calibrate(){
     log('Calibração não necessária no modo mouse.');
     return;
   }
-  state.calib.xOff += (0.5 - gaze.targetX) * 0.24;
-  state.calib.yOff += (0.5 - gaze.targetY) * 0.22;
+  state.calib.xOff += (0.5 - gaze.targetX) * 0.22;
+  state.calib.yOff += (0.5 - gaze.targetY) * 0.20;
   state.calib.gainX = 1.00;
   state.calib.gainY = 0.94;
-  state.tracking.history = [];
-  state.tracking.baselineFrames = 0;
-  state.tracking.baselineReady = false;
-  resetBlinkState();
+  if(state.tracking.baselineReady){
+    state.tracking.baseline.size = lerp(state.tracking.baseline.size, state.tracking.lastSizeRatio * state.tracking.baseline.size, 0.2);
+  }
+  state.blink.baselineReady = false;
   calibText.textContent='Concluída';
-  permNote.textContent='Calibração aplicada. A baseline do rosto e dos olhos foi reiniciada. Olhe normal por meio segundo; depois faça 1 piscada para afastar ou 2 piscadas rápidas para aproximar. A ficha da obra entra só de focar nela.';
+  permNote.textContent='Calibração aplicada. Se a direção lateral ainda parecer invertida, use o botão “Inverter X”.';
   log('Calibração aplicada. xOff='+state.calib.xOff.toFixed(3)+' yOff='+state.calib.yOff.toFixed(3));
 }
 
@@ -1947,7 +1743,7 @@ async function exportPdf(){
     lines.forEach(l=>{ pdf.text(l,12,y); y+=5; });
     y+=4;
     pdf.setFont('helvetica','bold');
-    pdf.text('Cena + Heatmap (heatmap visível apenas no relatório)',12,y); y+=3;
+    pdf.text('Cena + Heatmap',12,y); y+=3;
     pdf.addImage(sceneImg,'PNG',12,y,88,66,undefined,'FAST');
     pdf.addImage(heatImg,'PNG',108,y,88,66,undefined,'FAST');
     y+=72;
@@ -1979,6 +1775,12 @@ scenePanel.addEventListener('click', ()=>{
   else if(state.zoom.focusTarget>0) resetZoom();
 });
 
+zoomInBtn.addEventListener('click', ()=>{
+  const target = blinkTarget();
+  if(target) zoomInToArtwork(target, 'manual_zoom_in', 0.22);
+});
+zoomOutBtn.addEventListener('click', ()=> zoomOutStep('manual_zoom_out'));
+
 // ─── BUTTON WIRING ───
 document.getElementById('startBtn').addEventListener('click', startTracking);
 document.getElementById('stopBtn').addEventListener('click', stopTracking);
@@ -1987,9 +1789,7 @@ document.getElementById('resetHeatBtn').addEventListener('click', clearHeatmap);
 document.getElementById('exportPdfBtn').addEventListener('click', exportPdf);
 invertXBtn.addEventListener('click', ()=>{
   state.tracking.invertX = !state.tracking.invertX;
-  gaze.targetX = 1 - gaze.targetX;
-  gaze.x = 1 - gaze.x;
-  permNote.textContent = state.tracking.invertX ? 'Eixo X invertido manualmente.' : 'Eixo X no modo compensado padrão.';
+  permNote.textContent = state.tracking.invertX ? 'Eixo X invertido manualmente.' : 'Eixo X no modo normal.';
   resetTrackingState();
   log('Inverter X = '+state.tracking.invertX);
 });
@@ -2013,6 +1813,7 @@ function buildList(){
 function tick(now){
   requestAnimationFrame(tick);
   if(!state.startedAt) state.startedAt=Date.now();
+  flushPendingSingleBlink(Date.now());
   updateCursor();
   drawRoom();
   drawReveal();
@@ -2035,12 +1836,14 @@ resizeCanvases();
 initParallax();
 buildList();
 updateSelPanel(null);
+setTrackingMode('full');
 setMode('Face tracking pronto');
 setBlink('Pronto');
 setStatus(true,'Cena carregada');
 window.addEventListener('resize',resizeCanvases);
+video.addEventListener('loadedmetadata', syncVideoOverlaySize);
 requestAnimationFrame(tick);
-log('Sala pronta. Clique em "Iniciar tracking" para usar webcam com tracking pelo rosto.');
+log('Sala pronta. Clique em "Iniciar tracking" para usar webcam com cabeça/rosto como controle principal.');
 
 })();
 </script>
