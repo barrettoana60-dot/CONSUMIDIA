@@ -1,5 +1,3 @@
-<div id="eye-room-root">
-<style>
   @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;800&family=JetBrains+Mono:wght@400;600&display=swap');
   :root{
     --bg:#060d1a;
