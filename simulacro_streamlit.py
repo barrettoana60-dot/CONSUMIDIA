@@ -4,7 +4,7 @@ import streamlit.components.v1 as components
 st.set_page_config(page_title="Sala 3D – Face Tracking Parallax", layout="wide")
 
 st.title("Sala 3D com Face Tracking + Parallax")
-st.caption("Tracking facial com malha no rosto, direção lateral corrigida e blink calculado pelos landmarks dos olhos. 1 piscar aproxima, 2 piscadas rápidas afastam.")
+st.caption("Tracking facial com malha no rosto, direção lateral corrigida e blink calculado pelos landmarks dos olhos. 1 piscar afasta, 2 piscadas rápidas aproximam.")
 
 HTML_APP = r"""
 <div id="eye-room-root">
@@ -208,7 +208,7 @@ HTML_APP = r"""
 <div class="topbar">
   <div class="headline">
     <h2>🎨 Sala 3D – Face Tracking + Parallax</h2>
-    <p>Tracking pelo rosto com filtragem mais estável, blink adaptativo, parallax multicamada e zoom por piscadas mais confiável. <strong>1 piscar</strong> → aproxima a obra em foco &nbsp;|&nbsp; <strong>2 piscadas rápidas</strong> → afasta o zoom.</p>
+    <p>Tracking pelo rosto com filtragem mais estável, blink adaptativo, parallax multicamada e zoom por piscadas mais confiável. <strong>1 piscar</strong> → afasta o zoom &nbsp;|&nbsp; <strong>2 piscadas rápidas</strong> → aproxima a obra em foco.</p>
   </div>
   <div class="controls">
     <button class="btn primary" id="startBtn">▶ Iniciar tracking</button>
@@ -273,8 +273,8 @@ HTML_APP = r"""
     <div class="card">
       <h3>Obra em foco</h3>
       <div id="selected-title">Nenhuma obra selecionada</div>
-      <div id="selected-artist">Vire o rosto e mantenha foco ~1s ou pisque 1× para dar zoom</div>
-      <div id="selected-description">Mantenha o foco por 1 segundo (dwell) ou pisque uma vez com a obra em foco. 2 piscadas rápidas afastam o zoom.</div>
+      <div id="selected-artist">Vire o rosto e mantenha foco ~1s ou pisque 2× para aproximar</div>
+      <div id="selected-description">Mantenha o foco por 1 segundo (dwell) ou pisque duas vezes com a obra em foco para aproximar. 1 piscada afasta o zoom.</div>
     </div>
 
     <div class="card">
@@ -283,12 +283,12 @@ HTML_APP = r"""
         <div class="blink-card">
           <div class="icon">😉</div>
           <div class="bl">1 piscar</div>
-          <div class="desc">Zoom na obra em foco</div>
+          <div class="desc">Afasta o zoom</div>
         </div>
         <div class="blink-card">
           <div class="icon">😮</div>
           <div class="bl">2 piscadas rápidas</div>
-          <div class="desc">Sai do zoom / afasta</div>
+          <div class="desc">Aproxima a obra em foco</div>
         </div>
       </div>
     </div>
@@ -406,10 +406,10 @@ const state = {
     openScoreEma:1,
     readyFrames:0,
     baselineReady:false,
-    closeThresh:0.56,
-    openThresh:0.78,
-    minMs:45,
-    maxMs:460,
+    closeThresh:0.72,
+    openThresh:0.84,
+    minMs:30,
+    maxMs:520,
     closedFrames:0,
     openFrames:0,
     minClosedFrames:1,
@@ -419,8 +419,8 @@ const state = {
     pendingSingleTs:0,
     pendingSingleTimer:null,
     lastBlinkDuration:0,
-    doubleWindowMs:320,
-    cooldownMs:120,
+    doubleWindowMs:430,
+    cooldownMs:90,
     cooldownUntil:0,
     debugLast:'init'
   },
@@ -840,8 +840,8 @@ function artById(id){ return artworks.find(a=>a.id===id)||null; }
 function updateSelPanel(art){
   if(!art){
     selTitle.textContent='Nenhuma obra selecionada';
-    selArtist.textContent='Vire o rosto e mantenha foco ~1s ou pisque 1× para dar zoom';
-    selDesc.textContent='A ficha aparece aqui após dwell-click ou blink. 2 piscadas rápidas saem do zoom.';
+    selArtist.textContent='Vire o rosto e mantenha foco ~1s ou pisque 2× para aproximar';
+    selDesc.textContent='A ficha aparece aqui após dwell-click ou blink. 1 piscada afasta e 2 piscadas rápidas aproximam.';
     return;
   }
   selTitle.textContent=art.title;
@@ -923,21 +923,21 @@ function blinkTarget(){
 }
 
 function onSingleBlink(){
-  const target = blinkTarget();
-  if(target){
-    zoomInToArtwork(target, 'single_blink', target.id === state.hoveredId ? 0.34 : 0.28);
-    flashBlinkIndicator('👁 1 piscar → aproxima "'+target.title+'"');
-    log('Single blink → aproxima ' + target.title);
-  } else {
-    flashBlinkIndicator('👁 1 piscar sem obra em foco');
-    log('Single blink sem alvo útil');
-  }
+  zoomOutStep('single_blink');
+  flashBlinkIndicator('👁 1 piscar → afasta');
+  log('Single blink → afasta');
 }
 
 function onDoubleBlink(){
-  zoomOutStep('double_blink');
-  flashBlinkIndicator('👁👁 2 piscadas → afasta');
-  log('Double blink → afasta');
+  const target = blinkTarget();
+  if(target){
+    zoomInToArtwork(target, 'double_blink', target.id === state.hoveredId ? 0.42 : 0.36);
+    flashBlinkIndicator('👁👁 2 piscadas → aproxima "'+target.title+'"');
+    log('Double blink → aproxima ' + target.title);
+  } else {
+    flashBlinkIndicator('👁👁 2 piscadas sem obra em foco');
+    log('Double blink sem alvo útil');
+  }
 }
 
 function commitPendingSingleBlink(){
@@ -1102,56 +1102,60 @@ function processBlink(landmarks){
     return;
   }
 
-  state.blink.leftEma = lerp(state.blink.leftEma, leftEarRaw, 0.46);
-  state.blink.rightEma = lerp(state.blink.rightEma, rightEarRaw, 0.46);
+  state.blink.leftEma = lerp(state.blink.leftEma, leftEarRaw, state.blink.closed ? 0.58 : 0.34);
+  state.blink.rightEma = lerp(state.blink.rightEma, rightEarRaw, state.blink.closed ? 0.58 : 0.34);
 
   const leftEar = state.blink.leftEma;
   const rightEar = state.blink.rightEma;
   const avgEar = (leftEar + rightEar) * 0.5;
 
   if(!state.blink.baselineReady){
-    if(avgEar > 0.12){
-      state.blink.leftOpenRef = lerp(state.blink.leftOpenRef, leftEar, 0.28);
-      state.blink.rightOpenRef = lerp(state.blink.rightOpenRef, rightEar, 0.28);
+    const baselineOpenEnough = avgEar > 0.11 && leftEar > 0.095 && rightEar > 0.095;
+    if(baselineOpenEnough){
+      state.blink.leftOpenRef = lerp(state.blink.leftOpenRef, leftEar, 0.24);
+      state.blink.rightOpenRef = lerp(state.blink.rightOpenRef, rightEar, 0.24);
       state.blink.readyFrames += 1;
+    } else {
+      state.blink.readyFrames = Math.max(0, state.blink.readyFrames - 1);
     }
-    if(state.blink.readyFrames >= 6){
+    if(state.blink.readyFrames >= 8){
       state.blink.baselineReady = true;
       state.blink.debugLast = 'baseline_ready';
+      setBlink('Pronto');
+    } else {
+      setBlink('Calibrando');
     }
   } else if(!state.blink.closed){
-    if(leftEar > state.blink.leftOpenRef * 0.72) state.blink.leftOpenRef = lerp(state.blink.leftOpenRef, Math.max(leftEar, state.blink.leftOpenRef), 0.05);
-    if(rightEar > state.blink.rightOpenRef * 0.72) state.blink.rightOpenRef = lerp(state.blink.rightOpenRef, Math.max(rightEar, state.blink.rightOpenRef), 0.05);
+    const leftClearlyOpen = leftEar > state.blink.leftOpenRef * 0.74;
+    const rightClearlyOpen = rightEar > state.blink.rightOpenRef * 0.74;
+    if(leftClearlyOpen) state.blink.leftOpenRef = lerp(state.blink.leftOpenRef, Math.max(leftEar, state.blink.leftOpenRef), 0.035);
+    if(rightClearlyOpen) state.blink.rightOpenRef = lerp(state.blink.rightOpenRef, Math.max(rightEar, state.blink.rightOpenRef), 0.035);
   }
 
-  state.blink.leftOpenRef = clamp(state.blink.leftOpenRef, 0.15, 0.42);
-  state.blink.rightOpenRef = clamp(state.blink.rightOpenRef, 0.15, 0.42);
+  state.blink.leftOpenRef = clamp(state.blink.leftOpenRef, 0.12, 0.42);
+  state.blink.rightOpenRef = clamp(state.blink.rightOpenRef, 0.12, 0.42);
 
-  const leftRatio = clamp(leftEar / Math.max(state.blink.leftOpenRef, 1e-6), 0, 1.35);
-  const rightRatio = clamp(rightEar / Math.max(state.blink.rightOpenRef, 1e-6), 0, 1.35);
+  const leftRatio = clamp(leftEar / Math.max(state.blink.leftOpenRef, 1e-6), 0, 1.45);
+  const rightRatio = clamp(rightEar / Math.max(state.blink.rightOpenRef, 1e-6), 0, 1.45);
   const avgRatio = (leftRatio + rightRatio) * 0.5;
   const minRatio = Math.min(leftRatio, rightRatio);
-  const openScoreRaw = minRatio * 0.76 + avgRatio * 0.24;
-  state.blink.openScore = openScoreRaw;
-  state.blink.openScoreEma = lerp(state.blink.openScoreEma, openScoreRaw, state.blink.closed ? 0.40 : 0.24);
+  const maxRatio = Math.max(leftRatio, rightRatio);
 
-  const closeSignal = Math.min(state.blink.openScore, state.blink.openScoreEma);
-  const closedNow = closeSignal < state.blink.closeThresh || (minRatio < 0.42 && avgRatio < 0.72);
-  const openNow = state.blink.openScore > state.blink.openThresh && state.blink.openScoreEma > state.blink.openThresh * 0.92;
+  const strongClosure = (avgRatio < state.blink.closeThresh) || (minRatio < 0.58) || ((minRatio < 0.68) && (maxRatio < 0.96));
+  const reopened = (avgRatio > state.blink.openThresh && minRatio > 0.72) || (leftRatio > 0.86 && rightRatio > 0.86);
 
-  if(closedNow){
+  state.blink.openScore = avgRatio;
+  state.blink.openScoreEma = lerp(state.blink.openScoreEma, avgRatio, state.blink.closed ? 0.54 : 0.22);
+
+  if(strongClosure){
     state.blink.closedFrames += 1;
     state.blink.openFrames = 0;
-  } else if(openNow){
+  } else if(reopened){
     state.blink.openFrames += 1;
     if(!state.blink.closed) state.blink.closedFrames = 0;
   } else {
     if(!state.blink.closed) state.blink.closedFrames = 0;
     state.blink.openFrames = 0;
-  }
-
-  if(!state.blink.baselineReady){
-    setBlink('Calibrando');
   }
 
   if(!state.blink.closed && state.blink.baselineReady && state.blink.closedFrames >= state.blink.minClosedFrames){
@@ -1178,7 +1182,8 @@ function processBlink(landmarks){
   }
 
   if(meshDebug){
-    meshDebug.textContent = 'Malha OK • score ' + state.blink.openScore.toFixed(2) + ' • L ' + leftRatio.toFixed(2) + ' • R ' + rightRatio.toFixed(2) + ' • ref ' + state.blink.leftOpenRef.toFixed(3) + '/' + state.blink.rightOpenRef.toFixed(3);
+    const mode = state.blink.closed ? 'fechado' : 'aberto';
+    meshDebug.textContent = 'Malha OK • ' + mode + ' • avg ' + avgRatio.toFixed(2) + ' • L ' + leftRatio.toFixed(2) + ' • R ' + rightRatio.toFixed(2) + ' • ref ' + state.blink.leftOpenRef.toFixed(3) + '/' + state.blink.rightOpenRef.toFixed(3) + ' • ' + state.blink.debugLast;
   }
 }
 
@@ -1581,7 +1586,7 @@ async function startTracking(){
     state.rafMedia=requestAnimationFrame(mediaLoop);
     state.usingMouse=false;
     setMode('Webcam');
-    permNote.textContent='Tracking facial ativo com malha facial desenhada. Pisque normalmente: 1 piscada aproxima e 2 piscadas rápidas afastam.';
+    permNote.textContent='Tracking facial ativo com malha facial desenhada. Pisque normalmente: 1 piscada afasta e 2 piscadas rápidas aproximam.';
     if(meshDebug) meshDebug.textContent = 'Malha: procurando baseline dos olhos…';
     log('Tracking facial iniciado com malha facial + blink por EAR dinâmico.');
 
@@ -1626,7 +1631,7 @@ function calibrate(){
   state.tracking.baselineReady = false;
   resetBlinkState();
   calibText.textContent='Concluída';
-  permNote.textContent='Calibração aplicada. A baseline do rosto e dos olhos foi reiniciada. Olhe normal por meio segundo e depois pisque para aproximar/afastar.';
+  permNote.textContent='Calibração aplicada. A baseline do rosto e dos olhos foi reiniciada. Olhe normal por meio segundo; depois faça 1 piscada para afastar ou 2 piscadas rápidas para aproximar.';
   log('Calibração aplicada. xOff='+state.calib.xOff.toFixed(3)+' yOff='+state.calib.yOff.toFixed(3));
 }
 
