@@ -4,7 +4,7 @@ import streamlit.components.v1 as components
 st.set_page_config(page_title="Sala 3D – Face Tracking Parallax", layout="wide")
 
 st.title("Sala 3D com Face Tracking + Parallax")
-st.caption("Tracking facial mais estável, zoom por piscadas mais confiável e efeito de parallax com profundidade. 1 piscar aproxima, 2 piscadas rápidas afastam.")
+st.caption("Tracking facial mais estável, blink recalibrado de forma adaptativa e efeito de parallax com profundidade. 1 piscar aproxima, 2 piscadas rápidas afastam.")
 
 HTML_APP = r"""
 <div id="eye-room-root">
@@ -200,7 +200,7 @@ HTML_APP = r"""
 <div class="topbar">
   <div class="headline">
     <h2>🎨 Sala 3D – Face Tracking + Parallax</h2>
-    <p>Tracking pelo rosto com filtragem mais estável, parallax multicamada e zoom por piscadas mais confiável. <strong>1 piscar</strong> → aproxima a obra em foco &nbsp;|&nbsp; <strong>2 piscadas rápidas</strong> → afasta o zoom.</p>
+    <p>Tracking pelo rosto com filtragem mais estável, blink adaptativo, parallax multicamada e zoom por piscadas mais confiável. <strong>1 piscar</strong> → aproxima a obra em foco &nbsp;|&nbsp; <strong>2 piscadas rápidas</strong> → afasta o zoom.</p>
   </div>
   <div class="controls">
     <button class="btn primary" id="startBtn">▶ Iniciar tracking</button>
@@ -224,7 +224,7 @@ HTML_APP = r"""
 
       <div class="chip" id="statusChip"><span id="statusDot" class="dot"></span><span id="statusText">Aguardando</span></div>
       <div class="chip" id="modeChip">Modo: <strong id="modeText">Cena ativa</strong></div>
-      <div class="chip" id="blinkChip">👁 Blink: <strong id="blinkText">Pronto</strong></div>
+      <div class="chip" id="blinkChip">👁 Blink: <strong id="blinkText">Calibrando</strong></div>
 
       <div class="meter">
         <div class="label">Dwell-click</div>
@@ -382,14 +382,23 @@ const state = {
     closed:false,
     closeTs:0,
     ema:0.27,
-    threshClose:0.168,
-    threshOpen:0.205,
-    minMs:55,
-    maxMs:360,
+    baseline:0.27,
+    baselineReady:false,
+    minBaseline:0.20,
+    maxBaseline:0.42,
+    closeRatio:0.66,
+    openRatio:0.82,
+    threshClose:0.16,
+    threshOpen:0.21,
+    minMs:45,
+    maxMs:420,
+    holdFrames:0,
+    minHoldFrames:2,
     history:[],
     singleTimer:null,
-    singleDelayMs:280,
-    doubleWindowMs:520
+    singleDelayMs:300,
+    doubleWindowMs:560,
+    debugLast:'init'
   },
 
   tracking:{
@@ -837,42 +846,21 @@ function registerBlink(now){
     const prev = state.blink.history[state.blink.history.length - 2];
     if(now - prev < state.blink.doubleWindowMs){
       state.blink.history = [];
+      state.blink.debugLast = 'double';
       onDoubleBlink();
+      setBlink('2x');
       return;
     }
   }
 
   state.blink.singleTimer = setTimeout(()=>{
     if(state.blink.history.length === 1){
+      state.blink.debugLast = 'single';
       onSingleBlink();
+      setBlink('1x');
     }
     state.blink.history = [];
   }, state.blink.singleDelayMs);
-}
-
-function processBlink(landmarks){
-  const eo = eyeOpenness;
-  const leftOpen  = eo(landmarks,159,145,33,133);
-  const rightOpen = eo(landmarks,386,374,362,263);
-  const rawOpen = (leftOpen + rightOpen) / 2;
-  state.blink.ema = lerp(state.blink.ema, rawOpen, 0.42);
-  const openness = state.blink.ema;
-  const now = Date.now();
-
-  if(openness < state.blink.threshClose && !state.blink.closed){
-    state.blink.closed = true;
-    state.blink.closeTs = now;
-    setBlink('Fechado');
-    gazeCursor.style.borderColor = 'rgba(243,156,18,.9)';
-  } else if(openness > state.blink.threshOpen && state.blink.closed){
-    const dur = now - state.blink.closeTs;
-    state.blink.closed = false;
-    setBlink('Aberto');
-    gazeCursor.style.borderColor = 'rgba(255,255,255,.92)';
-    if(dur >= state.blink.minMs && dur <= state.blink.maxMs){
-      registerBlink(now);
-    }
-  }
 }
 
 function eyeOpenness(lm,topIdx,botIdx,lIdx,rIdx){
@@ -880,6 +868,67 @@ function eyeOpenness(lm,topIdx,botIdx,lIdx,rIdx){
   const vert=Math.hypot(top.x-bot.x, top.y-bot.y);
   const horiz=Math.hypot(left.x-right.x, left.y-right.y);
   return vert/Math.max(horiz,1e-6);
+}
+
+function processBlink(landmarks){
+  const eo = eyeOpenness;
+  const leftOpen  = eo(landmarks,159,145,33,133);
+  const rightOpen = eo(landmarks,386,374,362,263);
+
+  // usa o olho mais "aberto" para reduzir falso positivo por ruído de um lado
+  const rawOpen = Math.max(leftOpen, rightOpen);
+  state.blink.ema = lerp(state.blink.ema, rawOpen, 0.34);
+
+  // baseline adaptativa: só sobe/ajusta quando o olho está claramente aberto
+  if(!state.blink.closed){
+    if(!state.blink.baselineReady){
+      state.blink.baseline = lerp(state.blink.baseline, state.blink.ema, 0.08);
+      if(Math.abs(state.blink.baseline - state.blink.ema) < 0.015){
+        state.blink.baselineReady = true;
+      }
+    } else if(state.blink.ema > state.blink.baseline * 0.9){
+      state.blink.baseline = lerp(
+        state.blink.baseline,
+        clamp(state.blink.ema, state.blink.minBaseline, state.blink.maxBaseline),
+        0.02
+      );
+    }
+  }
+
+  const baseline = clamp(state.blink.baseline, state.blink.minBaseline, state.blink.maxBaseline);
+  const closeThresh = clamp(baseline * state.blink.closeRatio, 0.11, 0.24);
+  const openThresh  = clamp(baseline * state.blink.openRatio,  0.15, 0.32);
+  state.blink.threshClose = closeThresh;
+  state.blink.threshOpen = openThresh;
+
+  const openness = state.blink.ema;
+  const now = Date.now();
+
+  if(openness < closeThresh){
+    state.blink.holdFrames += 1;
+  } else if(!state.blink.closed) {
+    state.blink.holdFrames = 0;
+  }
+
+  if(openness < closeThresh && !state.blink.closed && state.blink.holdFrames >= state.blink.minHoldFrames){
+    state.blink.closed = true;
+    state.blink.closeTs = now;
+    state.blink.debugLast = 'closed';
+    setBlink('Fechado');
+    gazeCursor.style.borderColor = 'rgba(243,156,18,.9)';
+  } else if(openness > openThresh && state.blink.closed){
+    const dur = now - state.blink.closeTs;
+    state.blink.closed = false;
+    state.blink.holdFrames = 0;
+    state.blink.debugLast = 'open';
+    setBlink('Aberto');
+    gazeCursor.style.borderColor = 'rgba(255,255,255,.92)';
+    if(dur >= state.blink.minMs && dur <= state.blink.maxMs){
+      registerBlink(now);
+    } else {
+      state.blink.debugLast = 'ignored_'+dur;
+    }
+  }
 }
 
 // ─── FACE TRACKING / HEAD POSE MAPPING ───
