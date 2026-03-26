@@ -456,7 +456,7 @@ const state = {
   },
 
   tracking:{
-    invertX:false,
+    invertX:true,
     history:[],
     historyMax:10,
     baselineReady:false,
@@ -468,11 +468,11 @@ const state = {
       pitch:0,
       size:0.22
     },
-    deadzoneX:0.010,
+    deadzoneX:0.016,
     deadzoneY:0.012,
-    centerGainX:0.22,
+    centerGainX:0.05,
     centerGainY:0.78,
-    yawGainX:1.34,
+    yawGainX:1.72,
     pitchGainY:0.34,
     lastSizeRatio:1,
     sizeVelocity:0,
@@ -1425,7 +1425,9 @@ function mapFaceTracking(landmarks){
 
   const dirSign = state.tracking.invertX ? -1 : 1;
 
-  let combinedX = dirSign * (dyaw * state.tracking.yawGainX + dx * state.tracking.centerGainX);
+  const horizontalYaw = dyaw * state.tracking.yawGainX;
+  const horizontalCenter = dx * state.tracking.centerGainX;
+  let combinedX = dirSign * (horizontalYaw + horizontalCenter);
   let combinedY = dy * state.tracking.centerGainY + dpitch * state.tracking.pitchGainY;
 
   combinedX = remapDeadzone(combinedX, state.tracking.deadzoneX);
@@ -1747,9 +1749,9 @@ async function startTracking(){
     state.rafMedia=requestAnimationFrame(mediaLoop);
     state.usingMouse=false;
     setMode('Webcam');
-    permNote.textContent='Tracking ativo. A direção vem da pose da cabeça, o foco entra por permanência do olhar e o zoom principal vem da distância do rosto + botões. O blink entra só como reforço quando estiver confiável.';
+    permNote.textContent='Tracking ativo. A lateral agora usa compensação espelhada por padrão e quase todo o movimento horizontal vem do yaw da cabeça. O foco entra por permanência do olhar e o zoom principal vem da distância do rosto + botões.';
     setTrackingMode('full');
-    log('Tracking facial iniciado com malha facial, direção principal por cabeça, foco por permanência e zoom principal por distância do rosto + botões.');
+    log('Tracking facial iniciado com compensação espelhada no eixo X, lateral baseada em yaw da cabeça, foco por permanência e zoom principal por distância do rosto + botões.');
 
   } catch(err){
     state.usingMouse=true;
@@ -1872,7 +1874,7 @@ document.getElementById('resetHeatBtn').addEventListener('click', clearHeatmap);
 document.getElementById('exportPdfBtn').addEventListener('click', exportPdf);
 invertXBtn.addEventListener('click', ()=>{
   state.tracking.invertX = !state.tracking.invertX;
-  permNote.textContent = state.tracking.invertX ? 'Eixo X invertido manualmente: esquerda/direita foram trocadas.' : 'Eixo X no modo normal: yaw da cabeça controla a lateral diretamente.';
+  permNote.textContent = state.tracking.invertX ? 'Compensação espelhada ligada: o yaw da cabeça foi invertido para corrigir webcam selfie.' : 'Compensação espelhada desligada: yaw da cabeça no sentido bruto da câmera.';
   resetTrackingState();
   state.tracking.history = [];
   log('Inverter X = '+state.tracking.invertX);
