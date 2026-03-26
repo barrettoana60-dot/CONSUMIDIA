@@ -406,22 +406,29 @@ const state = {
     openScoreEma:1,
     readyFrames:0,
     baselineReady:false,
-    closeThresh:0.72,
-    openThresh:0.84,
-    minMs:30,
-    maxMs:520,
+    closeThresh:0.70,
+    openThresh:0.90,
+    minMs:45,
+    maxMs:480,
     closedFrames:0,
     openFrames:0,
-    minClosedFrames:1,
-    minOpenFrames:1,
+    minClosedFrames:2,
+    minOpenFrames:2,
     lastBlinkTs:0,
     lastEventTs:0,
     pendingSingleTs:0,
     pendingSingleTimer:null,
     lastBlinkDuration:0,
-    doubleWindowMs:430,
-    cooldownMs:90,
+    doubleWindowMs:520,
+    cooldownMs:120,
     cooldownUntil:0,
+    rearmUntil:0,
+    minInterBlinkMs:140,
+    minClosureDelta:0.20,
+    minClosedRatio:0.69,
+    minDuringBlink:1,
+    preBlinkOpenRatio:1,
+    stableOpenFrames:0,
     debugLast:'init'
   },
 
@@ -511,13 +518,17 @@ function resetBlinkState(){
   state.blink.pendingSingleTs = 0;
   state.blink.lastBlinkDuration = 0;
   state.blink.cooldownUntil = 0;
+  state.blink.rearmUntil = 0;
   state.blink.leftEma = 0.24;
   state.blink.rightEma = 0.24;
   state.blink.leftOpenRef = 0.24;
   state.blink.rightOpenRef = 0.24;
   state.blink.openScore = 1;
   state.blink.openScoreEma = 1;
+  state.blink.minDuringBlink = 1;
+  state.blink.preBlinkOpenRatio = 1;
   state.blink.readyFrames = 0;
+  state.blink.stableOpenFrames = 0;
   state.blink.baselineReady = false;
   state.blink.debugLast = 'reset';
   setBlink('Pronto');
@@ -959,7 +970,7 @@ function queueSingleBlink(now){
   state.blink.pendingSingleTs = now;
   state.blink.pendingSingleTimer = setTimeout(()=>{
     commitPendingSingleBlink();
-  }, state.blink.doubleWindowMs + 18);
+  }, state.blink.doubleWindowMs + 32);
 }
 
 function registerBlink(now){
@@ -968,8 +979,13 @@ function registerBlink(now){
     return;
   }
 
-  if(state.blink.lastEventTs && (now - state.blink.lastEventTs) < 85){
+  if(state.blink.lastEventTs && (now - state.blink.lastEventTs) < 70){
     state.blink.debugLast = 'debounced';
+    return;
+  }
+
+  if(state.blink.lastBlinkTs && (now - state.blink.lastBlinkTs) < state.blink.minInterBlinkMs){
+    state.blink.debugLast = 'too_fast';
     return;
   }
 
@@ -982,8 +998,8 @@ function registerBlink(now){
       state.blink.pendingSingleTimer = null;
     }
     state.blink.pendingSingleTs = 0;
-    state.blink.lastBlinkTs = 0;
-    state.blink.cooldownUntil = now + 190;
+    state.blink.lastBlinkTs = now;
+    state.blink.cooldownUntil = now + 150;
     state.blink.debugLast = 'double';
     setBlink('2x');
     onDoubleBlink();
@@ -1102,34 +1118,31 @@ function processBlink(landmarks){
     return;
   }
 
-  state.blink.leftEma = lerp(state.blink.leftEma, leftEarRaw, state.blink.closed ? 0.58 : 0.34);
-  state.blink.rightEma = lerp(state.blink.rightEma, rightEarRaw, state.blink.closed ? 0.58 : 0.34);
+  state.blink.leftEma = lerp(state.blink.leftEma, leftEarRaw, state.blink.closed ? 0.56 : 0.24);
+  state.blink.rightEma = lerp(state.blink.rightEma, rightEarRaw, state.blink.closed ? 0.56 : 0.24);
 
   const leftEar = state.blink.leftEma;
   const rightEar = state.blink.rightEma;
   const avgEar = (leftEar + rightEar) * 0.5;
 
   if(!state.blink.baselineReady){
-    const baselineOpenEnough = avgEar > 0.11 && leftEar > 0.095 && rightEar > 0.095;
+    const baselineOpenEnough = avgEar > 0.12 && leftEar > 0.10 && rightEar > 0.10;
     if(baselineOpenEnough){
-      state.blink.leftOpenRef = lerp(state.blink.leftOpenRef, leftEar, 0.24);
-      state.blink.rightOpenRef = lerp(state.blink.rightOpenRef, rightEar, 0.24);
+      state.blink.leftOpenRef = lerp(state.blink.leftOpenRef, leftEar, 0.22);
+      state.blink.rightOpenRef = lerp(state.blink.rightOpenRef, rightEar, 0.22);
       state.blink.readyFrames += 1;
     } else {
       state.blink.readyFrames = Math.max(0, state.blink.readyFrames - 1);
     }
-    if(state.blink.readyFrames >= 8){
+
+    if(state.blink.readyFrames >= 10){
       state.blink.baselineReady = true;
+      state.blink.stableOpenFrames = 2;
       state.blink.debugLast = 'baseline_ready';
       setBlink('Pronto');
     } else {
       setBlink('Calibrando');
     }
-  } else if(!state.blink.closed){
-    const leftClearlyOpen = leftEar > state.blink.leftOpenRef * 0.74;
-    const rightClearlyOpen = rightEar > state.blink.rightOpenRef * 0.74;
-    if(leftClearlyOpen) state.blink.leftOpenRef = lerp(state.blink.leftOpenRef, Math.max(leftEar, state.blink.leftOpenRef), 0.035);
-    if(rightClearlyOpen) state.blink.rightOpenRef = lerp(state.blink.rightOpenRef, Math.max(rightEar, state.blink.rightOpenRef), 0.035);
   }
 
   state.blink.leftOpenRef = clamp(state.blink.leftOpenRef, 0.12, 0.42);
@@ -1140,50 +1153,96 @@ function processBlink(landmarks){
   const avgRatio = (leftRatio + rightRatio) * 0.5;
   const minRatio = Math.min(leftRatio, rightRatio);
   const maxRatio = Math.max(leftRatio, rightRatio);
+  const asym = Math.abs(leftRatio - rightRatio);
 
-  const strongClosure = (avgRatio < state.blink.closeThresh) || (minRatio < 0.58) || ((minRatio < 0.68) && (maxRatio < 0.96));
-  const reopened = (avgRatio > state.blink.openThresh && minRatio > 0.72) || (leftRatio > 0.86 && rightRatio > 0.86);
+  const fullyOpen = avgRatio > 0.96 && minRatio > 0.84;
+  const reopened = (avgRatio > state.blink.openThresh && minRatio > 0.78) || (leftRatio > 0.93 && rightRatio > 0.93);
+  const strongClosure =
+    (avgRatio < state.blink.closeThresh) ||
+    (minRatio < 0.58) ||
+    ((avgRatio < 0.78) && (minRatio < 0.68)) ||
+    ((asym < 0.42) && (maxRatio < 0.82));
 
   state.blink.openScore = avgRatio;
-  state.blink.openScoreEma = lerp(state.blink.openScoreEma, avgRatio, state.blink.closed ? 0.54 : 0.22);
+  state.blink.openScoreEma = lerp(state.blink.openScoreEma, avgRatio, state.blink.closed ? 0.30 : 0.10);
 
-  if(strongClosure){
-    state.blink.closedFrames += 1;
-    state.blink.openFrames = 0;
-  } else if(reopened){
-    state.blink.openFrames += 1;
-    if(!state.blink.closed) state.blink.closedFrames = 0;
+  if(fullyOpen){
+    state.blink.stableOpenFrames = Math.min(state.blink.stableOpenFrames + 1, 8);
   } else {
-    if(!state.blink.closed) state.blink.closedFrames = 0;
-    state.blink.openFrames = 0;
+    state.blink.stableOpenFrames = Math.max(0, state.blink.stableOpenFrames - 1);
+  }
+
+  if(state.blink.baselineReady && !state.blink.closed){
+    const leftClearlyOpen = leftRatio > 0.92;
+    const rightClearlyOpen = rightRatio > 0.92;
+    if(leftClearlyOpen) state.blink.leftOpenRef = lerp(state.blink.leftOpenRef, Math.max(leftEar, state.blink.leftOpenRef), 0.018);
+    if(rightClearlyOpen) state.blink.rightOpenRef = lerp(state.blink.rightOpenRef, Math.max(rightEar, state.blink.rightOpenRef), 0.018);
+  }
+
+  if(!state.blink.closed){
+    if(now < state.blink.rearmUntil){
+      state.blink.closedFrames = 0;
+      state.blink.openFrames = fullyOpen ? Math.min(state.blink.openFrames + 1, 6) : 0;
+      state.blink.debugLast = 'rearm';
+    } else if(strongClosure && state.blink.baselineReady){
+      state.blink.closedFrames += 1;
+      state.blink.openFrames = 0;
+      state.blink.debugLast = 'closing';
+    } else {
+      state.blink.closedFrames = Math.max(0, state.blink.closedFrames - 1);
+      state.blink.openFrames = fullyOpen ? Math.min(state.blink.openFrames + 1, 6) : 0;
+      if(state.blink.baselineReady) state.blink.debugLast = fullyOpen ? 'open' : 'idle';
+    }
+  } else {
+    state.blink.minDuringBlink = Math.min(state.blink.minDuringBlink, minRatio);
+    if(reopened){
+      state.blink.openFrames += 1;
+      state.blink.debugLast = 'opening';
+    } else {
+      state.blink.openFrames = 0;
+      state.blink.debugLast = 'closed_hold';
+    }
   }
 
   if(!state.blink.closed && state.blink.baselineReady && state.blink.closedFrames >= state.blink.minClosedFrames){
-    state.blink.closed = true;
-    state.blink.closeTs = now;
-    state.blink.debugLast = 'closed';
-    setBlink('Fechado');
-    gazeCursor.style.borderColor = 'rgba(243,156,18,.95)';
+    const openReady = state.blink.stableOpenFrames >= 1 || state.blink.openScoreEma > 0.92;
+    if(openReady){
+      state.blink.closed = true;
+      state.blink.closeTs = now;
+      state.blink.closedFrames = 0;
+      state.blink.openFrames = 0;
+      state.blink.minDuringBlink = minRatio;
+      state.blink.preBlinkOpenRatio = clamp(Math.max(state.blink.openScoreEma, avgRatio), 0.76, 1.20);
+      state.blink.debugLast = 'closed';
+      setBlink('Fechado');
+      gazeCursor.style.borderColor = 'rgba(243,156,18,.95)';
+    }
   } else if(state.blink.closed && state.blink.openFrames >= state.blink.minOpenFrames){
     const dur = now - state.blink.closeTs;
+    const closureDrop = state.blink.preBlinkOpenRatio - state.blink.minDuringBlink;
+    const validClosure = closureDrop >= state.blink.minClosureDelta || state.blink.minDuringBlink <= state.blink.minClosedRatio;
+
     state.blink.closed = false;
     state.blink.closedFrames = 0;
     state.blink.openFrames = 0;
     state.blink.lastBlinkDuration = dur;
-    state.blink.debugLast = 'open';
+    state.blink.rearmUntil = now + 95;
+    state.blink.stableOpenFrames = Math.max(state.blink.stableOpenFrames, 2);
     setBlink('Aberto');
     gazeCursor.style.borderColor = 'rgba(255,255,255,.92)';
 
-    if(dur >= state.blink.minMs && dur <= state.blink.maxMs){
+    if(validClosure && dur >= state.blink.minMs && dur <= state.blink.maxMs){
+      state.blink.debugLast = 'blink_' + closureDrop.toFixed(2);
       registerBlink(now);
     } else {
-      state.blink.debugLast = 'ignored_' + dur;
+      state.blink.debugLast = 'ignored_' + dur + '_' + closureDrop.toFixed(2);
     }
   }
 
   if(meshDebug){
     const mode = state.blink.closed ? 'fechado' : 'aberto';
-    meshDebug.textContent = 'Malha OK • ' + mode + ' • avg ' + avgRatio.toFixed(2) + ' • L ' + leftRatio.toFixed(2) + ' • R ' + rightRatio.toFixed(2) + ' • ref ' + state.blink.leftOpenRef.toFixed(3) + '/' + state.blink.rightOpenRef.toFixed(3) + ' • ' + state.blink.debugLast;
+    const drop = Math.max(0, state.blink.preBlinkOpenRatio - state.blink.minDuringBlink);
+    meshDebug.textContent = 'Malha OK • ' + mode + ' • avg ' + avgRatio.toFixed(2) + ' • L ' + leftRatio.toFixed(2) + ' • R ' + rightRatio.toFixed(2) + ' • drop ' + drop.toFixed(2) + ' • ref ' + state.blink.leftOpenRef.toFixed(3) + '/' + state.blink.rightOpenRef.toFixed(3) + ' • ' + state.blink.debugLast;
   }
 }
 
