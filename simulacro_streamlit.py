@@ -310,7 +310,7 @@ HTML_APP = r"""
         <button class="btn primary" id="zoomInBtn">+ Aproximar</button>
         <button class="btn warn" id="zoomOutBtn">− Afastar</button>
       </div>
-      <div class="status-note" id="weakZoomNote">O zoom principal responde pela distância do rosto e pelos botões. Quando a webcam estiver boa, o blink pode reforçar esse zoom.</div>
+      <div class="status-note" id="weakZoomNote">O zoom principal responde pela distância do rosto e pelos botões. O botão manual agora escolhe automaticamente a obra mais próxima do olhar ou do centro da galeria.</div>
     </div>
 
     <div class="card">
@@ -456,7 +456,7 @@ const state = {
   },
 
   tracking:{
-    invertX:true,
+    invertX:false,
     history:[],
     historyMax:10,
     baselineReady:false,
@@ -494,7 +494,10 @@ const state = {
     starsFar:[],
     starsMid:[],
     orbs:[],
-    ribbons:[]
+    ribbons:[],
+    dustNear:[],
+    depthPanels:[],
+    artFloaters:[]
   },
 
   zoom:{
@@ -728,6 +731,35 @@ function initParallax(){
     });
   }
   state.parallax.ribbons = ribbons;
+
+  const dustNear = [];
+  for(let i=0;i<34;i++){
+    dustNear.push({
+      x:Math.random(),
+      y:Math.random(),
+      r:1.4 + Math.random()*3.2,
+      a:0.04 + Math.random()*0.10,
+      depth:0.55 + Math.random()*0.45,
+      drift:0.05 + Math.random()*0.12
+    });
+  }
+  state.parallax.dustNear = dustNear;
+
+  state.parallax.depthPanels = [
+    {x:-3.65,y:2.05,z:2.2,w:1.25,h:1.95,plane:'left',  tint:'93,173,226', alpha:0.08},
+    {x: 3.65,y:2.05,z:2.6,w:1.10,h:1.85,plane:'right', tint:'165,105,189', alpha:0.08},
+    {x:-1.05,y:2.35,z:8.35,w:1.10,h:1.55,plane:'back',  tint:'93,173,226', alpha:0.06},
+    {x: 1.20,y:2.10,z:7.75,w:1.00,h:1.35,plane:'back',  tint:'240,192,64', alpha:0.06}
+  ];
+
+  state.parallax.artFloaters = artworks.map((art, idx)=>(
+    {
+      artId: art.id,
+      phase: idx * 0.9 + Math.random(),
+      amp: 0.009 + Math.random()*0.010,
+      alpha: 0.05 + Math.random()*0.04
+    }
+  ));
 }
 
 function drawParallaxBackdrop(r, gx, gy){
@@ -786,6 +818,47 @@ function drawParallaxBackdrop(r, gx, gy){
   });
 }
 
+
+
+function parallaxOffsetForArt(art){
+  const depth = art.plane === 'back' ? 0.42 : 0.54;
+  const xShift = (gaze.x - 0.5) * (art.plane === 'back' ? 44 : 34) * depth;
+  const yShift = (gaze.y - 0.5) * 20 * depth;
+  return {x:xShift, y:yShift, depth};
+}
+
+function drawDepthPanels(){
+  state.parallax.depthPanels.forEach(panel=>{
+    const pts = polyPts(panel);
+    if(!pts || pts.some(p=>!p)) return;
+    const off = parallaxOffsetForArt(panel);
+    const shifted = pts.map(pt=>({x:pt.x + off.x * 0.22, y:pt.y + off.y * 0.12, depth:pt.depth, scale:pt.scale}));
+    const cx = shifted.reduce((s,p)=>s+p.x,0) / shifted.length;
+    const cy = shifted.reduce((s,p)=>s+p.y,0) / shifted.length;
+    const grad = ctx.createRadialGradient(cx - off.x*0.1, cy - off.y*0.1, 0, cx, cy, 160);
+    grad.addColorStop(0, 'rgba('+panel.tint+','+(panel.alpha*1.5).toFixed(3)+')');
+    grad.addColorStop(0.65, 'rgba('+panel.tint+','+panel.alpha.toFixed(3)+')');
+    grad.addColorStop(1, 'rgba('+panel.tint+',0)');
+    drawPoly(shifted, grad, 'rgba(255,255,255,0.06)', 1.1);
+  });
+}
+
+function drawParallaxForeground(r, gx, gy){
+  const t = performance.now() * 0.001;
+  state.parallax.dustNear.forEach(p=>{
+    const x = wrap(r.width * p.x + gx * r.width * p.depth * 0.58 + Math.sin(t*p.drift + p.x*6) * 12, r.width);
+    const y = wrap(r.height * p.y + gy * r.height * p.depth * 0.44 + Math.cos(t*p.drift + p.y*7) * 8, r.height);
+    const rr = p.r * (1 + Math.abs(gx) * 0.14);
+    const g = ctx.createRadialGradient(x, y, 0, x, y, rr*3.2);
+    g.addColorStop(0, 'rgba(255,255,255,'+(p.a*1.1).toFixed(3)+')');
+    g.addColorStop(0.5, 'rgba(191,214,246,'+(p.a*0.55).toFixed(3)+')');
+    g.addColorStop(1, 'rgba(191,214,246,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(x, y, rr*3.2, 0, Math.PI*2);
+    ctx.fill();
+  });
+}
 
 // ─── PROJECTION ───
 function projectPt(x,y,z){
@@ -998,29 +1071,65 @@ function resetZoom(){
   updateSelPanel(state.hoveredId ? artById(state.hoveredId) : null);
 }
 
-function blinkTarget(){
+function closestProjectedArtwork(px, py, radiusFactor){
+  if(!projectedArtworks || !projectedArtworks.length) return null;
+  const r = scenePanel.getBoundingClientRect();
+  let best = null;
+  let bestD = Infinity;
+  projectedArtworks.forEach(entry=>{
+    const cx = entry.center?.x ?? ((entry.poly[0].x + entry.poly[1].x + entry.poly[2].x + entry.poly[3].x) / 4);
+    const cy = entry.center?.y ?? ((entry.poly[0].y + entry.poly[1].y + entry.poly[2].y + entry.poly[3].y) / 4);
+    const d = Math.hypot(cx - px, cy - py);
+    if(d < bestD){
+      bestD = d;
+      best = entry.art;
+    }
+  });
+  const radius = Math.min(r.width, r.height) * (radiusFactor ?? 0.42);
+  return best && bestD <= radius ? best : null;
+}
+
+function resolveZoomTarget(preferCenter){
   const hovered = artById(state.hoveredId);
   const selected = artById(state.selectedId);
+  const zoomed = artById(state.zoom.targetId);
   if(hovered) return hovered;
   if(selected) return selected;
-  if(projectedArtworks && projectedArtworks.length){
-    const r = scenePanel.getBoundingClientRect();
-    const gx = gaze.x * r.width;
-    const gy = gaze.y * r.height;
-    let best = null;
-    let bestD = Infinity;
-    projectedArtworks.forEach(entry=>{
-      const cx = entry.center?.x ?? ((entry.poly[0].x + entry.poly[1].x + entry.poly[2].x + entry.poly[3].x) / 4);
-      const cy = entry.center?.y ?? ((entry.poly[0].y + entry.poly[1].y + entry.poly[2].y + entry.poly[3].y) / 4);
-      const d = Math.hypot(cx - gx, cy - gy);
-      if(d < bestD){
-        bestD = d;
-        best = entry.art;
-      }
-    });
-    if(best && bestD < Math.min(r.width, r.height) * 0.30) return best;
+  if(zoomed) return zoomed;
+
+  const r = scenePanel.getBoundingClientRect();
+  const gx = preferCenter ? r.width * 0.5 : gaze.x * r.width;
+  const gy = preferCenter ? r.height * 0.5 : gaze.y * r.height;
+  const nearGaze = closestProjectedArtwork(gx, gy, preferCenter ? 0.58 : 0.42);
+  if(nearGaze) return nearGaze;
+  const nearCenter = closestProjectedArtwork(r.width*0.5, r.height*0.54, 0.70);
+  if(nearCenter) return nearCenter;
+  return artworks[1] || artworks[0] || null;
+}
+
+function blinkTarget(){
+  return resolveZoomTarget(false);
+}
+
+function manualZoomIn(source){
+  const target = resolveZoomTarget(false);
+  if(target){
+    zoomInToArtwork(target, source || 'manual_zoom_in', target.id === state.hoveredId ? 0.26 : 0.24);
+    flashBlinkIndicator('＋ zoom manual → "'+target.title+'"');
+  } else {
+    state.zoom.focusTarget = clamp(state.zoom.focusTarget + 0.18, 0, 1);
+    state.zoom.active = state.zoom.focusTarget > 0.01;
+    zoomText.textContent = state.zoom.active ? 'Ativo' : 'Normal';
   }
-  return null;
+}
+
+function manualZoomOut(source){
+  if(state.zoom.focusTarget > 0.01){
+    zoomOutStep(source || 'manual_zoom_out');
+    flashBlinkIndicator('－ zoom manual → afasta');
+  } else {
+    resetZoom();
+  }
 }
 
 function onSingleBlink(){
@@ -1452,23 +1561,49 @@ function drawArtwork(art,highlight){
   const poly=polyPts(art);
   if(!poly||poly.some(p=>!p)) return null;
   const [p0,p1,p2,p3]=poly;
+  const par = parallaxOffsetForArt(art);
 
-  drawPoly(poly,'rgba(70,55,40,.98)', highlight?'rgba(93,173,226,.9)':'rgba(255,255,255,.1)', highlight?2.5:1);
+  const shadow = poly.map(p=>({x:p.x + par.x*0.18, y:p.y + 10 + par.y*0.18, depth:p.depth, scale:p.scale}));
+  drawPoly(shadow,'rgba(0,0,0,.18)', null, 0);
+
+  drawPoly(poly,'rgba(70,55,40,.98)', highlight?'rgba(93,173,226,.92)':'rgba(255,255,255,.10)', highlight?2.6:1.05);
 
   const cx=(p0.x+p1.x+p2.x+p3.x)/4;
   const cy=(p0.y+p1.y+p2.y+p3.y)/4;
   const inner=poly.map(p=>({x:lerp(p.x,cx,.08),y:lerp(p.y,cy,.08)}));
-  const g=ctx.createLinearGradient(inner[0].x,inner[0].y,inner[2].x,inner[2].y);
-  g.addColorStop(0,art.color); g.addColorStop(1,'#0a1525');
-  drawPoly(inner,g, highlight?'rgba(255,255,255,.2)':'rgba(255,255,255,.07)', 1);
+  const floatCfg = state.parallax.artFloaters.find(f=>f.artId===art.id);
+  const drift = floatCfg ? Math.sin(performance.now()*0.0017 + floatCfg.phase) * floatCfg.amp : 0;
+  const artShiftX = par.x * 0.18;
+  const artShiftY = par.y * 0.14 + drift * 120;
+  const innerShifted = inner.map(p=>({x:p.x + artShiftX, y:p.y + artShiftY}));
+  const g=ctx.createLinearGradient(innerShifted[0].x,innerShifted[0].y,innerShifted[2].x,innerShifted[2].y);
+  g.addColorStop(0,art.color);
+  g.addColorStop(0.55,'rgba(255,255,255,.12)');
+  g.addColorStop(1,'#0a1525');
+  drawPoly(innerShifted,g, highlight?'rgba(255,255,255,.26)':'rgba(255,255,255,.08)', 1.15);
+
+  const glare = ctx.createLinearGradient(cx - 80 + par.x*0.3, cy - 40 + par.y*0.25, cx + 110 + par.x*0.3, cy + 55 + par.y*0.25);
+  glare.addColorStop(0,'rgba(255,255,255,0)');
+  glare.addColorStop(0.35,'rgba(255,255,255,'+(highlight?0.18:0.10)+')');
+  glare.addColorStop(0.65,'rgba(255,255,255,0.03)');
+  glare.addColorStop(1,'rgba(255,255,255,0)');
+  drawPoly(inner, glare, null, 0);
+
+  const depthStrip = [
+    {x:lerp(p0.x,cx,0.10), y:lerp(p0.y,cy,0.10)},
+    {x:lerp(p1.x,cx,0.10), y:lerp(p1.y,cy,0.10)},
+    {x:lerp(p1.x,cx,0.24) + par.x*0.08, y:lerp(p1.y,cy,0.24) + par.y*0.08},
+    {x:lerp(p0.x,cx,0.24) + par.x*0.08, y:lerp(p0.y,cy,0.24) + par.y*0.08}
+  ];
+  drawPoly(depthStrip, 'rgba(255,255,255,0.05)', null, 0);
 
   ctx.fillStyle='rgba(255,255,255,.93)';
   ctx.font='bold 13px "Space Grotesk",sans-serif';
   ctx.textAlign='center';
-  ctx.fillText(art.title,cx,cy-4);
+  ctx.fillText(art.title,cx + artShiftX*0.45,cy-4 + artShiftY*0.45);
   ctx.fillStyle='rgba(200,215,255,.75)';
   ctx.font='11.5px "Space Grotesk",sans-serif';
-  ctx.fillText(art.artist,cx,cy+13);
+  ctx.fillText(art.artist,cx + artShiftX*0.45,cy+13 + artShiftY*0.45);
   return {poly, center:{x:cx, y:cy}};
 }
 
@@ -1530,6 +1665,7 @@ function drawRoom(){
     {pts:[[-5,0,10],[5,0,10],[5,4,10],[-5,4,10]],fill:'rgba(14,23,42,.96)',stroke:'rgba(255,255,255,.05)'}
   ];
   surfDefs.forEach(s => drawPoly(s.pts.map(p=>projectPt(...p)), s.fill, s.stroke, 1));
+  drawDepthPanels();
 
   // subtle floor grid
   for(let i=-4;i<=4;i++){
@@ -1578,6 +1714,7 @@ function drawRoom(){
     if(drawn) projectedArtworks.push({art, poly:drawn.poly, center:drawn.center});
   });
   updateFocusInfoCard();
+  drawParallaxForeground(r, gx, gy);
 
   const gPx = {x:gaze.x*r.width, y:gaze.y*r.height};
   ctx.strokeStyle='rgba(255,255,255,.08)';
@@ -1860,11 +1997,24 @@ scenePanel.addEventListener('click', ()=>{
   else if(state.zoom.focusTarget>0) resetZoom();
 });
 
-zoomInBtn.addEventListener('click', ()=>{
-  const target = blinkTarget();
-  if(target) zoomInToArtwork(target, 'manual_zoom_in', 0.22);
-});
-zoomOutBtn.addEventListener('click', ()=> zoomOutStep('manual_zoom_out'));
+function bindPressAction(el, handler){
+  let lastTs = 0;
+  const wrapped = (ev)=>{
+    if(ev){
+      ev.preventDefault();
+      ev.stopPropagation();
+    }
+    const now = Date.now();
+    if(now - lastTs < 180) return;
+    lastTs = now;
+    handler();
+  };
+  el.addEventListener('click', wrapped);
+  el.addEventListener('pointerdown', wrapped);
+}
+
+bindPressAction(zoomInBtn, ()=> manualZoomIn('manual_zoom_in'));
+bindPressAction(zoomOutBtn, ()=> manualZoomOut('manual_zoom_out'));
 
 // ─── BUTTON WIRING ───
 document.getElementById('startBtn').addEventListener('click', startTracking);
@@ -1874,7 +2024,7 @@ document.getElementById('resetHeatBtn').addEventListener('click', clearHeatmap);
 document.getElementById('exportPdfBtn').addEventListener('click', exportPdf);
 invertXBtn.addEventListener('click', ()=>{
   state.tracking.invertX = !state.tracking.invertX;
-  permNote.textContent = state.tracking.invertX ? 'Compensação espelhada ligada: o yaw da cabeça foi invertido para corrigir webcam selfie.' : 'Compensação espelhada desligada: yaw da cabeça no sentido bruto da câmera.';
+  permNote.textContent = state.tracking.invertX ? 'Compensação espelhada ligada: yaw invertido para webcams em modo selfie.' : 'Compensação espelhada desligada: direção direta da cabeça como padrão.';
   resetTrackingState();
   state.tracking.history = [];
   log('Inverter X = '+state.tracking.invertX);
@@ -1929,7 +2079,7 @@ setStatus(true,'Cena carregada');
 window.addEventListener('resize',resizeCanvases);
 video.addEventListener('loadedmetadata', syncVideoOverlaySize);
 requestAnimationFrame(tick);
-log('Sala pronta. Clique em "Iniciar tracking" para usar webcam com direção por pose da cabeça, foco por permanência do olhar e zoom principal por distância do rosto + botões.');
+log('Sala pronta. Clique em "Iniciar tracking" para usar webcam com direção por pose da cabeça, zoom manual corrigido e parallax de profundidade reforçado na galeria.');
 
 })();
 </script>
