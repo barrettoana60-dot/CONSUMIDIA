@@ -3,8 +3,8 @@ import streamlit.components.v1 as components
 
 st.set_page_config(page_title="Sala 3D – Face Tracking Parallax", layout="wide")
 
-st.title("Sala 3D com Face Tracking Robusto")
-st.caption("Cabeça/rosto como navegação principal, malha facial geral com contorno dos olhos, direção por pose da cabeça, blink opcional para zoom e fallback automático para câmera fraca com zoom por distância do rosto.")
+st.title("Sala 3D com Head Tracking + Zoom Híbrido Estável")
+st.caption("Direção principal pela pose da cabeça, foco por permanência do olhar, zoom principal por distância do rosto e botões, com blink apenas como reforço opcional quando a câmera estiver boa.")
 
 HTML_APP = r"""
 <div id="eye-room-root">
@@ -216,8 +216,8 @@ HTML_APP = r"""
 <!-- TOPBAR -->
 <div class="topbar">
   <div class="headline">
-    <h2>Sala 3D – Tracking robusto por cabeça + malha facial</h2>
-    <p><strong>Cabeça/rosto</strong> controlam a direção, a malha facial e o contorno dos olhos dão suporte ao tracking, e o sistema alterna automaticamente entre <strong>modo completo</strong> e <strong>modo câmera fraca</strong>. <strong>1 piscada</strong> afasta. <strong>2 piscadas rápidas</strong> aproximam.</p>
+    <h2>Sala 3D – Pose da cabeça + foco por permanência + zoom híbrido</h2>
+    <p><strong>Cabeça/rosto</strong> controlam a direção, o <strong>foco entra por permanência do olhar</strong>, e o <strong>zoom principal</strong> vem da distância do rosto e dos botões. O blink continua disponível apenas como reforço opcional quando a câmera estiver boa.</p>
   </div>
   <div class="controls">
     <button class="btn primary" id="startBtn">▶ Iniciar tracking</button>
@@ -242,7 +242,7 @@ HTML_APP = r"""
 
       <div class="chip" id="statusChip"><span id="statusDot" class="dot"></span><span id="statusText">Aguardando</span></div>
       <div class="chip" id="modeChip">Modo: <strong id="modeText">Cena ativa</strong></div>
-      <div class="chip" id="blinkChip">👁 Blink: <strong id="blinkText">Pronto</strong></div>
+      <div class="chip" id="blinkChip">🔎 Zoom extra: <strong id="blinkText">Pronto</strong></div>
 
       <div class="meter">
         <div class="label">Dwell-click</div>
@@ -250,7 +250,7 @@ HTML_APP = r"""
       </div>
 
       <div id="blink-indicator">👁 Blink detectado</div>
-      <div id="permission-note">Sala carregada. Clique em "Iniciar tracking". Cabeça controla a direção, a obra entra em foco por permanência do olhar e o sistema ativa ou desativa o blink automaticamente conforme a qualidade da câmera.</div>
+      <div id="permission-note">Sala carregada. Clique em "Iniciar tracking". Cabeça controla a direção, a obra entra em foco por permanência do olhar e o zoom principal responde à distância do rosto e aos botões; o blink entra só como extra quando a câmera estiver boa.</div>
     </div>
   </div>
 
@@ -284,7 +284,7 @@ HTML_APP = r"""
       <h3>Obra em foco</h3>
       <div id="selected-title">Nenhuma obra em foco</div>
       <div id="selected-artist">Olhe para uma obra para ver a ficha. 1 piscada afasta. 2 piscadas aproximam.</div>
-      <div id="selected-description">No modo câmera fraca, o sistema mantém a permanência do olhar e troca o zoom de blink por distância do rosto e botões manuais; no modo híbrido, os dois funcionam juntos.</div>
+      <div id="selected-description">O sistema usa permanência do olhar para foco e mantém o zoom principal por distância do rosto + botões. Em câmera boa, o blink pode entrar como reforço opcional.</div>
     </div>
 
     <div class="card">
@@ -293,7 +293,7 @@ HTML_APP = r"""
         <div class="blink-card">
           <div class="icon">1×</div>
           <div class="bl">1 piscada</div>
-          <div class="desc">Afasta o zoom</div>
+          <div class="desc">Extra opcional: afasta</div>
         </div>
         <div class="blink-card">
           <div class="icon">2×</div>
@@ -310,7 +310,7 @@ HTML_APP = r"""
         <button class="btn primary" id="zoomInBtn">+ Aproximar</button>
         <button class="btn warn" id="zoomOutBtn">− Afastar</button>
       </div>
-      <div class="status-note" id="weakZoomNote">Quando a webcam estiver ruim, o blink é desligado automaticamente e o zoom passa a responder pela distância do rosto e pelos botões.</div>
+      <div class="status-note" id="weakZoomNote">O zoom principal responde pela distância do rosto e pelos botões. Quando a webcam estiver boa, o blink pode reforçar esse zoom.</div>
     </div>
 
     <div class="card">
@@ -399,7 +399,7 @@ const state = {
   sampleIntervalMs:80,
   lastSampleTs:0,
   hoverStartTs:0,
-  dwellMs:950,
+  dwellMs:900,
 
   hoveredId:null,
   selectedId:null,
@@ -456,7 +456,7 @@ const state = {
   },
 
   tracking:{
-    invertX:true,
+    invertX:false,
     history:[],
     historyMax:10,
     baselineReady:false,
@@ -468,11 +468,11 @@ const state = {
       pitch:0,
       size:0.22
     },
-    deadzoneX:0.012,
+    deadzoneX:0.010,
     deadzoneY:0.012,
-    centerGainX:0.38,
+    centerGainX:0.22,
     centerGainY:0.78,
-    yawGainX:1.08,
+    yawGainX:1.34,
     pitchGainY:0.34,
     lastSizeRatio:1,
     sizeVelocity:0,
@@ -484,6 +484,8 @@ const state = {
     weakZoomCooldownUntil:0,
     weakZoomArmed:true,
     lastModeTs:0,
+    lastDistanceZoomTs:0,
+    distanceNeutralFrames:0,
     frameCounter:0
   },
 
@@ -499,12 +501,13 @@ const state = {
     active:false,
     targetId:null,
     focus:0,
-    focusTarget:0
+    focusTarget:0,
+    dwellLevel:0
   }
 };
 
 const modeConfig = {
-  full:{label:'Completo', allowBlink:true, usesFaceDistance:false},
+  full:{label:'Completo', allowBlink:true, usesFaceDistance:true},
   hybrid:{label:'Híbrido', allowBlink:true, usesFaceDistance:true},
   weak:{label:'Câmera fraca', allowBlink:false, usesFaceDistance:true}
 };
@@ -549,15 +552,15 @@ function setTrackingMode(kind){
   const cfg = modeConfig[kind] || modeConfig.full;
   state.tracking.modeKind = kind;
   trackingModeText.textContent = cfg.label;
-  weakZoomNote.textContent = cfg.usesFaceDistance
-    ? (cfg.allowBlink
-        ? 'Modo híbrido: blink continua ativo, mas o zoom também usa distância do rosto e botões como reforço.'
-        : 'Câmera fraca detectada: blink desligado. O zoom responde pela distância do rosto e pelos botões.')
-    : 'Blink ativo. 1 piscada afasta, 2 piscadas rápidas aproximam a obra em foco.';
+  weakZoomNote.textContent = cfg.allowBlink
+    ? 'Zoom principal por distância do rosto + botões. Blink funciona apenas como reforço opcional quando a câmera estiver estável.'
+    : 'Câmera fraca detectada: blink desligado. O zoom continua pela distância do rosto e pelos botões.';
   if(kind === 'weak') {
-    permNote.textContent = 'Câmera fraca detectada: cabeça continua controlando a direção, a obra entra por permanência do olhar e o zoom usa distância do rosto + botões.';
+    permNote.textContent = 'Câmera fraca detectada: a cabeça continua controlando a direção, a obra entra por permanência do olhar e o zoom segue pela distância do rosto + botões.';
+  } else if(kind === 'hybrid') {
+    permNote.textContent = 'Modo híbrido ativo: cabeça controla a direção, foco por permanência do olhar, zoom principal por distância do rosto + botões e blink como reforço opcional.';
   } else {
-    permNote.textContent = 'Tracking ativo. Cabeça controla a direção. 1 piscada afasta e 2 piscadas rápidas aproximam quando a câmera estiver boa; em câmera fraca, o zoom troca automaticamente para distância do rosto + botões.';
+    permNote.textContent = 'Tracking ativo. Cabeça controla a direção, foco por permanência do olhar, e o zoom principal responde à distância do rosto + botões. Blink fica disponível como reforço opcional.';
   }
 }
 
@@ -601,6 +604,8 @@ function resetTrackingState(){
   state.tracking.totalQuality = 0.62;
   state.tracking.weakZoomCooldownUntil = 0;
   state.tracking.weakZoomArmed = true;
+  state.tracking.lastDistanceZoomTs = 0;
+  state.tracking.distanceNeutralFrames = 0;
   state.tracking.baseline = {
     centerX:0.5,
     centerY:0.5,
@@ -608,6 +613,7 @@ function resetTrackingState(){
     pitch:0,
     size:0.22
   };
+  state.zoom.dwellLevel = 0;
   setTrackingMode('full');
 }
 
@@ -959,7 +965,7 @@ function selectArtwork(art,source){
   state.selectedId = art.id;
   updateSelPanel(art);
   if(source === 'dwell'){
-    zoomInToArtwork(art, source || 'select', 0.16);
+    zoomInToArtwork(art, source || 'select', 0.12);
   } else if(source && source.startsWith('manual')){
     zoomInToArtwork(art, source, 0.24);
   } else {
@@ -987,6 +993,7 @@ function resetZoom(){
   state.zoom.active = false;
   state.zoom.targetId = null;
   state.selectedId = null;
+  state.zoom.dwellLevel = 0;
   zoomText.textContent = 'Normal';
   updateSelPanel(state.hoveredId ? artById(state.hoveredId) : null);
 }
@@ -1203,11 +1210,11 @@ function updateTrackingMode(){
   const eyeScore = state.blink.eyeConfidence || 0;
   const stability = clamp(1 - (Math.abs(gaze.targetX - gaze.x) + Math.abs(gaze.targetY - gaze.y)) * 1.8, 0, 1);
   state.tracking.stabilityScore = lerp(state.tracking.stabilityScore, stability, 0.22);
-  const total = 0.30 + 0.20*state.tracking.videoBrightnessScore + 0.18*state.tracking.videoSharpnessScore + 0.18*state.tracking.stabilityScore + 0.14*eyeScore;
+  const total = 0.36 + 0.22*state.tracking.videoBrightnessScore + 0.20*state.tracking.videoSharpnessScore + 0.16*state.tracking.stabilityScore + 0.06*eyeScore;
   state.tracking.totalQuality = lerp(state.tracking.totalQuality, clamp(total, 0, 1), 0.24);
 
   let next = 'weak';
-  if(state.tracking.totalQuality >= 0.78 && eyeScore >= 0.55 && state.tracking.videoSharpnessScore >= 0.24){
+  if(state.tracking.totalQuality >= 0.80 && eyeScore >= 0.56 && state.tracking.videoSharpnessScore >= 0.26){
     next = 'full';
   } else if(state.tracking.totalQuality >= 0.58){
     next = 'hybrid';
@@ -1218,13 +1225,13 @@ function updateTrackingMode(){
     state.tracking.lastModeTs = Date.now();
     if(next === 'weak'){
       flashBlinkIndicator('📷 câmera fraca → zoom por distância do rosto');
-      log('Modo câmera fraca ativado. Blink desativado automaticamente.');
+      log('Modo câmera fraca ativado. Zoom segue por distância do rosto + botões.');
     } else if(next === 'hybrid'){
-      flashBlinkIndicator('🧭 modo híbrido → cabeça + distância + blink opcional');
-      log('Modo híbrido ativado: cabeça principal, zoom por distância e blink opcional.');
+      flashBlinkIndicator('🧭 modo híbrido → cabeça + permanência + distância');
+      log('Modo híbrido ativado: cabeça principal, foco por permanência e zoom principal por distância do rosto.');
     } else {
-      flashBlinkIndicator('👁 blink ativo novamente');
-      log('Blink reativado no modo completo.');
+      flashBlinkIndicator('🔎 zoom híbrido estável ativo');
+      log('Modo completo ativo com zoom principal por distância do rosto e blink como reforço.');
     }
   }
 
@@ -1233,31 +1240,40 @@ function updateTrackingMode(){
   setMode('Webcam · '+modeConfig[state.tracking.modeKind].label);
 }
 
-function processWeakZoom(now){
-  if(state.tracking.modeKind === 'full') return;
-  if(now < state.tracking.weakZoomCooldownUntil) return;
-
+function processDistanceZoom(now){
   const ratio = state.tracking.lastSizeRatio || 1;
   const target = blinkTarget();
-  const zoomInThresh = state.tracking.modeKind === 'weak' ? 1.10 : 1.16;
-  const zoomOutThresh = state.tracking.modeKind === 'weak' ? 0.92 : 0.88;
 
-  if(ratio > zoomInThresh && state.tracking.weakZoomArmed){
-    if(target){
-      zoomInToArtwork(target, state.tracking.modeKind === 'weak' ? 'distancia_rosto_weak' : 'distancia_rosto_hybrid', state.tracking.modeKind === 'weak' ? 0.18 : 0.14);
-      flashBlinkIndicator('↗ rosto aproximou → zoom in');
-    }
-    state.tracking.weakZoomCooldownUntil = now + 620;
-    state.tracking.weakZoomArmed = false;
-  } else if(ratio < zoomOutThresh && !state.tracking.weakZoomArmed){
-    if(state.zoom.focusTarget > 0.02){
-      zoomOutStep(state.tracking.modeKind === 'weak' ? 'distancia_rosto_weak' : 'distancia_rosto_hybrid');
-      flashBlinkIndicator('↘ rosto afastou → zoom out');
-    }
-    state.tracking.weakZoomCooldownUntil = now + 620;
-    state.tracking.weakZoomArmed = true;
-  } else if(ratio > 0.97 && ratio < 1.03 && now >= state.tracking.weakZoomCooldownUntil){
-    state.tracking.weakZoomArmed = true;
+  const inThresh  = state.tracking.modeKind === 'weak' ? 1.08 : (state.tracking.modeKind === 'hybrid' ? 1.11 : 1.14);
+  const outThresh = state.tracking.modeKind === 'weak' ? 0.94 : (state.tracking.modeKind === 'hybrid' ? 0.91 : 0.88);
+  const inCooldown = state.tracking.modeKind === 'weak' ? 620 : 760;
+  const outCooldown = 620;
+
+  const nearNeutral = ratio > 0.98 && ratio < 1.02;
+  state.tracking.distanceNeutralFrames = nearNeutral
+    ? Math.min(12, state.tracking.distanceNeutralFrames + 1)
+    : Math.max(0, state.tracking.distanceNeutralFrames - 1);
+
+  const allowAction = (now - state.tracking.lastDistanceZoomTs) > Math.min(inCooldown, outCooldown);
+
+  if(ratio > inThresh && allowAction && target){
+    zoomInToArtwork(target, 'distancia_rosto', state.tracking.modeKind === 'full' ? 0.16 : 0.18);
+    flashBlinkIndicator('↗ rosto aproximou → zoom in');
+    state.tracking.lastDistanceZoomTs = now;
+    state.tracking.distanceNeutralFrames = 0;
+    return;
+  }
+
+  if(ratio < outThresh && allowAction && state.zoom.focusTarget > 0.02){
+    zoomOutStep('distancia_rosto');
+    flashBlinkIndicator('↘ rosto afastou → zoom out');
+    state.tracking.lastDistanceZoomTs = now;
+    state.tracking.distanceNeutralFrames = 0;
+    return;
+  }
+
+  if(nearNeutral && state.tracking.distanceNeutralFrames >= 6 && state.tracking.baselineReady && state.zoom.focusTarget < 0.08 && state.blink.phase !== 'closed'){
+    state.tracking.baseline.size = lerp(state.tracking.baseline.size, avgHistory('size') || state.tracking.baseline.size, 0.015);
   }
 }
 
@@ -1387,11 +1403,8 @@ function mapFaceTracking(landmarks){
 
   updateTrackingBaseline(m);
 
-  const xBase = state.tracking.invertX ? (1 - m.centerX) : m.centerX;
-  const xRef  = state.tracking.invertX ? (1 - state.tracking.baseline.centerX) : state.tracking.baseline.centerX;
-
   const sample = {
-    x:xBase,
+    x:m.centerX,
     y:m.centerY,
     yaw:m.yaw,
     pitch:m.pitch,
@@ -1405,12 +1418,14 @@ function mapFaceTracking(landmarks){
   const hpitch = avgHistory('pitch');
   const hsize = avgHistory('size');
 
-  const dx = hx - xRef;
+  const dx = hx - state.tracking.baseline.centerX;
   const dy = hy - state.tracking.baseline.centerY;
   const dyaw = hyaw - state.tracking.baseline.yaw;
   const dpitch = hpitch - state.tracking.baseline.pitch;
 
-  let combinedX = dyaw * state.tracking.yawGainX + dx * state.tracking.centerGainX;
+  const dirSign = state.tracking.invertX ? -1 : 1;
+
+  let combinedX = dirSign * (dyaw * state.tracking.yawGainX + dx * state.tracking.centerGainX);
   let combinedY = dy * state.tracking.centerGainY + dpitch * state.tracking.pitchGainY;
 
   combinedX = remapDeadzone(combinedX, state.tracking.deadzoneX);
@@ -1419,14 +1434,14 @@ function mapFaceTracking(landmarks){
   const targetX = clamp(0.5 + combinedX * 0.92 + state.calib.xOff, 0.02, 0.98);
   const targetY = clamp(0.5 + combinedY * 0.86 + state.calib.yOff, 0.02, 0.98);
 
-  gaze.targetX = smoothTowards(gaze.targetX, targetX, 0.07, 0.14);
+  gaze.targetX = smoothTowards(gaze.targetX, targetX, 0.065, 0.13);
   gaze.targetY = smoothTowards(gaze.targetY, targetY, 0.07, 0.14);
 
   const sizeRatio = hsize / Math.max(0.001, state.tracking.baseline.size);
   state.tracking.sizeVelocity = lerp(state.tracking.sizeVelocity, sizeRatio - state.tracking.lastSizeRatio, 0.35);
-  state.tracking.lastSizeRatio = lerp(state.tracking.lastSizeRatio, sizeRatio, 0.24);
+  state.tracking.lastSizeRatio = lerp(state.tracking.lastSizeRatio, sizeRatio, 0.22);
 
-  const sym = 1 - Math.abs(dx * 0.30) - Math.abs(dyaw * 0.18) - Math.abs(hsize - state.tracking.baseline.size) * 0.26;
+  const sym = 1 - Math.abs(dx * 0.18) - Math.abs(dyaw * 0.22) - Math.abs(hsize - state.tracking.baseline.size) * 0.22;
   gaze.quality = clamp(sym, 0.58, 0.99);
 }
 
@@ -1589,13 +1604,18 @@ function updateHoverDwell(now){
         best = entry;
       }
     });
-    if(best && bestD < Math.min(r.width, r.height) * 0.18){
+    if(best && bestD < Math.min(r.width, r.height) * 0.20){
       hit = best;
     }
   }
 
   if(!hit){
-    if(state.hoveredId){ state.hoveredId=null; state.hoverStartTs=now; updateSelPanel(state.selectedId ? artById(state.selectedId) : null); }
+    if(state.hoveredId){
+      state.hoveredId=null;
+      state.hoverStartTs=now;
+      state.zoom.dwellLevel = 0;
+      updateSelPanel(state.selectedId ? artById(state.selectedId) : null);
+    }
     dwellFill.style.width='0%';
     hoverText.textContent='—';
     gazeCursor.style.width='26px'; gazeCursor.style.height='26px';
@@ -1607,6 +1627,7 @@ function updateHoverDwell(now){
   if(state.hoveredId!==hit.art.id){
     state.hoveredId=hit.art.id;
     state.hoverStartTs=now;
+    state.zoom.dwellLevel = 0;
     gazeCursor.style.width='34px'; gazeCursor.style.height='34px';
   }
 
@@ -1615,9 +1636,21 @@ function updateHoverDwell(now){
   dwellFill.style.width=(progress*100).toFixed(1)+'%';
   gazeCursor.style.borderColor=progress>.7?'rgba(46,204,113,.95)':'rgba(93,173,226,.95)';
 
-  if(progress>=1){
+  if(elapsed >= 800 && state.zoom.dwellLevel < 1){
+    state.zoom.dwellLevel = 1;
     selectArtwork(hit.art,'dwell');
-    state.hoverStartTs=now+340;
+    flashBlinkIndicator('🎯 foco travado em "'+hit.art.title+'"');
+  }
+  if(elapsed >= 1400 && state.zoom.dwellLevel < 2){
+    state.zoom.dwellLevel = 2;
+    zoomInToArtwork(hit.art,'dwell_progress_1',0.12);
+    flashBlinkIndicator('🔎 permanência → aproxima');
+  }
+  if(elapsed >= 2100 && state.zoom.dwellLevel < 3){
+    state.zoom.dwellLevel = 3;
+    zoomInToArtwork(hit.art,'dwell_progress_2',0.12);
+    flashBlinkIndicator('🔎 permanência longa → aproxima mais');
+    state.hoverStartTs = now - 1500;
   }
 }
 
@@ -1699,7 +1732,7 @@ async function startTracking(){
       processBlink(lm);
       if((state.tracking.frameCounter++ % 4) === 0) updateVideoQuality();
       updateTrackingMode();
-      processWeakZoom(Date.now());
+      processDistanceZoom(Date.now());
       state.usingMouse=false;
       setStatus(true,'Tracking facial ativo');
     });
@@ -1714,9 +1747,9 @@ async function startTracking(){
     state.rafMedia=requestAnimationFrame(mediaLoop);
     state.usingMouse=false;
     setMode('Webcam');
-    permNote.textContent='Tracking ativo. A direção vem da pose da cabeça; 1 piscada afasta e 2 piscadas rápidas aproximam quando o olho estiver confiável. Em câmera fraca, o zoom cai para distância do rosto + botões.';
+    permNote.textContent='Tracking ativo. A direção vem da pose da cabeça, o foco entra por permanência do olhar e o zoom principal vem da distância do rosto + botões. O blink entra só como reforço quando estiver confiável.';
     setTrackingMode('full');
-    log('Tracking facial iniciado com malha facial, contorno dos olhos, direção por cabeça e fallback automático para câmera fraca.');
+    log('Tracking facial iniciado com malha facial, direção principal por cabeça, foco por permanência e zoom principal por distância do rosto + botões.');
 
   } catch(err){
     state.usingMouse=true;
@@ -1753,12 +1786,15 @@ function calibrate(){
   state.calib.yOff += (0.5 - gaze.targetY) * 0.20;
   state.calib.gainX = 1.00;
   state.calib.gainY = 0.94;
-  if(state.tracking.baselineReady){
-    state.tracking.baseline.size = lerp(state.tracking.baseline.size, state.tracking.lastSizeRatio * state.tracking.baseline.size, 0.2);
-  }
+  state.tracking.history = [];
+  state.tracking.baselineReady = false;
+  state.tracking.baselineFrames = 0;
+  state.tracking.lastDistanceZoomTs = 0;
+  state.tracking.distanceNeutralFrames = 0;
   state.blink.baselineReady = false;
+  state.zoom.dwellLevel = 0;
   calibText.textContent='Concluída';
-  permNote.textContent='Calibração aplicada. A cabeça é o controle principal; se a direção lateral ainda parecer invertida, use o botão “Inverter X”.';
+  permNote.textContent='Calibração aplicada. A cabeça é o controle principal; se a lateral ainda parecer invertida, use o botão “Inverter X”.';
   log('Calibração aplicada. xOff='+state.calib.xOff.toFixed(3)+' yOff='+state.calib.yOff.toFixed(3));
 }
 
@@ -1836,8 +1872,9 @@ document.getElementById('resetHeatBtn').addEventListener('click', clearHeatmap);
 document.getElementById('exportPdfBtn').addEventListener('click', exportPdf);
 invertXBtn.addEventListener('click', ()=>{
   state.tracking.invertX = !state.tracking.invertX;
-  permNote.textContent = state.tracking.invertX ? 'Eixo X invertido manualmente.' : 'Eixo X no modo normal.';
+  permNote.textContent = state.tracking.invertX ? 'Eixo X invertido manualmente: esquerda/direita foram trocadas.' : 'Eixo X no modo normal: yaw da cabeça controla a lateral diretamente.';
   resetTrackingState();
+  state.tracking.history = [];
   log('Inverter X = '+state.tracking.invertX);
 });
 
@@ -1890,7 +1927,7 @@ setStatus(true,'Cena carregada');
 window.addEventListener('resize',resizeCanvases);
 video.addEventListener('loadedmetadata', syncVideoOverlaySize);
 requestAnimationFrame(tick);
-log('Sala pronta. Clique em "Iniciar tracking" para usar webcam com cabeça/rosto como controle principal.');
+log('Sala pronta. Clique em "Iniciar tracking" para usar webcam com direção por pose da cabeça, foco por permanência do olhar e zoom principal por distância do rosto + botões.');
 
 })();
 </script>
