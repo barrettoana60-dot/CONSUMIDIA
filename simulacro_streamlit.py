@@ -1,10 +1,10 @@
 import streamlit as st
 import streamlit.components.v1 as components
 
-st.set_page_config(page_title="Sala 3D – Eye Tracking", layout="wide")
+st.set_page_config(page_title="Sala 3D – Face Tracking", layout="wide")
 
-st.title("Sala 3D com Eye Tracking")
-st.caption("Tracking corrigido: direção natural do olhar, 1 piscar = zoom in, 2 piscadas rápidas = zoom out.")
+st.title("Sala 3D com Face Tracking")
+st.caption("Tracking pelo rosto corrigido: virar o rosto para um lado move para o mesmo lado na tela. 1 piscar = zoom in, 2 piscadas rápidas = zoom out.")
 
 HTML_APP = r"""
 <div id="eye-room-root">
@@ -199,8 +199,8 @@ HTML_APP = r"""
 <!-- TOPBAR -->
 <div class="topbar">
   <div class="headline">
-    <h2>🎨 Sala 3D – Eye Tracking</h2>
-    <p>Tracking corrigido (direção natural). <strong>1 piscar</strong> → zoom na obra em foco &nbsp;|&nbsp; <strong>2 piscadas rápidas (&lt;500ms)</strong> → afasta o zoom.</p>
+    <h2>🎨 Sala 3D – Face Tracking</h2>
+    <p>Tracking pelo rosto corrigido (direção natural). Vire o rosto para a direita e a cena acompanha para a direita. <strong>1 piscar</strong> → zoom na obra em foco &nbsp;|&nbsp; <strong>2 piscadas rápidas (&lt;500ms)</strong> → afasta o zoom.</p>
   </div>
   <div class="controls">
     <button class="btn primary" id="startBtn">▶ Iniciar tracking</button>
@@ -231,7 +231,7 @@ HTML_APP = r"""
       </div>
 
       <div id="blink-indicator">👁 Blink detectado</div>
-      <div id="permission-note">Sala carregada. Clique em "Iniciar tracking" para webcam. Sem câmera, o modo mouse funciona normalmente.</div>
+      <div id="permission-note">Sala carregada. Clique em "Iniciar tracking" para webcam. Nesta versão, virar o rosto para a direita leva o foco para a direita da tela. Sem câmera, o modo mouse funciona normalmente.</div>
     </div>
   </div>
 
@@ -240,7 +240,7 @@ HTML_APP = r"""
     <div class="card">
       <h3>Câmera</h3>
       <video id="video" autoplay playsinline muted></video>
-      <div class="small-note">Câmera espelhada para exibição. O tracking é compensado automaticamente.</div>
+      <div class="small-note">Câmera espelhada para exibição. O tracking pelo rosto compensa o espelhamento automaticamente.</div>
     </div>
 
     <div class="card">
@@ -260,8 +260,8 @@ HTML_APP = r"""
     <div class="card">
       <h3>Obra em foco</h3>
       <div id="selected-title">Nenhuma obra selecionada</div>
-      <div id="selected-artist">Olhe ~1s ou pisque 1× para dar zoom</div>
-      <div id="selected-description">Pise sobre a obra por 1 segundo (dwell) ou pisque uma vez com ela em foco. 2 piscadas rápidas afastam o zoom.</div>
+      <div id="selected-artist">Vire o rosto e mantenha foco ~1s ou pisque 1× para dar zoom</div>
+      <div id="selected-description">Mantenha o foco por 1 segundo (dwell) ou pisque uma vez com a obra em foco. 2 piscadas rápidas afastam o zoom.</div>
     </div>
 
     <div class="card">
@@ -356,7 +356,7 @@ const state = {
   seenIds:new Set(),
 
   // Calibração: depois de calibrar ajusta offsets
-  calib:{ xOff:0, yOff:0, gainX:1.3, gainY:1.2 },
+  calib:{ xOff:0, yOff:0, gainX:1.12, gainY:1.06 },
 
   // ── BLINK STATE (single/double) ──
   blink:{
@@ -549,7 +549,7 @@ function artById(id){ return artworks.find(a=>a.id===id)||null; }
 function updateSelPanel(art){
   if(!art){
     selTitle.textContent='Nenhuma obra selecionada';
-    selArtist.textContent='Olhe ~1s ou pisque 1× para dar zoom';
+    selArtist.textContent='Vire o rosto e mantenha foco ~1s ou pisque 1× para dar zoom';
     selDesc.textContent='A ficha aparece aqui após dwell-click ou blink. 2 piscadas rápidas saem do zoom.';
     return;
   }
@@ -662,55 +662,80 @@ function eyeOpenness(lm,topIdx,botIdx,lIdx,rIdx){
   return vert/Math.max(horiz,1e-6);
 }
 
-// ─── IRIS / GAZE MAPPING ───
-// CORREÇÃO DE INVERSÃO:
-//   MediaPipe retorna landmarks no espaço da imagem original (NÃO espelhada).
-//   O vídeo é exibido com scaleX(-1) (espelho), mas o tracking processa os pixels originais.
-//   Resultado: se o usuário olha para a direita (direita real), a íris se move para
-//   a esquerda na imagem original → lrx pequeno → gaze.x pequeno → cursor vai à esquerda.
-//   Na tela espelhada, a direita do usuário aparece na ESQUERDA → coincide com cursor à esquerda.
-//   PORÉM a câmara do usuário enxerga o oposto: mover olho para direita na tela espelhada
-//   corresponde ao olho indo para a esquerda no feed original.
-//   Solução: INVERTER X para que o cursor siga a direção NATURAL (espelhada) da tela.
-function irisCenter(lm,ids){
-  const pts=ids.map(i=>lm[i]).filter(Boolean);
-  return {x:avgKey(pts,'x'),y:avgKey(pts,'y')};
-}
-
-function eyeBox(lm,ids){
+// ─── FACE TRACKING / HEAD POSE MAPPING ───
+// Nesta versão, o cursor e a navegação da cena passam a seguir o rosto/cabeça,
+// não a posição da íris. Isso reduz a inversão lateral que acontecia em alguns
+// aparelhos por causa do vídeo espelhado.
+// Estratégia:
+// - usa nariz + largura da face + alinhamento dos olhos
+// - compensa o espelhamento do vídeo invertendo X uma única vez
+// - combina translação do rosto com yaw (rotação lateral da cabeça)
+// - aplica zona morta e suavização para reduzir tremedeira
+function faceBox(lm){
+  const ids=[10,152,234,454,93,323,127,356];
   const pts=ids.map(i=>lm[i]).filter(Boolean);
   return {
-    minX:Math.min(...pts.map(p=>p.x)), maxX:Math.max(...pts.map(p=>p.x)),
-    minY:Math.min(...pts.map(p=>p.y)), maxY:Math.max(...pts.map(p=>p.y))
+    minX:Math.min(...pts.map(p=>p.x)),
+    maxX:Math.max(...pts.map(p=>p.x)),
+    minY:Math.min(...pts.map(p=>p.y)),
+    maxY:Math.max(...pts.map(p=>p.y))
   };
 }
 
-function mapGaze(landmarks){
-  const li=irisCenter(landmarks,[468,469,470,471,472]);
-  const ri=irisCenter(landmarks,[473,474,475,476,477]);
-  const le=eyeBox(landmarks,[33,133,159,145,160,144]);
-  const re=eyeBox(landmarks,[362,263,386,374,385,380]);
+function mapFaceTracking(landmarks){
+  const box = faceBox(landmarks);
+  const nose = landmarks[1];
+  const forehead = landmarks[10];
+  const chin = landmarks[152];
+  const leftEyeOuter = landmarks[33];
+  const rightEyeOuter = landmarks[263];
+  const leftTemple = landmarks[234];
+  const rightTemple = landmarks[454];
 
-  // posição relativa da íris dentro de cada olho (0=esq, 1=dir no frame original)
-  const lrxRaw = clamp((li.x-le.minX)/Math.max(.001,le.maxX-le.minX),0,1);
-  const rrxRaw = clamp((ri.x-re.minX)/Math.max(.001,re.maxX-re.minX),0,1);
-  const lry    = clamp((li.y-le.minY)/Math.max(.001,le.maxY-le.minY),0,1);
-  const rry    = clamp((ri.y-re.minY)/Math.max(.001,re.maxY-re.minY),0,1);
+  if(!nose || !forehead || !chin || !leftEyeOuter || !rightEyeOuter || !leftTemple || !rightTemple){
+    return;
+  }
 
-  // ── INVERSÃO DE X ──
-  // Inverte para que o cursor acompanhe o olhar na tela espelhada (comportamento natural)
-  const lrx = 1 - lrxRaw;
-  const rrx = 1 - rrxRaw;
+  const faceW = Math.max(.001, rightTemple.x - leftTemple.x);
+  const faceH = Math.max(.001, chin.y - forehead.y);
 
-  const rawX = ((lrx+rrx)/2 - .5) * state.calib.gainX + .5 + state.calib.xOff;
-  const rawY = ((lry+rry)/2 - .5) * state.calib.gainY + .5 + state.calib.yOff;
+  // posição do nariz dentro da caixa da face (frame original da câmera)
+  const noseXRaw = clamp((nose.x - box.minX) / Math.max(.001, box.maxX - box.minX), 0, 1);
+  const noseYRaw = clamp((nose.y - box.minY) / Math.max(.001, box.maxY - box.minY), 0, 1);
 
-  gaze.targetX = clamp(lerp(gaze.targetX, clamp(rawX,.02,.98), .28), .02, .98);
-  gaze.targetY = clamp(lerp(gaze.targetY, clamp(rawY,.02,.98), .28), .02, .98);
+  // vídeo está espelhado na interface -> inverter X uma única vez
+  const noseXMirrored = 1 - noseXRaw;
 
-  // qualidade baseada na simetria dos olhos
-  const wL=le.maxX-le.minX, wR=re.maxX-re.minX;
-  gaze.quality=clamp(1-Math.abs(wL-wR)*9, .45, .98);
+  // yaw estimado pela diferença entre nariz e centro dos olhos
+  const eyeMidX = (leftEyeOuter.x + rightEyeOuter.x) * 0.5;
+  const yawRaw = (nose.x - eyeMidX) / Math.max(.001, rightEyeOuter.x - leftEyeOuter.x);
+
+  // como o vídeo está espelhado, yaw positivo precisa virar negativo na tela
+  const yawScreen = -yawRaw;
+
+  // pitch estimado pela posição vertical do nariz dentro da face
+  const faceMidY = (forehead.y + chin.y) * 0.5;
+  const pitchRaw = (nose.y - faceMidY) / faceH;
+
+  // combina movimento lateral do rosto com rotação da cabeça
+  let targetX = 0.5 + (noseXMirrored - 0.5) * state.calib.gainX + yawScreen * 0.55 + state.calib.xOff;
+  let targetY = 0.5 + (noseYRaw - 0.5) * state.calib.gainY + pitchRaw * 0.18 + state.calib.yOff;
+
+  // zona morta para reduzir jitter
+  const dx = targetX - 0.5;
+  const dy = targetY - 0.5;
+  if(Math.abs(dx) < 0.018) targetX = 0.5;
+  if(Math.abs(dy) < 0.018) targetY = 0.5;
+
+  // suavização um pouco mais forte
+  targetX = clamp(targetX, .02, .98);
+  targetY = clamp(targetY, .02, .98);
+  gaze.targetX = clamp(lerp(gaze.targetX, targetX, .18), .02, .98);
+  gaze.targetY = clamp(lerp(gaze.targetY, targetY, .18), .02, .98);
+
+  // qualidade baseada em proporção e simetria mínimas
+  const symmetry = 1 - Math.abs((rightEyeOuter.x - eyeMidX) - (eyeMidX - leftEyeOuter.x)) * 8;
+  gaze.quality = clamp(symmetry, .5, .99);
 }
 
 // ─── DRAW ROOM ───
@@ -774,21 +799,12 @@ function drawRoom(){
   }
 
   const f=state.zoom.focus;
-  cam.x     = lerp(gx*1.4,  fx*.2, f);
-  cam.y     = lerp(1.65-gy*.5, fy-.12, f);
-  cam.z     = lerp(-1.4, fz-6.5, f);
-  cam.yaw   = lerp(gx*.55,  fx*.018, f);
-  cam.pitch = lerp(-gy*.16, -.025, f);
-  cam.fov   = lerp(cam.baseFov, cam.baseFov*1.6, f);
-
-  // surfaces
-  const surfaces=[
-    [[-5,0,0],[5,0,0],[5,0,10],[-5,0,10],'rgba(18,30,50,.98)'],  // floor
-    [[-5,4,0],[5,4,0],[5,4,10],[-5,4,10],'rgba(9,16,32,.9)'],   // ceiling
-    [[-5,0,0],[-5,0,10],[-5,4,10],[-5,4,0],'rgba(12,20,38,.94)'], // left
-    [[5,0,0],[5,0,10],[5,4,10],[5,4,0],'rgba(11,19,36,.94)'],    // right
-    [[-5,0,10],[5,0,10],[5,4,10],[-5,4,10],'rgba(14,23,42,.96]'] // back (typo fixed below)
-  ];
+  cam.x     = lerp(gx*0.85,  fx*.18, f);
+  cam.y     = lerp(1.65-gy*.32, fy-.10, f);
+  cam.z     = lerp(-1.4, fz-6.45, f);
+  cam.yaw   = lerp(gx*.34,  fx*.016, f);
+  cam.pitch = lerp(-gy*.11, -.022, f);
+  cam.fov   = lerp(cam.baseFov, cam.baseFov*1.52, f);
 
   const surfDefs=[
     {pts:[[-5,0,0],[5,0,0],[5,0,10],[-5,0,10]],fill:'rgba(18,30,50,.98)',stroke:'rgba(255,255,255,.04)'},
@@ -938,10 +954,10 @@ async function startTracking(){
       if(!results.multiFaceLandmarks?.[0]){
         setStatus(false,'Rosto não encontrado'); gaze.quality=.4; return;
       }
-      mapGaze(results.multiFaceLandmarks[0]);
+      mapFaceTracking(results.multiFaceLandmarks[0]);
       processBlink(results.multiFaceLandmarks[0]);
       state.usingMouse=false;
-      setMode('Webcam'); setStatus(true,'Tracking ativo');
+      setMode('Webcam'); setStatus(true,'Tracking facial ativo');
     });
 
     async function mediaLoop(){
@@ -954,8 +970,8 @@ async function startTracking(){
     state.rafMedia=requestAnimationFrame(mediaLoop);
     state.usingMouse=false;
     setMode('Webcam');
-    permNote.textContent='Tracking ativo! 1 piscar = zoom · 2 piscadas rápidas = afasta.';
-    log('Tracking ocular iniciado.');
+    permNote.textContent='Tracking facial ativo. 1 piscar = aproxima · 2 piscadas rápidas = afasta.';
+    log('Tracking facial iniciado.');
 
   } catch(err){
     state.usingMouse=true;
@@ -987,9 +1003,9 @@ function calibrate(){
     log('Calibração não necessária no modo mouse.');
     return;
   }
-  state.calib.xOff += (.5-gaze.targetX)*.4;
-  state.calib.yOff += (.5-gaze.targetY)*.4;
-  state.calib.gainX=1.35; state.calib.gainY=1.25;
+  state.calib.xOff += (.5-gaze.targetX)*.28;
+  state.calib.yOff += (.5-gaze.targetY)*.28;
+  state.calib.gainX=1.12; state.calib.gainY=1.06;
   calibText.textContent='Concluída';
   permNote.textContent='Calibração aplicada. Foque no centro da tela e recalibre se necessário.';
   log('Calibração aplicada. xOff='+state.calib.xOff.toFixed(3)+' yOff='+state.calib.yOff.toFixed(3));
@@ -1102,12 +1118,12 @@ function tick(now){
 resizeCanvases();
 buildList();
 updateSelPanel(null);
-setMode('Cena ativa');
+setMode('Face tracking pronto');
 setBlink('Pronto');
 setStatus(true,'Cena carregada');
 window.addEventListener('resize',resizeCanvases);
 requestAnimationFrame(tick);
-log('Sala pronta. Clique em "Iniciar tracking" para usar webcam.');
+log('Sala pronta. Clique em "Iniciar tracking" para usar webcam com tracking pelo rosto.');
 
 })();
 </script>
