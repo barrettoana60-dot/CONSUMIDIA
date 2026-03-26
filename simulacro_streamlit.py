@@ -4,7 +4,7 @@ import streamlit.components.v1 as components
 st.set_page_config(page_title="Sala 3D – Face Tracking Parallax", layout="wide")
 
 st.title("Sala 3D com Face Tracking + Parallax")
-st.caption("Tracking facial mais estável, blink recalibrado de forma adaptativa e efeito de parallax com profundidade. 1 piscar aproxima, 2 piscadas rápidas afastam.")
+st.caption("Tracking facial mais estável, blink recalibrado de forma adaptativa e efeito de parallax com profundidade. 1 piscar aproxima, 2 piscadas rápidas afastam. A piscada agora usa detecção adaptativa e resolução pendente mais confiável.")
 
 HTML_APP = r"""
 <div id="eye-room-root">
@@ -382,22 +382,25 @@ const state = {
     closed:false,
     closeTs:0,
     ema:0.27,
+    emaFast:0.27,
     baseline:0.27,
     baselineReady:false,
-    minBaseline:0.20,
-    maxBaseline:0.42,
-    closeRatio:0.66,
-    openRatio:0.82,
-    threshClose:0.16,
-    threshOpen:0.21,
-    minMs:45,
-    maxMs:420,
-    holdFrames:0,
-    minHoldFrames:2,
-    history:[],
-    singleTimer:null,
-    singleDelayMs:300,
-    doubleWindowMs:560,
+    minBaseline:0.18,
+    maxBaseline:0.40,
+    closeRatio:0.78,
+    openRatio:0.90,
+    threshClose:0.18,
+    threshOpen:0.23,
+    minMs:55,
+    maxMs:360,
+    closedFrames:0,
+    openFrames:0,
+    minClosedFrames:2,
+    minOpenFrames:2,
+    pendingCount:0,
+    pendingUntil:0,
+    singleWindowMs:320,
+    doubleWindowMs:520,
     debugLast:'init'
   },
 
@@ -504,13 +507,6 @@ function smoothTowards(curr, target, nearA, farA){
   const d = Math.abs(target - curr);
   const a = d > 0.08 ? farA : nearA;
   return lerp(curr, target, a);
-}
-
-function clearNodeTimer(obj, key){
-  if(obj[key]){
-    clearTimeout(obj[key]);
-    obj[key] = null;
-  }
 }
 
 function pushTrackingHistory(sample){
@@ -819,48 +815,78 @@ function resetZoom(){
   updateSelPanel(null);
 }
 
-function onSingleBlink(){
+function blinkTarget(){
   const hovered = artById(state.hoveredId);
   const selected = artById(state.selectedId);
-  const target = hovered || selected;
+  if(hovered) return hovered;
+  if(selected) return selected;
+
+  // fallback: usa a obra mais próxima do cursor atual
+  if(projectedArtworks && projectedArtworks.length){
+    const r = scenePanel.getBoundingClientRect();
+    const gx = gaze.x * r.width;
+    const gy = gaze.y * r.height;
+    let best = null;
+    let bestD = Infinity;
+    projectedArtworks.forEach(entry=>{
+      const poly = entry.poly;
+      const cx = (poly[0].x + poly[1].x + poly[2].x + poly[3].x) / 4;
+      const cy = (poly[0].y + poly[1].y + poly[2].y + poly[3].y) / 4;
+      const d = Math.hypot(cx - gx, cy - gy);
+      if(d < bestD){
+        bestD = d;
+        best = entry.art;
+      }
+    });
+    if(best && bestD < Math.min(r.width, r.height) * 0.26) return best;
+  }
+  return null;
+}
+
+function onSingleBlink(){
+  const target = blinkTarget();
   if(target){
-    zoomInToArtwork(target, 'single_blink', hovered ? 0.34 : 0.26);
+    zoomInToArtwork(target, 'single_blink', target.id === state.hoveredId ? 0.34 : 0.28);
     flashBlinkIndicator('👁 1 piscar → aproxima "'+target.title+'"');
+    log('Single blink → aproxima ' + target.title);
   } else {
     flashBlinkIndicator('👁 1 piscar sem obra em foco');
-    log('Single blink sem obra em foco');
+    log('Single blink sem alvo útil');
   }
 }
 
 function onDoubleBlink(){
   zoomOutStep('double_blink');
   flashBlinkIndicator('👁👁 2 piscadas → afasta');
+  log('Double blink → afasta');
 }
 
 function registerBlink(now){
-  state.blink.history = state.blink.history.filter(ts => now - ts < state.blink.doubleWindowMs);
-  state.blink.history.push(now);
-  clearNodeTimer(state.blink, 'singleTimer');
-
-  if(state.blink.history.length >= 2){
-    const prev = state.blink.history[state.blink.history.length - 2];
-    if(now - prev < state.blink.doubleWindowMs){
-      state.blink.history = [];
-      state.blink.debugLast = 'double';
-      onDoubleBlink();
-      setBlink('2x');
-      return;
-    }
+  // primeiro blink fica pendente um curto intervalo;
+  // se vier o segundo dentro da janela, vira blink duplo.
+  if(state.blink.pendingCount === 1 && now <= state.blink.pendingUntil){
+    state.blink.pendingCount = 0;
+    state.blink.pendingUntil = 0;
+    state.blink.debugLast = 'double';
+    setBlink('2x');
+    onDoubleBlink();
+    return;
   }
 
-  state.blink.singleTimer = setTimeout(()=>{
-    if(state.blink.history.length === 1){
-      state.blink.debugLast = 'single';
-      onSingleBlink();
-      setBlink('1x');
-    }
-    state.blink.history = [];
-  }, state.blink.singleDelayMs);
+  state.blink.pendingCount = 1;
+  state.blink.pendingUntil = now + state.blink.doubleWindowMs;
+  state.blink.debugLast = 'pending_single';
+  setBlink('1?');
+}
+
+function resolvePendingBlink(now){
+  if(state.blink.pendingCount === 1 && now > state.blink.pendingUntil){
+    state.blink.pendingCount = 0;
+    state.blink.pendingUntil = 0;
+    state.blink.debugLast = 'single';
+    setBlink('1x');
+    onSingleBlink();
+  }
 }
 
 function eyeOpenness(lm,topIdx,botIdx,lIdx,rIdx){
@@ -871,58 +897,64 @@ function eyeOpenness(lm,topIdx,botIdx,lIdx,rIdx){
 }
 
 function processBlink(landmarks){
-  const eo = eyeOpenness;
-  const leftOpen  = eo(landmarks,159,145,33,133);
-  const rightOpen = eo(landmarks,386,374,362,263);
+  const leftOpen  = eyeOpenness(landmarks,159,145,33,133);
+  const rightOpen = eyeOpenness(landmarks,386,374,362,263);
 
-  // usa o olho mais "aberto" para reduzir falso positivo por ruído de um lado
-  const rawOpen = Math.max(leftOpen, rightOpen);
-  state.blink.ema = lerp(state.blink.ema, rawOpen, 0.34);
+  // média ponderada ajuda mais no piscar bilateral do que usar só o olho "mais aberto"
+  const rawAvg = (leftOpen + rightOpen) / 2;
+  const rawMin = Math.min(leftOpen, rightOpen);
+  const rawOpen = rawAvg * 0.75 + rawMin * 0.25;
+  const now = Date.now();
 
-  // baseline adaptativa: só sobe/ajusta quando o olho está claramente aberto
+  state.blink.emaFast = lerp(state.blink.emaFast, rawOpen, 0.46);
+  state.blink.ema = lerp(state.blink.ema, rawOpen, 0.22);
+
   if(!state.blink.closed){
     if(!state.blink.baselineReady){
       state.blink.baseline = lerp(state.blink.baseline, state.blink.ema, 0.08);
-      if(Math.abs(state.blink.baseline - state.blink.ema) < 0.015){
+      if(Math.abs(state.blink.baseline - state.blink.ema) < 0.012){
         state.blink.baselineReady = true;
       }
-    } else if(state.blink.ema > state.blink.baseline * 0.9){
+    } else if(state.blink.ema > state.blink.baseline * 0.82){
       state.blink.baseline = lerp(
         state.blink.baseline,
         clamp(state.blink.ema, state.blink.minBaseline, state.blink.maxBaseline),
-        0.02
+        0.025
       );
     }
   }
 
   const baseline = clamp(state.blink.baseline, state.blink.minBaseline, state.blink.maxBaseline);
-  const closeThresh = clamp(baseline * state.blink.closeRatio, 0.11, 0.24);
-  const openThresh  = clamp(baseline * state.blink.openRatio,  0.15, 0.32);
+  const closeThresh = clamp(baseline * state.blink.closeRatio, 0.14, 0.28);
+  const openThresh  = clamp(baseline * state.blink.openRatio,  0.18, 0.34);
   state.blink.threshClose = closeThresh;
   state.blink.threshOpen = openThresh;
 
-  const openness = state.blink.ema;
-  const now = Date.now();
+  const openness = Math.min(state.blink.emaFast, state.blink.ema * 1.04);
 
   if(openness < closeThresh){
-    state.blink.holdFrames += 1;
-  } else if(!state.blink.closed) {
-    state.blink.holdFrames = 0;
+    state.blink.closedFrames += 1;
+    state.blink.openFrames = 0;
+  } else if(openness > openThresh){
+    state.blink.openFrames += 1;
+    if(!state.blink.closed) state.blink.closedFrames = 0;
   }
 
-  if(openness < closeThresh && !state.blink.closed && state.blink.holdFrames >= state.blink.minHoldFrames){
+  if(!state.blink.closed && state.blink.closedFrames >= state.blink.minClosedFrames){
     state.blink.closed = true;
     state.blink.closeTs = now;
     state.blink.debugLast = 'closed';
     setBlink('Fechado');
     gazeCursor.style.borderColor = 'rgba(243,156,18,.9)';
-  } else if(openness > openThresh && state.blink.closed){
+  } else if(state.blink.closed && state.blink.openFrames >= state.blink.minOpenFrames){
     const dur = now - state.blink.closeTs;
     state.blink.closed = false;
-    state.blink.holdFrames = 0;
+    state.blink.closedFrames = 0;
+    state.blink.openFrames = 0;
     state.blink.debugLast = 'open';
     setBlink('Aberto');
     gazeCursor.style.borderColor = 'rgba(255,255,255,.92)';
+
     if(dur >= state.blink.minMs && dur <= state.blink.maxMs){
       registerBlink(now);
     } else {
@@ -1453,6 +1485,7 @@ function tick(now){
   updateCursor();
   drawRoom();
   drawReveal();
+  resolvePendingBlink(Date.now());
   if(state.running||state.usingMouse){
     updateHoverDwell(now);
     const t=Date.now();
