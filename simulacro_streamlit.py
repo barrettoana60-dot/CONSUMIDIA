@@ -419,11 +419,11 @@ const state = {
     pendingSingleTs:0,
     pendingSingleTimer:null,
     lastBlinkDuration:0,
-    doubleWindowMs:520,
-    cooldownMs:120,
+    doubleWindowMs:760,
+    cooldownMs:70,
     cooldownUntil:0,
     rearmUntil:0,
-    minInterBlinkMs:140,
+    minInterBlinkMs:85,
     minClosureDelta:0.20,
     minClosedRatio:0.69,
     minDuringBlink:1,
@@ -970,42 +970,55 @@ function queueSingleBlink(now){
   state.blink.pendingSingleTs = now;
   state.blink.pendingSingleTimer = setTimeout(()=>{
     commitPendingSingleBlink();
-  }, state.blink.doubleWindowMs + 32);
+  }, state.blink.doubleWindowMs + 48);
 }
 
 function registerBlink(now){
-  if(now < state.blink.cooldownUntil){
-    state.blink.debugLast = 'cooldown';
-    return;
-  }
+  const pendingDelta = state.blink.pendingSingleTs ? (now - state.blink.pendingSingleTs) : Infinity;
+  const sinceLastBlink = state.blink.lastBlinkTs ? (now - state.blink.lastBlinkTs) : Infinity;
+  const sinceLastEvent = state.blink.lastEventTs ? (now - state.blink.lastEventTs) : Infinity;
 
-  if(state.blink.lastEventTs && (now - state.blink.lastEventTs) < 70){
-    state.blink.debugLast = 'debounced';
-    return;
-  }
-
-  if(state.blink.lastBlinkTs && (now - state.blink.lastBlinkTs) < state.blink.minInterBlinkMs){
-    state.blink.debugLast = 'too_fast';
-    return;
-  }
-
-  state.blink.lastEventTs = now;
-  state.blink.cooldownUntil = now + state.blink.cooldownMs;
-
-  if(state.blink.pendingSingleTs && (now - state.blink.pendingSingleTs) <= state.blink.doubleWindowMs){
+  // Primeiro tenta resolver duplo blink. Antes o cooldown barrava esse caminho.
+  if(state.blink.pendingSingleTs && pendingDelta <= state.blink.doubleWindowMs){
+    if(sinceLastEvent < 45){
+      state.blink.debugLast = 'double_debounced';
+      return;
+    }
+    if(sinceLastBlink < Math.max(55, state.blink.minInterBlinkMs * 0.72)){
+      state.blink.debugLast = 'double_too_fast';
+      return;
+    }
     if(state.blink.pendingSingleTimer){
       clearTimeout(state.blink.pendingSingleTimer);
       state.blink.pendingSingleTimer = null;
     }
     state.blink.pendingSingleTs = 0;
     state.blink.lastBlinkTs = now;
-    state.blink.cooldownUntil = now + 150;
+    state.blink.lastEventTs = now;
+    state.blink.cooldownUntil = now + 90;
     state.blink.debugLast = 'double';
     setBlink('2x');
     onDoubleBlink();
     return;
   }
 
+  if(now < state.blink.cooldownUntil){
+    state.blink.debugLast = 'cooldown';
+    return;
+  }
+
+  if(sinceLastEvent < 55){
+    state.blink.debugLast = 'debounced';
+    return;
+  }
+
+  if(sinceLastBlink < state.blink.minInterBlinkMs){
+    state.blink.debugLast = 'too_fast';
+    return;
+  }
+
+  state.blink.lastEventTs = now;
+  state.blink.cooldownUntil = now + state.blink.cooldownMs;
   state.blink.lastBlinkTs = now;
   state.blink.debugLast = 'single_pending';
   setBlink('1x?');
@@ -1226,7 +1239,7 @@ function processBlink(landmarks){
     state.blink.closedFrames = 0;
     state.blink.openFrames = 0;
     state.blink.lastBlinkDuration = dur;
-    state.blink.rearmUntil = now + 95;
+    state.blink.rearmUntil = now + 55;
     state.blink.stableOpenFrames = Math.max(state.blink.stableOpenFrames, 2);
     setBlink('Aberto');
     gazeCursor.style.borderColor = 'rgba(255,255,255,.92)';
