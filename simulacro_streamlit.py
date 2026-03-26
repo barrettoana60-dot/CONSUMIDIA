@@ -4,7 +4,7 @@ import streamlit.components.v1 as components
 st.set_page_config(page_title="Sala 3D – Face Tracking Parallax", layout="wide")
 
 st.title("Sala 3D com Face Tracking + Parallax")
-st.caption("Tracking facial mais estável, blink recalibrado de forma adaptativa e efeito de parallax com profundidade. 1 piscar aproxima, 2 piscadas rápidas afastam. A piscada agora usa detecção adaptativa e resolução pendente mais confiável.")
+st.caption("Tracking facial com eixo lateral corrigido, blink recalibrado com janela curta e zoom por piscadas. 1 piscar aproxima, 2 piscadas rápidas afastam.")
 
 HTML_APP = r"""
 <div id="eye-room-root">
@@ -385,22 +385,25 @@ const state = {
     emaFast:0.27,
     baseline:0.27,
     baselineReady:false,
-    minBaseline:0.18,
-    maxBaseline:0.40,
-    closeRatio:0.80,
-    openRatio:0.92,
+    minBaseline:0.16,
+    maxBaseline:0.42,
+    closeRatio:0.73,
+    openRatio:0.86,
     threshClose:0.18,
     threshOpen:0.23,
     minMs:45,
-    maxMs:420,
+    maxMs:380,
     closedFrames:0,
     openFrames:0,
-    minClosedFrames:1,
-    minOpenFrames:1,
-    lastBlinkTs:0,
-    doubleWindowMs:520,
-    cooldownMs:170,
+    minClosedFrames:2,
+    minOpenFrames:2,
+    awaitingSecond:false,
+    firstBlinkTs:0,
+    singleDelayMs:150,
+    doubleWindowMs:430,
+    cooldownMs:130,
     cooldownUntil:0,
+    singleTimer:null,
     debugLast:'init'
   },
 
@@ -417,12 +420,12 @@ const state = {
       pitch:0,
       size:0.22
     },
-    deadzoneX:0.016,
-    deadzoneY:0.014,
-    centerGainX:1.18,
-    centerGainY:0.92,
-    yawGainX:0.62,
-    pitchGainY:0.18
+    deadzoneX:0.013,
+    deadzoneY:0.012,
+    centerGainX:1.36,
+    centerGainY:0.98,
+    yawGainX:0.14,
+    pitchGainY:0.10
   },
 
   parallax:{
@@ -867,21 +870,34 @@ function registerBlink(now){
     return;
   }
 
-  const delta = state.blink.lastBlinkTs ? (now - state.blink.lastBlinkTs) : Infinity;
-  state.blink.cooldownUntil = now + state.blink.cooldownMs;
-
-  if(delta <= state.blink.doubleWindowMs){
+  if(state.blink.awaitingSecond && (now - state.blink.firstBlinkTs) <= state.blink.doubleWindowMs){
+    clearTimeout(state.blink.singleTimer);
+    state.blink.singleTimer = null;
+    state.blink.awaitingSecond = false;
+    state.blink.firstBlinkTs = 0;
+    state.blink.cooldownUntil = now + state.blink.cooldownMs;
     state.blink.debugLast = 'double';
-    state.blink.lastBlinkTs = 0;
     setBlink('2x');
     onDoubleBlink();
     return;
   }
 
-  state.blink.debugLast = 'single';
-  state.blink.lastBlinkTs = now;
-  setBlink('1x');
-  onSingleBlink();
+  state.blink.awaitingSecond = true;
+  state.blink.firstBlinkTs = now;
+  state.blink.cooldownUntil = now + state.blink.cooldownMs;
+  state.blink.debugLast = 'armed_single';
+  setBlink('1?');
+
+  clearTimeout(state.blink.singleTimer);
+  state.blink.singleTimer = setTimeout(()=>{
+    if(!state.blink.awaitingSecond) return;
+    state.blink.awaitingSecond = false;
+    state.blink.firstBlinkTs = 0;
+    state.blink.singleTimer = null;
+    state.blink.debugLast = 'single';
+    setBlink('1x');
+    onSingleBlink();
+  }, state.blink.singleDelayMs);
 }
 
 function eyeOpenness(lm,topIdx,botIdx,lIdx,rIdx){
@@ -895,42 +911,41 @@ function processBlink(landmarks){
   const leftOpen  = eyeOpenness(landmarks,159,145,33,133);
   const rightOpen = eyeOpenness(landmarks,386,374,362,263);
 
-  // média ponderada ajuda mais no piscar bilateral do que usar só o olho "mais aberto"
-  const rawAvg = (leftOpen + rightOpen) / 2;
+  const rawAvg = (leftOpen + rightOpen) * 0.5;
   const rawMin = Math.min(leftOpen, rightOpen);
-  const rawOpen = rawAvg * 0.75 + rawMin * 0.25;
+  const rawOpen = rawAvg * 0.55 + rawMin * 0.45;
   const now = Date.now();
 
-  state.blink.emaFast = lerp(state.blink.emaFast, rawOpen, 0.46);
-  state.blink.ema = lerp(state.blink.ema, rawOpen, 0.22);
+  state.blink.emaFast = lerp(state.blink.emaFast, rawOpen, 0.55);
+  state.blink.ema = lerp(state.blink.ema, rawOpen, 0.24);
 
   if(!state.blink.closed){
     if(!state.blink.baselineReady){
-      state.blink.baseline = lerp(state.blink.baseline, state.blink.ema, 0.08);
-      if(Math.abs(state.blink.baseline - state.blink.ema) < 0.012){
+      state.blink.baseline = lerp(state.blink.baseline, state.blink.ema, 0.10);
+      if(Math.abs(state.blink.baseline - state.blink.ema) < 0.010){
         state.blink.baselineReady = true;
       }
-    } else if(state.blink.ema > state.blink.baseline * 0.82){
+    } else if(state.blink.ema > state.blink.baseline * 0.80){
       state.blink.baseline = lerp(
         state.blink.baseline,
         clamp(state.blink.ema, state.blink.minBaseline, state.blink.maxBaseline),
-        0.025
+        0.022
       );
     }
   }
 
   const baseline = clamp(state.blink.baseline, state.blink.minBaseline, state.blink.maxBaseline);
-  const closeThresh = clamp(baseline * state.blink.closeRatio, 0.14, 0.28);
-  const openThresh  = clamp(baseline * state.blink.openRatio,  0.18, 0.34);
+  const closeThresh = clamp(baseline * state.blink.closeRatio, 0.11, 0.24);
+  const openThresh  = clamp(baseline * state.blink.openRatio,  0.15, 0.30);
   state.blink.threshClose = closeThresh;
   state.blink.threshOpen = openThresh;
 
-  const openness = Math.min(state.blink.emaFast, state.blink.ema * 1.04);
+  const openness = Math.min(state.blink.emaFast, state.blink.ema * 1.05);
 
-  if(openness < closeThresh){
+  if(openness <= closeThresh){
     state.blink.closedFrames += 1;
     state.blink.openFrames = 0;
-  } else if(openness > openThresh){
+  } else if(openness >= openThresh){
     state.blink.openFrames += 1;
     if(!state.blink.closed) state.blink.closedFrames = 0;
   }
@@ -995,23 +1010,28 @@ function faceMetrics(lm){
   }
 
   const eyeMidX = (leftEyeOuter.x + rightEyeOuter.x) * 0.5;
+  const eyeMidY = (leftEyeOuter.y + rightEyeOuter.y) * 0.5;
   const faceWidth = Math.max(0.001, rightCheek.x - leftCheek.x);
   const faceHeight = Math.max(0.001, chin.y - forehead.y);
+  const boxW = Math.max(0.001, box.maxX - box.minX);
+  const boxH = Math.max(0.001, box.maxY - box.minY);
 
-  const centerRawX = clamp(((nose.x * 0.62 + eyeMidX * 0.38) - box.minX) / Math.max(0.001, box.maxX - box.minX), 0, 1);
-  const centerRawY = clamp(((nose.y * 0.66 + ((mouthTop.y + mouthBot.y) * 0.5) * 0.34) - box.minY) / Math.max(0.001, box.maxY - box.minY), 0, 1);
-  const centerMirroredX = 1 - centerRawX;
+  const noseMixX = nose.x * 0.84 + eyeMidX * 0.16;
+  const noseMixY = nose.y * 0.72 + ((mouthTop.y + mouthBot.y) * 0.5) * 0.18 + eyeMidY * 0.10;
 
-  const yawRaw = (nose.x - eyeMidX) / Math.max(0.001, rightEyeOuter.x - leftEyeOuter.x);
+  const centerRawX = clamp((noseMixX - box.minX) / boxW, 0, 1);
+  const centerRawY = clamp((noseMixY - box.minY) / boxH, 0, 1);
+  const centerDisplayX = 1 - centerRawX;
+
+  const yawRaw = clamp((nose.x - eyeMidX) / Math.max(0.001, rightEyeOuter.x - leftEyeOuter.x), -0.35, 0.35);
   const faceMidY = (forehead.y + chin.y) * 0.5;
-  const pitchRaw = (nose.y - faceMidY) / faceHeight;
+  const pitchRaw = clamp((nose.y - faceMidY) / faceHeight, -0.35, 0.35);
   const sizeRaw = faceWidth;
 
   return {
-    centerRawX,
-    centerMirroredX,
+    centerDisplayX,
     centerY:centerRawY,
-    yaw:-yawRaw, // compensa o espelhamento da visualização
+    yaw:yawRaw,
     pitch:pitchRaw,
     size:sizeRaw
   };
@@ -1022,7 +1042,7 @@ function updateTrackingBaseline(m){
   if(!state.tracking.baselineReady){
     state.tracking.baselineFrames += 1;
     const t = Math.min(1, state.tracking.baselineFrames / 20);
-    b.centerX = lerp(b.centerX, m.centerMirroredX, 0.18 * t);
+    b.centerX = lerp(b.centerX, m.centerDisplayX, 0.18 * t);
     b.centerY = lerp(b.centerY, m.centerY, 0.18 * t);
     b.yaw     = lerp(b.yaw,     m.yaw,     0.18 * t);
     b.pitch   = lerp(b.pitch,   m.pitch,   0.18 * t);
@@ -1036,9 +1056,9 @@ function updateTrackingBaseline(m){
   }
 
   // adaptação lenta quando usuário fica relativamente estável
-  const stableCenter = Math.abs(m.centerMirroredX - b.centerX) < 0.06 && Math.abs(m.centerY - b.centerY) < 0.06;
+  const stableCenter = Math.abs(m.centerDisplayX - b.centerX) < 0.06 && Math.abs(m.centerY - b.centerY) < 0.06;
   if(stableCenter && !state.blink.closed){
-    b.centerX = lerp(b.centerX, m.centerMirroredX, 0.008);
+    b.centerX = lerp(b.centerX, m.centerDisplayX, 0.008);
     b.centerY = lerp(b.centerY, m.centerY, 0.008);
     b.yaw     = lerp(b.yaw,     m.yaw,     0.010);
     b.pitch   = lerp(b.pitch,   m.pitch,   0.010);
@@ -1052,13 +1072,15 @@ function mapFaceTracking(landmarks){
 
   updateTrackingBaseline(m);
 
-  const xBase = state.tracking.invertX ? (1 - m.centerMirroredX) : m.centerMirroredX;
+  const xBase = state.tracking.invertX ? (1 - m.centerDisplayX) : m.centerDisplayX;
   const xRef  = state.tracking.invertX ? (1 - state.tracking.baseline.centerX) : state.tracking.baseline.centerX;
+  const yawBase = state.tracking.invertX ? -m.yaw : m.yaw;
+  const yawRef  = state.tracking.invertX ? -state.tracking.baseline.yaw : state.tracking.baseline.yaw;
 
   const sample = {
     x:xBase,
     y:m.centerY,
-    yaw:m.yaw,
+    yaw:yawBase,
     pitch:m.pitch,
     size:m.size
   };
@@ -1072,7 +1094,7 @@ function mapFaceTracking(landmarks){
 
   const dx = hx - xRef;
   const dy = hy - state.tracking.baseline.centerY;
-  const dyaw = hyaw - state.tracking.baseline.yaw;
+  const dyaw = hyaw - yawRef;
   const dpitch = hpitch - state.tracking.baseline.pitch;
 
   let combinedX = dx * state.tracking.centerGainX + dyaw * state.tracking.yawGainX;
@@ -1081,14 +1103,14 @@ function mapFaceTracking(landmarks){
   combinedX = remapDeadzone(combinedX, state.tracking.deadzoneX);
   combinedY = remapDeadzone(combinedY, state.tracking.deadzoneY);
 
-  const targetX = clamp(0.5 + combinedX * 0.88 + state.calib.xOff, 0.02, 0.98);
-  const targetY = clamp(0.5 + combinedY * 0.82 + state.calib.yOff, 0.02, 0.98);
+  const targetX = clamp(0.5 + combinedX * 0.94 + state.calib.xOff, 0.02, 0.98);
+  const targetY = clamp(0.5 + combinedY * 0.86 + state.calib.yOff, 0.02, 0.98);
 
-  gaze.targetX = smoothTowards(gaze.targetX, targetX, 0.08, 0.16);
-  gaze.targetY = smoothTowards(gaze.targetY, targetY, 0.08, 0.16);
+  gaze.targetX = smoothTowards(gaze.targetX, targetX, 0.12, 0.20);
+  gaze.targetY = smoothTowards(gaze.targetY, targetY, 0.10, 0.18);
 
-  const sym = 1 - Math.abs(dx * 0.8) - Math.abs(dyaw * 0.25) - Math.abs(hsize - state.tracking.baseline.size) * 0.4;
-  gaze.quality = clamp(sym, 0.56, 0.99);
+  const sym = 1 - Math.abs(dx * 0.55) - Math.abs(dy * 0.45) - Math.abs(hsize - state.tracking.baseline.size) * 0.25;
+  gaze.quality = clamp(sym, 0.60, 0.99);
 }
 
 // ─── DRAW ROOM ───
@@ -1295,6 +1317,15 @@ async function startTracking(){
   log('Iniciando tracking…');
   state.startedAt=state.startedAt||Date.now();
   state.running=true;
+  state.tracking.history = [];
+  state.tracking.baselineReady = false;
+  state.tracking.baselineFrames = 0;
+  state.blink.baselineReady = false;
+  state.blink.awaitingSecond = false;
+  state.blink.firstBlinkTs = 0;
+  state.blink.cooldownUntil = 0;
+  clearTimeout(state.blink.singleTimer);
+  state.blink.singleTimer = null;
   setStatus(false,'Preparando…');
   permNote.textContent='Tentando webcam + MediaPipe FaceMesh…';
 
@@ -1359,19 +1390,19 @@ async function startTracking(){
 
 function stopTracking(){
   state.running=false;
+  clearTimeout(state.blink.singleTimer);
+  state.blink.singleTimer = null;
+  state.blink.awaitingSecond = false;
+  state.blink.firstBlinkTs = 0;
+  state.blink.cooldownUntil = 0;
   state.blink.closed = false;
-  state.blink.closeTs = 0;
   state.blink.closedFrames = 0;
   state.blink.openFrames = 0;
-  state.blink.lastBlinkTs = 0;
-  state.blink.cooldownUntil = 0;
-  state.blink.debugLast = 'stopped';
   if(state.rafMedia){ cancelAnimationFrame(state.rafMedia); state.rafMedia=null; }
   if(state.stream){ state.stream.getTracks().forEach(t=>t.stop()); state.stream=null; }
   video.srcObject=null;
   state.usingMouse=true;
   setMode('Parado'); setStatus(false,'Tracking desligado');
-  setBlink('Parado');
   permNote.textContent='Tracking desligado. Sala continua ativa.';
   dwellFill.style.width='0%';
   resetZoom();
