@@ -1,780 +1,666 @@
-import io
 import math
 import threading
-import time
-from collections import deque
 from dataclasses import dataclass, field
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import av
 import cv2
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_pdf import PdfPages
-import mediapipe as mp
+from mediapipe.python.solutions import face_mesh as mp_face_mesh
 import numpy as np
 import streamlit as st
-from streamlit_webrtc import RTCConfiguration, VideoProcessorBase, WebRtcMode, webrtc_streamer
+from streamlit_webrtc import WebRtcMode, webrtc_streamer
 
 
 # ============================================================
-# CONFIGURAÇÃO DA PÁGINA
+# CONFIG
 # ============================================================
 st.set_page_config(
-    page_title="Galeria controlada pela íris",
+    page_title="Rastreamento de Pupila/Íris 3D",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-
-# ============================================================
-# DADOS DA GALERIA
-# ============================================================
-PAINTINGS: List[Dict] = [
-    {
-        "id": "quadro_1",
-        "title": "Mãe da Maré",
-        "artist": "Acervo demonstrativo",
-        "year": "2026",
-        "description": "Quadro da parede esquerda. O foco da seleção é feito apenas pelo olhar e confirmado por tempo de fixação.",
-        "box": (0.10, 0.24, 0.31, 0.66),
-    },
-    {
-        "id": "quadro_2",
-        "title": "Centro da Memória",
-        "artist": "Acervo demonstrativo",
-        "year": "2026",
-        "description": "Quadro central. Quando o ponto de gaze permanece nele por alguns instantes, ele vira o quadro ativo.",
-        "box": (0.39, 0.18, 0.61, 0.72),
-    },
-    {
-        "id": "quadro_3",
-        "title": "Rastro de Ancestralidade",
-        "artist": "Acervo demonstrativo",
-        "year": "2026",
-        "description": "Quadro da parede direita. A navegação usa centros oculares, centros das íris, projeção de raios e calibração multiponto.",
-        "box": (0.69, 0.24, 0.90, 0.66),
-    },
-]
-
-CALIBRATION_TARGETS: List[Tuple[float, float]] = [
-    (0.10, 0.10),
-    (0.90, 0.10),
-    (0.50, 0.50),
-    (0.10, 0.90),
-    (0.90, 0.90),
-]
-
-RTC_CONFIGURATION = RTCConfiguration(
-    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+st.markdown(
+    """
+    <style>
+    .small-note {font-size: 0.92rem; opacity: 0.9;}
+    .metric-box {
+        background: rgba(255,255,255,0.05);
+        border: 1px solid rgba(255,255,255,0.12);
+        border-radius: 16px;
+        padding: 12px 14px;
+        margin-bottom: 8px;
+    }
+    .target-wrap {
+        width: 100%;
+        aspect-ratio: 16/9;
+        border-radius: 20px;
+        border: 1px solid rgba(255,255,255,0.15);
+        background:
+            linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.02)),
+            radial-gradient(circle at 50% 50%, rgba(255,255,255,0.06), rgba(0,0,0,0.12));
+        position: relative;
+        overflow: hidden;
+    }
+    .target-dot {
+        position: absolute;
+        width: 18px;
+        height: 18px;
+        border-radius: 50%;
+        background: #ff3b30;
+        box-shadow: 0 0 0 8px rgba(255,59,48,0.12), 0 0 22px rgba(255,59,48,0.55);
+        transform: translate(-50%, -50%);
+    }
+    .gaze-dot {
+        position: absolute;
+        width: 16px;
+        height: 16px;
+        border-radius: 50%;
+        background: #00e0ff;
+        box-shadow: 0 0 0 8px rgba(0,224,255,0.12), 0 0 20px rgba(0,224,255,0.55);
+        transform: translate(-50%, -50%);
+    }
+    .guide-grid {
+        position: absolute;
+        inset: 0;
+        background-image:
+            linear-gradient(rgba(255,255,255,0.06) 1px, transparent 1px),
+            linear-gradient(90deg, rgba(255,255,255,0.06) 1px, transparent 1px);
+        background-size: 12.5% 12.5%;
+        pointer-events: none;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 
 # ============================================================
-# ESTRUTURAS DE ESTADO COMPARTILHADO
+# LANDMARK SETS
+# ============================================================
+RIGHT_IRIS = [469, 470, 471, 472]
+LEFT_IRIS = [474, 475, 476, 477]
+RIGHT_EYE_RING = [33, 133, 159, 145, 153, 154, 155, 173]
+LEFT_EYE_RING = [362, 263, 386, 374, 380, 381, 382, 398]
+RIGHT_EYE_CORNERS = (33, 133)
+LEFT_EYE_CORNERS = (362, 263)
+RIGHT_EYE_UP_DOWN = (159, 145)
+LEFT_EYE_UP_DOWN = (386, 374)
+
+HEAD_POSE_INDICES = [1, 152, 33, 263, 61, 291]
+MODEL_POINTS_3D = np.array(
+    [
+        [0.0, 0.0, 0.0],          # nose tip
+        [0.0, -63.6, -12.5],      # chin
+        [-43.3, 32.7, -26.0],     # left eye outer corner
+        [43.3, 32.7, -26.0],      # right eye outer corner
+        [-28.9, -28.9, -24.1],    # left mouth corner
+        [28.9, -28.9, -24.1],     # right mouth corner
+    ],
+    dtype=np.float64,
+)
+
+# Approximate eyeball centers in the canonical head model (millimeters).
+LEFT_EYEBALL_CENTER_CANON = np.array([-29.0, 33.0, -34.0], dtype=np.float64)
+RIGHT_EYEBALL_CENTER_CANON = np.array([29.0, 33.0, -34.0], dtype=np.float64)
+
+CALIBRATION_POINTS = [
+    (0.1, 0.1), (0.5, 0.1), (0.9, 0.1),
+    (0.1, 0.5), (0.5, 0.5), (0.9, 0.5),
+    (0.1, 0.9), (0.5, 0.9), (0.9, 0.9),
+]
+
+
+# ============================================================
+# MATH HELPERS
+# ============================================================
+def clamp(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
+    return max(lo, min(hi, float(v)))
+
+
+def normalize(v: np.ndarray) -> np.ndarray:
+    n = np.linalg.norm(v)
+    if n < 1e-9:
+        return v.copy()
+    return v / n
+
+
+def mean_points(points: np.ndarray, idxs: List[int]) -> np.ndarray:
+    return np.mean(points[idxs], axis=0)
+
+
+def project_points(points_3d: np.ndarray, rvec: np.ndarray, tvec: np.ndarray, camera_matrix: np.ndarray) -> np.ndarray:
+    pts2d, _ = cv2.projectPoints(points_3d, rvec, tvec, camera_matrix, np.zeros((4, 1), dtype=np.float64))
+    return pts2d.reshape(-1, 2)
+
+
+def rotation_matrix_from_rvec(rvec: np.ndarray) -> np.ndarray:
+    R, _ = cv2.Rodrigues(rvec)
+    return R
+
+
+def yaw_pitch_from_rotation(R: np.ndarray) -> Tuple[float, float]:
+    forward = R @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    yaw = math.atan2(forward[0], max(1e-6, forward[2]))
+    pitch = -math.atan2(forward[1], max(1e-6, math.sqrt(forward[0] ** 2 + forward[2] ** 2)))
+    return yaw, pitch
+
+
+def intersect_ray_with_plane(ray_origin: np.ndarray, ray_dir: np.ndarray, plane_z: float) -> Optional[np.ndarray]:
+    dz = float(ray_dir[2])
+    if abs(dz) < 1e-6:
+        return None
+    t = (plane_z - float(ray_origin[2])) / dz
+    if t <= 0:
+        return None
+    return ray_origin + t * ray_dir
+
+
+def eye_geometry(points_2d: np.ndarray, iris_idxs: List[int], ring_idxs: List[int], corner_idxs: Tuple[int, int], up_down_idxs: Tuple[int, int]):
+    iris_center = mean_points(points_2d, iris_idxs)
+    ring_center = mean_points(points_2d, ring_idxs)
+    eye_width = float(np.linalg.norm(points_2d[corner_idxs[0]] - points_2d[corner_idxs[1]]))
+    eye_height = float(np.linalg.norm(points_2d[up_down_idxs[0]] - points_2d[up_down_idxs[1]]))
+    return iris_center, ring_center, eye_width, eye_height
+
+
+def make_camera_matrix(width: int, height: int, focal_scale: float = 1.15) -> np.ndarray:
+    focal = width * focal_scale
+    return np.array(
+        [
+            [focal, 0.0, width / 2.0],
+            [0.0, focal, height / 2.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+
+def fit_linear_calibration(samples: List[Tuple[np.ndarray, np.ndarray]]) -> Optional[np.ndarray]:
+    if len(samples) < 5:
+        return None
+    X = np.array([s[0] for s in samples], dtype=np.float64)
+    Y = np.array([s[1] for s in samples], dtype=np.float64)
+    # Least-squares affine-like mapping with pose terms.
+    coef, _, _, _ = np.linalg.lstsq(X, Y, rcond=None)
+    return coef
+
+
+def apply_linear_calibration(feature_vec: np.ndarray, coef: Optional[np.ndarray]) -> np.ndarray:
+    if coef is None:
+        return feature_vec[:2].copy()
+    out = feature_vec @ coef
+    return np.array([clamp(out[0]), clamp(out[1])], dtype=np.float64)
+
+
+def raw_feature_vector(raw_xy: np.ndarray, head_yaw: float, head_pitch: float) -> np.ndarray:
+    return np.array([raw_xy[0], raw_xy[1], head_yaw, head_pitch, 1.0], dtype=np.float64)
+
+
+def draw_pose_cube(frame: np.ndarray, rvec: np.ndarray, tvec: np.ndarray, camera_matrix: np.ndarray):
+    cube = np.array(
+        [
+            [-40, -40, 60],
+            [40, -40, 60],
+            [40, 40, 60],
+            [-40, 40, 60],
+            [-40, -40, 140],
+            [40, -40, 140],
+            [40, 40, 140],
+            [-40, 40, 140],
+        ],
+        dtype=np.float64,
+    )
+    pts = project_points(cube, rvec, tvec, camera_matrix).astype(int)
+    edges = [
+        (0, 1), (1, 2), (2, 3), (3, 0),
+        (4, 5), (5, 6), (6, 7), (7, 4),
+        (0, 4), (1, 5), (2, 6), (3, 7),
+    ]
+    for a, b in edges:
+        cv2.line(frame, tuple(pts[a]), tuple(pts[b]), (60, 255, 220), 2, cv2.LINE_AA)
+
+
+def draw_crosshair(frame: np.ndarray, pt: Tuple[int, int], color=(0, 224, 255), size: int = 10):
+    x, y = int(pt[0]), int(pt[1])
+    cv2.line(frame, (x - size, y), (x + size, y), color, 2, cv2.LINE_AA)
+    cv2.line(frame, (x, y - size), (x, y + size), color, 2, cv2.LINE_AA)
+
+
+# ============================================================
+# SHARED STATE
 # ============================================================
 @dataclass
-class SelectionEvent:
-    timestamp: float
-    painting_id: str
-    title: str
-
-
-@dataclass
-class SharedTrackerState:
+class SharedGazeState:
     lock: threading.Lock = field(default_factory=threading.Lock)
-    latest_gaze_norm: Tuple[float, float] = (0.5, 0.5)
-    latest_raw_point: Optional[np.ndarray] = None
-    latest_left_eye_center: Optional[Tuple[float, float]] = None
-    latest_right_eye_center: Optional[Tuple[float, float]] = None
-    latest_left_iris_center: Optional[Tuple[float, float]] = None
-    latest_right_iris_center: Optional[Tuple[float, float]] = None
-    latest_face_ok: bool = False
-    latest_status: str = "Aguardando vídeo"
-    calibration_samples: List[Tuple[np.ndarray, Tuple[float, float]]] = field(default_factory=list)
-    calibration_matrix: Optional[np.ndarray] = None
-    current_target_index: int = 0
-    gaze_history: Deque[Tuple[float, float]] = field(default_factory=lambda: deque(maxlen=9000))
-    raw_history: Deque[Tuple[float, float]] = field(default_factory=lambda: deque(maxlen=9000))
-    hover_painting_id: Optional[str] = None
-    hover_started_at: Optional[float] = None
-    selected_painting_id: Optional[str] = None
-    selection_events: List[SelectionEvent] = field(default_factory=list)
-    zoom_level: float = 1.0
-    blink_closed: bool = False
-    blink_closed_at: float = 0.0
-    pending_single_blink_at: Optional[float] = None
-    blink_message: str = "Sem piscadas detectadas"
+    screen_width_cm: float = 53.0
+    screen_height_cm: float = 30.0
+    screen_distance_cm: float = 60.0
+    screen_res_w: int = 1920
+    screen_res_h: int = 1080
 
-    def reset_tracking(self) -> None:
+    face_found: bool = False
+    raw_hit_xy: np.ndarray = field(default_factory=lambda: np.array([0.5, 0.5], dtype=np.float64))
+    centered_raw_xy: np.ndarray = field(default_factory=lambda: np.array([0.5, 0.5], dtype=np.float64))
+    calibrated_xy: np.ndarray = field(default_factory=lambda: np.array([0.5, 0.5], dtype=np.float64))
+    latest_feature_vec: np.ndarray = field(default_factory=lambda: np.array([0.5, 0.5, 0.0, 0.0, 1.0], dtype=np.float64))
+    head_yaw: float = 0.0
+    head_pitch: float = 0.0
+    last_status: str = "Aguardando vídeo"
+
+    left_eye_center_3d: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float64))
+    right_eye_center_3d: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float64))
+    left_iris_center_2d: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=np.float64))
+    right_iris_center_2d: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=np.float64))
+    rotation_matrix: np.ndarray = field(default_factory=lambda: np.eye(3, dtype=np.float64))
+
+    center_bias: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=np.float64))
+    calibration_samples: List[Tuple[np.ndarray, np.ndarray]] = field(default_factory=list)
+    calibration_coef: Optional[np.ndarray] = None
+
+    def set_screen(self, width_cm: float, height_cm: float, distance_cm: float, res_w: int, res_h: int):
         with self.lock:
-            self.latest_gaze_norm = (0.5, 0.5)
-            self.latest_raw_point = None
-            self.latest_left_eye_center = None
-            self.latest_right_eye_center = None
-            self.latest_left_iris_center = None
-            self.latest_right_iris_center = None
-            self.latest_face_ok = False
-            self.latest_status = "Aguardando vídeo"
-            self.gaze_history.clear()
-            self.raw_history.clear()
-            self.hover_painting_id = None
-            self.hover_started_at = None
-            self.selected_painting_id = None
-            self.selection_events = []
-            self.zoom_level = 1.0
-            self.blink_closed = False
-            self.blink_closed_at = 0.0
-            self.pending_single_blink_at = None
-            self.blink_message = "Sem piscadas detectadas"
+            self.screen_width_cm = float(width_cm)
+            self.screen_height_cm = float(height_cm)
+            self.screen_distance_cm = float(distance_cm)
+            self.screen_res_w = int(res_w)
+            self.screen_res_h = int(res_h)
 
-    def reset_calibration(self) -> None:
+    def get_screen_mm(self) -> Tuple[float, float, float]:
+        return self.screen_width_cm * 10.0, self.screen_height_cm * 10.0, self.screen_distance_cm * 10.0
+
+    def capture_center(self):
+        with self.lock:
+            self.center_bias = self.raw_hit_xy - np.array([0.5, 0.5], dtype=np.float64)
+            self.last_status = "Centro bruto capturado"
+
+    def clear_center(self):
+        with self.lock:
+            self.center_bias = np.zeros(2, dtype=np.float64)
+            self.last_status = "Centro bruto resetado"
+
+    def capture_calibration(self, target_xy: Tuple[float, float]):
+        with self.lock:
+            target = np.array(target_xy, dtype=np.float64)
+            self.calibration_samples.append((self.latest_feature_vec.copy(), target))
+            self.last_status = f"Ponto de calibração capturado: {len(self.calibration_samples)}"
+            coef = fit_linear_calibration(self.calibration_samples)
+            if coef is not None:
+                self.calibration_coef = coef
+                self.last_status = f"Calibração ajustada com {len(self.calibration_samples)} ponto(s)"
+
+    def reset_calibration(self):
         with self.lock:
             self.calibration_samples = []
-            self.calibration_matrix = None
-            self.current_target_index = 0
+            self.calibration_coef = None
+            self.last_status = "Calibração resetada"
+
+    def snapshot(self):
+        with self.lock:
+            return {
+                "screen_width_cm": self.screen_width_cm,
+                "screen_height_cm": self.screen_height_cm,
+                "screen_distance_cm": self.screen_distance_cm,
+                "screen_res_w": self.screen_res_w,
+                "screen_res_h": self.screen_res_h,
+                "face_found": self.face_found,
+                "raw_hit_xy": self.raw_hit_xy.copy(),
+                "centered_raw_xy": self.centered_raw_xy.copy(),
+                "calibrated_xy": self.calibrated_xy.copy(),
+                "head_yaw": self.head_yaw,
+                "head_pitch": self.head_pitch,
+                "center_bias": self.center_bias.copy(),
+                "calibration_n": len(self.calibration_samples),
+                "last_status": self.last_status,
+                "rotation_matrix": self.rotation_matrix.copy(),
+            }
+
+
+STATE = SharedGazeState()
 
 
 # ============================================================
-# UTILITÁRIOS DE GEOMETRIA E LANDMARKS
+# VIDEO PROCESSOR
 # ============================================================
-LEFT_EYE_CORNERS = (33, 133)
-RIGHT_EYE_CORNERS = (362, 263)
-LEFT_EYE_LIDS = (159, 145)
-RIGHT_EYE_LIDS = (386, 374)
-LEFT_IRIS = [468, 469, 470, 471, 472]
-RIGHT_IRIS = [473, 474, 475, 476, 477]
-
-
-def clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
-
-
-def mean_point(points: List[Tuple[float, float]]) -> Tuple[float, float]:
-    arr = np.array(points, dtype=np.float32)
-    return float(np.mean(arr[:, 0])), float(np.mean(arr[:, 1]))
-
-
-def dist(a: Tuple[float, float], b: Tuple[float, float]) -> float:
-    return float(math.hypot(a[0] - b[0], a[1] - b[1]))
-
-
-def eye_aspect_ratio(
-    upper: Tuple[float, float],
-    lower: Tuple[float, float],
-    outer: Tuple[float, float],
-    inner: Tuple[float, float],
-) -> float:
-    horizontal = max(dist(outer, inner), 1e-6)
-    vertical = dist(upper, lower)
-    return vertical / horizontal
-
-
-def get_landmark_xy(landmarks, idx: int, width: int, height: int) -> Tuple[float, float]:
-    lm = landmarks[idx]
-    return lm.x * width, lm.y * height
-
-
-def fit_calibration_matrix(samples: List[Tuple[np.ndarray, Tuple[float, float]]]) -> Optional[np.ndarray]:
-    if len(samples) < 3:
-        return None
-
-    x_rows = []
-    y_rows = []
-    for raw_feat, target in samples:
-        x_rows.append([float(raw_feat[0]), float(raw_feat[1]), 1.0])
-        y_rows.append([float(target[0]), float(target[1])])
-
-    x_mat = np.array(x_rows, dtype=np.float32)
-    y_mat = np.array(y_rows, dtype=np.float32)
-    try:
-        w, _, _, _ = np.linalg.lstsq(x_mat, y_mat, rcond=None)
-        return w
-    except np.linalg.LinAlgError:
-        return None
-
-
-def apply_calibration(raw_point: np.ndarray, calibration_matrix: Optional[np.ndarray]) -> Tuple[float, float]:
-    if calibration_matrix is None:
-        # fallback bruto: normalização simples do espaço do olho para tela
-        gx = 0.5 + raw_point[0] * 0.9
-        gy = 0.5 - raw_point[1] * 0.9
-        return clamp(gx, 0.0, 1.0), clamp(gy, 0.0, 1.0)
-
-    vec = np.array([float(raw_point[0]), float(raw_point[1]), 1.0], dtype=np.float32)
-    pred = vec @ calibration_matrix
-    return clamp(float(pred[0]), 0.0, 1.0), clamp(float(pred[1]), 0.0, 1.0)
-
-
-def ray_intersection_on_plane(
-    origin_xy: Tuple[float, float],
-    iris_offset_xy: Tuple[float, float],
-    plane_z: float = 1.2,
-    gain: float = 1.35,
-) -> np.ndarray:
-    # origem no "espaço do olho"
-    origin = np.array([origin_xy[0], origin_xy[1], 0.0], dtype=np.float32)
-    direction = np.array(
-        [iris_offset_xy[0] * gain, -iris_offset_xy[1] * gain, 1.0],
-        dtype=np.float32,
-    )
-    direction /= max(np.linalg.norm(direction), 1e-6)
-    t = plane_z / max(direction[2], 1e-6)
-    point = origin + direction * t
-    return point[:2]
-
-
-def point_inside_box(point: Tuple[float, float], box: Tuple[float, float, float, float]) -> bool:
-    x, y = point
-    x1, y1, x2, y2 = box
-    return x1 <= x <= x2 and y1 <= y <= y2
-
-
-def painting_by_id(pid: Optional[str]) -> Optional[Dict]:
-    if pid is None:
-        return None
-    for painting in PAINTINGS:
-        if painting["id"] == pid:
-            return painting
-    return None
-
-
-# ============================================================
-# GERAÇÃO DO PDF
-# ============================================================
-def build_pdf_report(state: SharedTrackerState) -> bytes:
-    with state.lock:
-        gaze_points = list(state.gaze_history)
-        selected = state.selected_painting_id
-        zoom_level = state.zoom_level
-        blink_message = state.blink_message
-        selection_events = list(state.selection_events)
-        calibration_ready = state.calibration_matrix is not None
-        sample_count = len(state.calibration_samples)
-
-    buffer = io.BytesIO()
-    with PdfPages(buffer) as pdf:
-        fig = plt.figure(figsize=(8.27, 11.69))
-        ax = fig.add_subplot(111)
-        ax.axis("off")
-        selected_p = painting_by_id(selected)
-        selected_text = selected_p["title"] if selected_p else "Nenhum quadro selecionado"
-
-        lines = [
-            "Relatório de navegação por íris",
-            "",
-            f"Calibração pronta: {'sim' if calibration_ready else 'não'}",
-            f"Pontos de calibração capturados: {sample_count}",
-            f"Quadro selecionado: {selected_text}",
-            f"Zoom atual: {zoom_level:.2f}x",
-            f"Último evento de piscada: {blink_message}",
-            f"Total de pontos de gaze gravados: {len(gaze_points)}",
-            f"Total de seleções registradas: {len(selection_events)}",
-            "",
-            "Seleções registradas:",
-        ]
-
-        if selection_events:
-            for event in selection_events[-12:]:
-                hhmmss = time.strftime("%H:%M:%S", time.localtime(event.timestamp))
-                lines.append(f"- {hhmmss}: {event.title}")
-        else:
-            lines.append("- Nenhuma seleção até o momento")
-
-        ax.text(0.05, 0.97, "\n".join(lines), va="top", ha="left", fontsize=12)
-        pdf.savefig(fig, bbox_inches="tight")
-        plt.close(fig)
-
-        fig2, ax2 = plt.subplots(figsize=(11, 6))
-        ax2.set_title("Mapa de calor do olhar na parede virtual")
-        ax2.set_xlim(0, 1)
-        ax2.set_ylim(1, 0)
-        ax2.set_xlabel("Tela virtual X")
-        ax2.set_ylabel("Tela virtual Y")
-        ax2.set_facecolor("#f4f1ea")
-
-        for painting in PAINTINGS:
-            x1, y1, x2, y2 = painting["box"]
-            rect = plt.Rectangle(
-                (x1, y1),
-                x2 - x1,
-                y2 - y1,
-                fill=False,
-                linewidth=2.0,
-            )
-            ax2.add_patch(rect)
-            ax2.text((x1 + x2) / 2, y1 - 0.03, painting["title"], ha="center", va="bottom", fontsize=9)
-
-        if gaze_points:
-            xs = np.array([p[0] for p in gaze_points], dtype=np.float32)
-            ys = np.array([p[1] for p in gaze_points], dtype=np.float32)
-            heat, _, _ = np.histogram2d(xs, ys, bins=[40, 25], range=[[0, 1], [0, 1]])
-            ax2.imshow(
-                heat.T,
-                origin="lower",
-                extent=[0, 1, 0, 1],
-                aspect="auto",
-                alpha=0.65,
-                cmap="inferno",
-            )
-            ax2.scatter(xs[-1:], ys[-1:], s=100, marker="x")
-
-        pdf.savefig(fig2, bbox_inches="tight")
-        plt.close(fig2)
-
-    buffer.seek(0)
-    return buffer.getvalue()
-
-
-# ============================================================
-# PROCESSADOR DE VÍDEO
-# ============================================================
-class IrisGalleryProcessor(VideoProcessorBase):
-    shared_state: SharedTrackerState = None
-
-    def __init__(self) -> None:
-        self.state = self.__class__.shared_state
-        self.face_mesh = mp.solutions.face_mesh.FaceMesh(
+class GazeVideoProcessor:
+    def __init__(self):
+        self.face_mesh = mp_face_mesh.FaceMesh(
             static_image_mode=False,
             max_num_faces=1,
             refine_landmarks=True,
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5,
         )
-        self.last_frame_ts = time.time()
 
-    def _process_blinks(self, ear: float, now_ts: float) -> None:
-        close_threshold = 0.17
-        open_threshold = 0.21
-        min_blink_duration = 0.05
-        max_blink_duration = 0.45
-        double_window = 0.55
-
-        with self.state.lock:
-            if self.state.pending_single_blink_at is not None:
-                if now_ts - self.state.pending_single_blink_at > double_window:
-                    self.state.zoom_level = max(0.70, self.state.zoom_level - 0.12)
-                    self.state.blink_message = f"Piscada simples → afastou para {self.state.zoom_level:.2f}x"
-                    self.state.pending_single_blink_at = None
-
-            if ear < close_threshold and not self.state.blink_closed:
-                self.state.blink_closed = True
-                self.state.blink_closed_at = now_ts
-
-            elif ear > open_threshold and self.state.blink_closed:
-                duration = now_ts - self.state.blink_closed_at
-                self.state.blink_closed = False
-
-                if min_blink_duration <= duration <= max_blink_duration:
-                    if (
-                        self.state.pending_single_blink_at is not None
-                        and (now_ts - self.state.pending_single_blink_at) <= double_window
-                    ):
-                        self.state.zoom_level = min(2.30, self.state.zoom_level + 0.25)
-                        self.state.blink_message = f"Piscada dupla → aproximou para {self.state.zoom_level:.2f}x"
-                        self.state.pending_single_blink_at = None
-                    else:
-                        self.state.pending_single_blink_at = now_ts
-
-    def _update_selection(self, gaze_norm: Tuple[float, float], now_ts: float) -> None:
-        hovered = None
-        for painting in PAINTINGS:
-            if point_inside_box(gaze_norm, painting["box"]):
-                hovered = painting["id"]
-                break
-
-        with self.state.lock:
-            if hovered != self.state.hover_painting_id:
-                self.state.hover_painting_id = hovered
-                self.state.hover_started_at = now_ts if hovered is not None else None
-            elif hovered is not None and self.state.hover_started_at is not None:
-                if now_ts - self.state.hover_started_at >= 0.80:
-                    if self.state.selected_painting_id != hovered:
-                        self.state.selected_painting_id = hovered
-                        p = painting_by_id(hovered)
-                        if p is not None:
-                            self.state.selection_events.append(
-                                SelectionEvent(timestamp=now_ts, painting_id=hovered, title=p["title"])
-                            )
-
-    def _draw_virtual_gallery(self, image: np.ndarray) -> np.ndarray:
-        h, w = image.shape[:2]
-
-        # parede simulada
-        wall_color = (210, 220, 235)
-        floor_color = (120, 105, 90)
-        cv2.rectangle(image, (0, 0), (w, int(h * 0.78)), wall_color, -1)
-        cv2.rectangle(image, (0, int(h * 0.78)), (w, h), floor_color, -1)
-
-        with self.state.lock:
-            gaze = self.state.latest_gaze_norm
-            selected_id = self.state.selected_painting_id
-            hover_id = self.state.hover_painting_id
-            zoom_level = self.state.zoom_level
-            cal_ready = self.state.calibration_matrix is not None
-            target_index = self.state.current_target_index
-            blink_msg = self.state.blink_message
-            status = self.state.latest_status
-
-        for painting in PAINTINGS:
-            x1, y1, x2, y2 = painting["box"]
-            pt1 = (int(x1 * w), int(y1 * h))
-            pt2 = (int(x2 * w), int(y2 * h))
-
-            frame_color = (50, 65, 120)
-            inside_color = (240, 235, 210)
-            thickness = 3
-
-            if painting["id"] == selected_id:
-                frame_color = (40, 170, 60)
-                thickness = 5
-            elif painting["id"] == hover_id:
-                frame_color = (10, 180, 220)
-                thickness = 4
-
-            cv2.rectangle(image, pt1, pt2, frame_color, thickness)
-            cv2.rectangle(
-                image,
-                (pt1[0] + 8, pt1[1] + 8),
-                (pt2[0] - 8, pt2[1] - 8),
-                inside_color,
-                -1,
-            )
-            cv2.putText(
-                image,
-                painting["title"],
-                (pt1[0] + 10, pt1[1] + 28),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (30, 30, 30),
-                2,
-                cv2.LINE_AA,
-            )
-
-        # alvo de calibração
-        if not cal_ready and target_index < len(CALIBRATION_TARGETS):
-            tx, ty = CALIBRATION_TARGETS[target_index]
-            cx = int(tx * w)
-            cy = int(ty * h)
-            cv2.circle(image, (cx, cy), 16, (0, 0, 255), 2)
-            cv2.line(image, (cx - 22, cy), (cx + 22, cy), (0, 0, 255), 2)
-            cv2.line(image, (cx, cy - 22), (cx, cy + 22), (0, 0, 255), 2)
-            cv2.putText(
-                image,
-                f"Olhe para o alvo {target_index + 1}/{len(CALIBRATION_TARGETS)} e capture na barra lateral",
-                (16, 32),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.58,
-                (0, 0, 180),
-                2,
-                cv2.LINE_AA,
-            )
-
-        gx = int(gaze[0] * w)
-        gy = int(gaze[1] * h)
-        cv2.circle(image, (gx, gy), 10, (0, 0, 255), -1)
-        cv2.circle(image, (gx, gy), 22, (255, 255, 255), 2)
-
-        selected = painting_by_id(selected_id)
-        if selected is not None:
-            panel_y1 = int(h * 0.80)
-            panel_y2 = h - 12
-            cv2.rectangle(image, (12, panel_y1), (w - 12, panel_y2), (18, 18, 18), -1)
-            cv2.putText(
-                image,
-                f"Quadro ativo: {selected['title']} | {selected['artist']} | zoom {zoom_level:.2f}x",
-                (24, panel_y1 + 32),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.68,
-                (230, 230, 230),
-                2,
-                cv2.LINE_AA,
-            )
-            desc = selected["description"][:95]
-            cv2.putText(
-                image,
-                desc,
-                (24, panel_y1 + 68),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.54,
-                (180, 220, 255),
-                1,
-                cv2.LINE_AA,
-            )
-
-        cv2.putText(
-            image,
-            status,
-            (16, h - 18),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
+    def _estimate_head_pose(self, pts2d: np.ndarray, width: int, height: int):
+        image_points = np.array([pts2d[i] for i in HEAD_POSE_INDICES], dtype=np.float64)
+        cam = make_camera_matrix(width, height)
+        ok, rvec, tvec = cv2.solvePnP(
+            MODEL_POINTS_3D,
+            image_points,
+            cam,
+            np.zeros((4, 1), dtype=np.float64),
+            flags=cv2.SOLVEPNP_ITERATIVE,
         )
-        cv2.putText(
-            image,
-            blink_msg,
-            (16, h - 44),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
+        if not ok:
+            return None, None, cam
+        return rvec, tvec, cam
+
+    def _eye_ray(self, iris_center: np.ndarray, eye_center_2d: np.ndarray, eye_width: float, eye_height: float, eyeball_center_3d: np.ndarray, R_head: np.ndarray):
+        eye_width = max(eye_width, 1.0)
+        eye_height = max(eye_height, 1.0)
+        dx = (iris_center[0] - eye_center_2d[0]) / (eye_width / 2.0)
+        dy = (iris_center[1] - eye_center_2d[1]) / (eye_height / 2.0)
+        dx = float(np.clip(dx, -1.2, 1.2))
+        dy = float(np.clip(dy, -1.2, 1.2))
+
+        max_yaw = math.radians(35.0)
+        max_pitch = math.radians(25.0)
+        eye_yaw = dx * max_yaw
+        eye_pitch = -dy * max_pitch
+
+        local_dir = normalize(
+            np.array(
+                [
+                    math.tan(eye_yaw),
+                    math.tan(eye_pitch),
+                    1.0,
+                ],
+                dtype=np.float64,
+            )
         )
-        return image
+        cam_dir = normalize(R_head @ local_dir)
+        return cam_dir, eye_yaw, eye_pitch
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        image = frame.to_ndarray(format="bgr24")
-        image = cv2.flip(image, 1)
-        overlay = image.copy()
-        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        img = frame.to_ndarray(format="bgr24")
+        h, w = img.shape[:2]
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         results = self.face_mesh.process(rgb)
-        now_ts = time.time()
 
-        face_ok = False
-        status_msg = "Rosto não detectado"
+        if not results.multi_face_landmarks:
+            with STATE.lock:
+                STATE.face_found = False
+                STATE.last_status = "Rosto não detectado"
+            cv2.putText(img, "Rosto nao detectado", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2, cv2.LINE_AA)
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-        if results.multi_face_landmarks:
-            landmarks = results.multi_face_landmarks[0].landmark
-            h, w = image.shape[:2]
+        face_landmarks = results.multi_face_landmarks[0].landmark
+        pts2d = np.array([[lm.x * w, lm.y * h] for lm in face_landmarks], dtype=np.float64)
 
-            left_outer = get_landmark_xy(landmarks, LEFT_EYE_CORNERS[0], w, h)
-            left_inner = get_landmark_xy(landmarks, LEFT_EYE_CORNERS[1], w, h)
-            right_outer = get_landmark_xy(landmarks, RIGHT_EYE_CORNERS[0], w, h)
-            right_inner = get_landmark_xy(landmarks, RIGHT_EYE_CORNERS[1], w, h)
-            left_upper = get_landmark_xy(landmarks, LEFT_EYE_LIDS[0], w, h)
-            left_lower = get_landmark_xy(landmarks, LEFT_EYE_LIDS[1], w, h)
-            right_upper = get_landmark_xy(landmarks, RIGHT_EYE_LIDS[0], w, h)
-            right_lower = get_landmark_xy(landmarks, RIGHT_EYE_LIDS[1], w, h)
+        rvec, tvec, cam = self._estimate_head_pose(pts2d, w, h)
+        if rvec is None:
+            with STATE.lock:
+                STATE.face_found = False
+                STATE.last_status = "Falha na pose da cabeca"
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-            left_eye_center = mean_point([left_outer, left_inner, left_upper, left_lower])
-            right_eye_center = mean_point([right_outer, right_inner, right_upper, right_lower])
-            left_iris_center = mean_point([get_landmark_xy(landmarks, idx, w, h) for idx in LEFT_IRIS])
-            right_iris_center = mean_point([get_landmark_xy(landmarks, idx, w, h) for idx in RIGHT_IRIS])
+        R_head = rotation_matrix_from_rvec(rvec)
+        head_yaw, head_pitch = yaw_pitch_from_rotation(R_head)
 
-            left_eye_width = max(dist(left_outer, left_inner), 1e-6)
-            right_eye_width = max(dist(right_outer, right_inner), 1e-6)
-            left_eye_height = max(dist(left_upper, left_lower), 1e-6)
-            right_eye_height = max(dist(right_upper, right_lower), 1e-6)
-
-            left_offset = (
-                (left_iris_center[0] - left_eye_center[0]) / left_eye_width,
-                (left_iris_center[1] - left_eye_center[1]) / left_eye_height,
-            )
-            right_offset = (
-                (right_iris_center[0] - right_eye_center[0]) / right_eye_width,
-                (right_iris_center[1] - right_eye_center[1]) / right_eye_height,
-            )
-
-            left_origin = (
-                (left_eye_center[0] / w) - 0.5,
-                0.5 - (left_eye_center[1] / h),
-            )
-            right_origin = (
-                (right_eye_center[0] / w) - 0.5,
-                0.5 - (right_eye_center[1] / h),
-            )
-
-            left_plane_hit = ray_intersection_on_plane(left_origin, left_offset)
-            right_plane_hit = ray_intersection_on_plane(right_origin, right_offset)
-            raw_intersection = (left_plane_hit + right_plane_hit) / 2.0
-            gaze_norm = apply_calibration(raw_intersection, None)
-
-            with self.state.lock:
-                if self.state.calibration_matrix is not None:
-                    gaze_norm = apply_calibration(raw_intersection, self.state.calibration_matrix)
-                self.state.latest_gaze_norm = gaze_norm
-                self.state.latest_raw_point = raw_intersection.copy()
-                self.state.latest_left_eye_center = left_eye_center
-                self.state.latest_right_eye_center = right_eye_center
-                self.state.latest_left_iris_center = left_iris_center
-                self.state.latest_right_iris_center = right_iris_center
-                self.state.latest_face_ok = True
-                self.state.latest_status = "Rosto detectado | seleção por fixação | zoom por piscadas"
-                self.state.gaze_history.append(gaze_norm)
-                self.state.raw_history.append((float(raw_intersection[0]), float(raw_intersection[1])))
-
-            avg_ear = 0.5 * (
-                eye_aspect_ratio(left_upper, left_lower, left_outer, left_inner)
-                + eye_aspect_ratio(right_upper, right_lower, right_outer, right_inner)
-            )
-            self._process_blinks(avg_ear, now_ts)
-            self._update_selection(gaze_norm, now_ts)
-
-            for pt in [left_eye_center, right_eye_center]:
-                cv2.circle(overlay, (int(pt[0]), int(pt[1])), 5, (255, 255, 0), -1)
-            for pt in [left_iris_center, right_iris_center]:
-                cv2.circle(overlay, (int(pt[0]), int(pt[1])), 5, (0, 0, 255), -1)
-
-            # desenha os raios aproximados
-            def draw_ray(origin_xy, hit_xy, color):
-                ox = int((origin_xy[0] + 0.5) * w)
-                oy = int((0.5 - origin_xy[1]) * h)
-                hx = int(clamp(0.5 + hit_xy[0], 0.0, 1.0) * w)
-                hy = int(clamp(0.5 - hit_xy[1], 0.0, 1.0) * h)
-                cv2.line(overlay, (ox, oy), (hx, hy), color, 2)
-
-            draw_ray(left_origin, left_plane_hit, (0, 180, 255))
-            draw_ray(right_origin, right_plane_hit, (0, 255, 180))
-
-            status_msg = "OK"
-            face_ok = True
-
-        with self.state.lock:
-            self.state.latest_face_ok = face_ok
-            if not face_ok:
-                self.state.latest_status = status_msg
-
-        result = cv2.addWeighted(overlay, 0.45, self._draw_virtual_gallery(image.copy()), 0.55, 0)
-        return av.VideoFrame.from_ndarray(result, format="bgr24")
-
-
-# ============================================================
-# INICIALIZAÇÃO DO ESTADO
-# ============================================================
-if "shared_tracker_state" not in st.session_state:
-    st.session_state.shared_tracker_state = SharedTrackerState()
-
-shared_state: SharedTrackerState = st.session_state.shared_tracker_state
-IrisGalleryProcessor.shared_state = shared_state
-
-
-# ============================================================
-# AÇÕES DA SIDEBAR
-# ============================================================
-with st.sidebar:
-    st.header("Calibração e controle")
-    st.write(
-        "Olhe para o alvo vermelho no vídeo e capture cada ponto. São 5 pontos: canto superior esquerdo, superior direito, centro, inferior esquerdo e inferior direito."
-    )
-
-    if st.button("Capturar ponto atual", use_container_width=True):
-        with shared_state.lock:
-            raw = None if shared_state.latest_raw_point is None else shared_state.latest_raw_point.copy()
-            idx = shared_state.current_target_index
-        if raw is not None and idx < len(CALIBRATION_TARGETS):
-            with shared_state.lock:
-                shared_state.calibration_samples.append((raw, CALIBRATION_TARGETS[idx]))
-                shared_state.current_target_index += 1
-                shared_state.calibration_matrix = fit_calibration_matrix(shared_state.calibration_samples)
-        else:
-            st.warning("Ainda não há um ponto bruto disponível. Ligue a câmera e deixe o rosto visível.")
-
-    if st.button("Resetar calibração", use_container_width=True):
-        shared_state.reset_calibration()
-
-    if st.button("Resetar rastreamento", use_container_width=True):
-        shared_state.reset_tracking()
-
-    pdf_bytes = build_pdf_report(shared_state)
-    st.download_button(
-        "Baixar relatório PDF",
-        data=pdf_bytes,
-        file_name="relatorio_gaze_galeria.pdf",
-        mime="application/pdf",
-        use_container_width=True,
-    )
-
-    with shared_state.lock:
-        cal_ready = shared_state.calibration_matrix is not None
-        current_target_idx = shared_state.current_target_index
-        sample_count = len(shared_state.calibration_samples)
-        selected_id = shared_state.selected_painting_id
-        zoom_value = shared_state.zoom_level
-        blink_msg = shared_state.blink_message
-
-    st.metric("Pontos de calibração", f"{sample_count}/{len(CALIBRATION_TARGETS)}")
-    st.metric("Calibração pronta", "Sim" if cal_ready else "Não")
-    st.metric("Zoom", f"{zoom_value:.2f}x")
-    st.caption(blink_msg)
-
-    if current_target_idx < len(CALIBRATION_TARGETS):
-        tx, ty = CALIBRATION_TARGETS[current_target_idx]
-        st.info(f"Próximo alvo: ({tx:.2f}, {ty:.2f})")
-    else:
-        st.success("Todos os alvos foram capturados.")
-
-    selected_p = painting_by_id(selected_id)
-    if selected_p is not None:
-        st.success(f"Quadro ativo: {selected_p['title']}")
-
-
-# ============================================================
-# LAYOUT PRINCIPAL
-# ============================================================
-st.title("Galeria em Streamlit controlada pela íris")
-st.write(
-    "Este app substitui a lógica de mouse por rastreamento ocular usando centros dos olhos, centros das íris, projeção de raios, interseção num plano virtual e calibração multiponto."
-)
-
-st.markdown(
-    """
-### Como usar
-1. Ligue a webcam no componente abaixo.
-2. Deixe o rosto frontal e bem iluminado.
-3. Olhe para cada alvo vermelho e clique em **Capturar ponto atual** na barra lateral.
-4. Depois da calibração, fixe o olhar sobre um quadro por cerca de 0,8 s para selecioná-lo.
-5. Piscada simples afasta; piscada dupla aproxima.
-6. Baixe o PDF com o mapa de calor quando quiser.
-"""
-)
-
-ctx = webrtc_streamer(
-    key="iris-gallery",
-    mode=WebRtcMode.SENDRECV,
-    rtc_configuration=RTC_CONFIGURATION,
-    media_stream_constraints={"video": True, "audio": False},
-    video_processor_factory=IrisGalleryProcessor,
-    async_processing=True,
-)
-
-with shared_state.lock:
-    face_ok = shared_state.latest_face_ok
-    gaze = shared_state.latest_gaze_norm
-    selected = painting_by_id(shared_state.selected_painting_id)
-    left_eye = shared_state.latest_left_eye_center
-    right_eye = shared_state.latest_right_eye_center
-    left_iris = shared_state.latest_left_iris_center
-    right_iris = shared_state.latest_right_iris_center
-    status_text = shared_state.latest_status
-    selection_count = len(shared_state.selection_events)
-
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Rosto detectado", "Sim" if face_ok else "Não")
-c2.metric("Gaze X", f"{gaze[0]:.2f}")
-c3.metric("Gaze Y", f"{gaze[1]:.2f}")
-c4.metric("Seleções", str(selection_count))
-st.caption(status_text)
-
-st.subheader("Galeria virtual")
-cols = st.columns(3)
-for col, painting in zip(cols, PAINTINGS):
-    is_selected = selected is not None and selected["id"] == painting["id"]
-    box_text = f"área {painting['box'][0]:.2f}, {painting['box'][1]:.2f}, {painting['box'][2]:.2f}, {painting['box'][3]:.2f}"
-    with col:
-        st.markdown(
-            f"### {'🟢 ' if is_selected else ''}{painting['title']}\n"
-            f"**Autor:** {painting['artist']}  \n"
-            f"**Ano:** {painting['year']}  \n"
-            f"**Descrição:** {painting['description']}  \n"
-            f"**Caixa virtual:** {box_text}"
+        left_iris_center, left_eye_center_2d, left_eye_width, left_eye_height = eye_geometry(
+            pts2d, LEFT_IRIS, LEFT_EYE_RING, LEFT_EYE_CORNERS, LEFT_EYE_UP_DOWN
+        )
+        right_iris_center, right_eye_center_2d, right_eye_width, right_eye_height = eye_geometry(
+            pts2d, RIGHT_IRIS, RIGHT_EYE_RING, RIGHT_EYE_CORNERS, RIGHT_EYE_UP_DOWN
         )
 
-st.subheader("Diagnóstico geométrico do olho")
-d1, d2 = st.columns(2)
-with d1:
-    st.write("**Centros dos olhos**")
-    st.code(
-        f"Olho esquerdo: {left_eye}\nOlho direito: {right_eye}",
-        language="text",
-    )
-with d2:
-    st.write("**Centros das íris**")
-    st.code(
-        f"Íris esquerda: {left_iris}\nÍris direita: {right_iris}",
-        language="text",
+        left_eye_center_3d = (R_head @ LEFT_EYEBALL_CENTER_CANON.reshape(3, 1) + tvec).reshape(3)
+        right_eye_center_3d = (R_head @ RIGHT_EYEBALL_CENTER_CANON.reshape(3, 1) + tvec).reshape(3)
+
+        left_ray_dir, _, _ = self._eye_ray(
+            left_iris_center, left_eye_center_2d, left_eye_width, left_eye_height, left_eye_center_3d, R_head
+        )
+        right_ray_dir, _, _ = self._eye_ray(
+            right_iris_center, right_eye_center_2d, right_eye_width, right_eye_height, right_eye_center_3d, R_head
+        )
+
+        screen_w_mm, screen_h_mm, screen_z_mm = STATE.get_screen_mm()
+        left_hit = intersect_ray_with_plane(left_eye_center_3d, left_ray_dir, screen_z_mm)
+        right_hit = intersect_ray_with_plane(right_eye_center_3d, right_ray_dir, screen_z_mm)
+
+        if left_hit is None and right_hit is None:
+            avg_hit = np.array([0.0, 0.0, screen_z_mm], dtype=np.float64)
+        elif left_hit is None:
+            avg_hit = right_hit
+        elif right_hit is None:
+            avg_hit = left_hit
+        else:
+            avg_hit = 0.5 * (left_hit + right_hit)
+
+        raw_x = ((avg_hit[0] / (screen_w_mm / 2.0)) + 1.0) / 2.0
+        raw_y = ((avg_hit[1] / (screen_h_mm / 2.0)) + 1.0) / 2.0
+        raw_xy = np.array([clamp(raw_x), clamp(raw_y)], dtype=np.float64)
+
+        with STATE.lock:
+            centered_raw = raw_xy - STATE.center_bias
+            centered_raw = np.array([clamp(centered_raw[0]), clamp(centered_raw[1])], dtype=np.float64)
+            feature_vec = raw_feature_vector(centered_raw, head_yaw, head_pitch)
+            calibrated_xy = apply_linear_calibration(feature_vec, STATE.calibration_coef)
+
+            STATE.face_found = True
+            STATE.raw_hit_xy = raw_xy
+            STATE.centered_raw_xy = centered_raw
+            STATE.calibrated_xy = calibrated_xy
+            STATE.latest_feature_vec = feature_vec
+            STATE.left_eye_center_3d = left_eye_center_3d
+            STATE.right_eye_center_3d = right_eye_center_3d
+            STATE.left_iris_center_2d = left_iris_center
+            STATE.right_iris_center_2d = right_iris_center
+            STATE.rotation_matrix = R_head
+            STATE.head_yaw = head_yaw
+            STATE.head_pitch = head_pitch
+            STATE.last_status = "Rastreamento ativo"
+
+        # OVERLAY -------------------------------------------------
+        draw_pose_cube(img, rvec, tvec, cam)
+
+        # Iris centers and eye centers on image
+        cv2.circle(img, tuple(np.int32(left_iris_center)), 5, (0, 255, 0), -1, cv2.LINE_AA)
+        cv2.circle(img, tuple(np.int32(right_iris_center)), 5, (0, 255, 0), -1, cv2.LINE_AA)
+        cv2.circle(img, tuple(np.int32(left_eye_center_2d)), 4, (255, 0, 255), -1, cv2.LINE_AA)
+        cv2.circle(img, tuple(np.int32(right_eye_center_2d)), 4, (255, 0, 255), -1, cv2.LINE_AA)
+
+        # Ray visualization from the 3D eye centers
+        ray_pts_3d = np.array(
+            [
+                left_eye_center_3d,
+                left_eye_center_3d + left_ray_dir * 180.0,
+                right_eye_center_3d,
+                right_eye_center_3d + right_ray_dir * 180.0,
+            ],
+            dtype=np.float64,
+        )
+        ray_pts_2d = project_points(ray_pts_3d, np.zeros((3, 1), dtype=np.float64), np.zeros((3, 1), dtype=np.float64), cam).astype(int)
+        cv2.line(img, tuple(ray_pts_2d[0]), tuple(ray_pts_2d[1]), (255, 180, 0), 2, cv2.LINE_AA)
+        cv2.line(img, tuple(ray_pts_2d[2]), tuple(ray_pts_2d[3]), (255, 180, 0), 2, cv2.LINE_AA)
+
+        # Crosshair on virtual-screen estimate for debugging text
+        with STATE.lock:
+            dbg_xy = STATE.calibrated_xy.copy()
+            dbg_raw = STATE.centered_raw_xy.copy()
+
+        text_lines = [
+            f"Raw centered: ({dbg_raw[0]:.3f}, {dbg_raw[1]:.3f})",
+            f"Calibrated: ({dbg_xy[0]:.3f}, {dbg_xy[1]:.3f})",
+            f"Head yaw/pitch: ({math.degrees(head_yaw):.1f} deg, {math.degrees(head_pitch):.1f} deg)",
+            "Cube = rotation matrix visualized on head pose",
+        ]
+        y0 = 28
+        for i, line in enumerate(text_lines):
+            cv2.putText(img, line, (16, y0 + 28 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (240, 240, 240), 2, cv2.LINE_AA)
+
+        draw_crosshair(img, (int(left_iris_center[0]), int(left_iris_center[1])), color=(0, 255, 0), size=8)
+        draw_crosshair(img, (int(right_iris_center[0]), int(right_iris_center[1])), color=(0, 255, 0), size=8)
+
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+
+# ============================================================
+# UI HELPERS
+# ============================================================
+def render_target_screen(target_xy: Optional[Tuple[float, float]], gaze_xy: Tuple[float, float]) -> str:
+    tx, ty = (target_xy if target_xy is not None else (None, None))
+    gx, gy = gaze_xy
+    target_html = ""
+    if tx is not None and ty is not None:
+        target_html = f'<div class="target-dot" style="left:{tx*100:.2f}%; top:{ty*100:.2f}%;"></div>'
+    gaze_html = f'<div class="gaze-dot" style="left:{gx*100:.2f}%; top:{gy*100:.2f}%;"></div>'
+    return f'''
+    <div class="target-wrap">
+        <div class="guide-grid"></div>
+        {target_html}
+        {gaze_html}
+    </div>
+    '''
+
+
+def matrix_to_html(R: np.ndarray) -> str:
+    rows = []
+    for r in R:
+        rows.append("[" + ", ".join(f"{v:+0.3f}" for v in r) + "]")
+    return "<br>".join(rows)
+
+
+# ============================================================
+# SIDEBAR / SETTINGS
+# ============================================================
+st.title("Rastreamento de Pupila/Íris 3D para Streamlit")
+st.caption(
+    "App completo com: 1) centros dos olhos, 2) centros da pupila/íris, 3) projeção de raios, 4) interseção com o plano da tela, 5) binding do monitor real para monitor virtual e 6) calibração multiponto."
+)
+
+with st.sidebar:
+    st.header("Tela / Monitor")
+    screen_width_cm = st.number_input("Largura física do monitor (cm)", min_value=20.0, max_value=120.0, value=53.0, step=0.5)
+    screen_height_cm = st.number_input("Altura física do monitor (cm)", min_value=12.0, max_value=80.0, value=30.0, step=0.5)
+    screen_distance_cm = st.number_input("Distância olhos -> tela (cm)", min_value=20.0, max_value=120.0, value=60.0, step=0.5)
+    screen_res_w = st.number_input("Resolução horizontal (px)", min_value=640, max_value=7680, value=1920, step=10)
+    screen_res_h = st.number_input("Resolução vertical (px)", min_value=360, max_value=4320, value=1080, step=10)
+    if st.button("Aplicar parâmetros da tela", use_container_width=True):
+        STATE.set_screen(screen_width_cm, screen_height_cm, screen_distance_cm, int(screen_res_w), int(screen_res_h))
+
+    st.divider()
+    st.markdown(
+        """
+        **Webcam recomendada**
+        - 720p ou 1080p
+        - 30 fps ou mais
+        - câmera na altura do rosto
+        - iluminação frontal estável
+        - sem contraluz
+        """
     )
 
-st.info(
-    "Observação: o seu código original foi reescrito para Streamlit. Em vez de janelas desktop com tkinter/cv2.imshow, esta versão usa webcam em Streamlit e mantém a lógica em Python para olhar, calibrar, selecionar quadro e gerar heatmap."
+snapshot = STATE.snapshot()
+
+col_a, col_b = st.columns([1.35, 1.0], gap="large")
+
+with col_a:
+    st.subheader("Vídeo em tempo real")
+    webrtc_streamer(
+        key="gaze-tracker",
+        mode=WebRtcMode.SENDRECV,
+        media_stream_constraints={"video": True, "audio": False},
+        video_processor_factory=GazeVideoProcessor,
+        async_processing=True,
+        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+    )
+    st.markdown(
+        "<div class='small-note'>Olhe para o ponto vermelho durante a calibração. O ponto azul representa a estimativa atual na tela virtual.</div>",
+        unsafe_allow_html=True,
+    )
+
+with col_b:
+    st.subheader("Tela virtual")
+
+    if "cal_idx" not in st.session_state:
+        st.session_state.cal_idx = 0
+
+    current_target = None
+    if 0 <= st.session_state.cal_idx < len(CALIBRATION_POINTS):
+        current_target = CALIBRATION_POINTS[st.session_state.cal_idx]
+
+    st.markdown(
+        render_target_screen(current_target, tuple(snapshot["calibrated_xy"])),
+        unsafe_allow_html=True,
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Capturar centro bruto", use_container_width=True):
+            STATE.capture_center()
+        if st.button("Resetar centro bruto", use_container_width=True):
+            STATE.clear_center()
+    with c2:
+        if st.button("Capturar ponto atual", use_container_width=True):
+            if current_target is not None:
+                STATE.capture_calibration(current_target)
+                st.session_state.cal_idx = min(st.session_state.cal_idx + 1, len(CALIBRATION_POINTS))
+        if st.button("Resetar calibração", use_container_width=True):
+            STATE.reset_calibration()
+            st.session_state.cal_idx = 0
+
+    nav1, nav2 = st.columns(2)
+    with nav1:
+        if st.button("Voltar um ponto", use_container_width=True):
+            st.session_state.cal_idx = max(0, st.session_state.cal_idx - 1)
+    with nav2:
+        if st.button("Pular ponto", use_container_width=True):
+            st.session_state.cal_idx = min(len(CALIBRATION_POINTS), st.session_state.cal_idx + 1)
+
+    st.markdown(f"**Próximo ponto:** {st.session_state.cal_idx + 1 if st.session_state.cal_idx < len(CALIBRATION_POINTS) else 'fim'} / {len(CALIBRATION_POINTS)}")
+
+    st.markdown("### Estado")
+    st.markdown(f"<div class='metric-box'><b>Status:</b> {snapshot['last_status']}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='metric-box'><b>Face detectada:</b> {'Sim' if snapshot['face_found'] else 'Não'}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='metric-box'><b>Amostras de calibração:</b> {snapshot['calibration_n']}</div>", unsafe_allow_html=True)
+    st.markdown(
+        f"<div class='metric-box'><b>Olhar bruto corrigido:</b> ({snapshot['centered_raw_xy'][0]:.3f}, {snapshot['centered_raw_xy'][1]:.3f})</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f"<div class='metric-box'><b>Olhar calibrado:</b> ({snapshot['calibrated_xy'][0]:.3f}, {snapshot['calibrated_xy'][1]:.3f})</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f"<div class='metric-box'><b>Pixel estimado:</b> ({int(snapshot['calibrated_xy'][0]*snapshot['screen_res_w'])}, {int(snapshot['calibrated_xy'][1]*snapshot['screen_res_h'])})</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f"<div class='metric-box'><b>Yaw/Pitch da cabeça:</b> ({math.degrees(snapshot['head_yaw']):.2f}°, {math.degrees(snapshot['head_pitch']):.2f}°)</div>",
+        unsafe_allow_html=True,
+    )
+
+st.divider()
+
+left_info, right_info = st.columns(2, gap="large")
+with left_info:
+    st.subheader("Matriz de rotação atual")
+    st.markdown(f"<div class='metric-box' style='font-family: monospace'>{matrix_to_html(snapshot['rotation_matrix'])}</div>", unsafe_allow_html=True)
+
+with right_info:
+    st.subheader("Como o algoritmo funciona")
+    st.markdown(
+        """
+        1. Detecta landmarks faciais refinados da Face Mesh com íris.
+        2. Calcula o centro 2D de cada íris/pupila e o centro geométrico de cada olho.
+        3. Estima a pose da cabeça por `solvePnP`.
+        4. Usa centros 3D aproximados dos globos oculares no modelo canônico da face.
+        5. Projeta um raio de cada olho com base no desvio da íris dentro da abertura ocular.
+        6. Intersecta os dois raios com o plano do monitor virtual.
+        7. Corrige o centro bruto e depois ajusta a saída por calibração multiponto.
+        """
+    )
+
+st.divider()
+st.subheader("Observações importantes")
+st.markdown(
+    """
+    - Este app faz **estimativa monocular calibrada**. Em webcam comum, o centro do olho em 3D é aproximado por um modelo canônico + pose da cabeça.
+    - A calibração multiponto é o que transforma a estimativa geométrica em algo utilizável na tela real.
+    - Para uso prático, faça pelo menos os 9 pontos da grade.
+    - Mantenha a cabeça na posição usual de uso durante a calibração.
+    - Se a webcam estiver muito acima/abaixo da tela, reajuste a calibração.
+    """
 )
