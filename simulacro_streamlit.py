@@ -1,871 +1,874 @@
-import io
+from __future__ import annotations
+
 import math
-import time
+import random
 import threading
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from collections import deque
+from dataclasses import dataclass
+from typing import Deque, Dict, List, Optional, Tuple
 
 import av
 import cv2
-import mediapipe as mp
 import numpy as np
 import streamlit as st
-from matplotlib import pyplot as plt
-from matplotlib.backends.backend_pdf import PdfPages
-from PIL import Image
-from streamlit_autorefresh import st_autorefresh
-from streamlit_webrtc import VideoProcessorBase, WebRtcMode, webrtc_streamer
+from streamlit_webrtc import WebRtcMode, webrtc_streamer
 
 
-st.set_page_config(
-    page_title="Simulacro Eye Gallery",
-    page_icon="👁️",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-
-SCENE_W = 1280
-SCENE_H = 720
-
-
-PAINTINGS = [
-    {
-        "id": "q1",
-        "title": "Memória Costeira",
-        "artist": "Acervo Experimental",
-        "year": "2026",
-        "wall": "left",
-        "center": (-3.98, 1.70, 2.20),
-        "size": (1.20, 0.85),
-        "summary": "Estudo visual sobre memória, território e paisagem litorânea.",
-        "details": [
-            "Técnica: impressão pigmentada sobre suporte rígido",
-            "Tema: patrimônio, memória social e espacialidade",
-            "Leitura curatorial: relações entre paisagem e pertencimento",
-        ],
-    },
-    {
-        "id": "q2",
-        "title": "Topografia Afetiva",
-        "artist": "Coletivo Simulacro",
-        "year": "2026",
-        "wall": "left",
-        "center": (-3.98, 1.65, 5.10),
-        "size": (1.25, 0.95),
-        "summary": "Camadas cromáticas que evocam mapas, trajetos e deslocamentos.",
-        "details": [
-            "Material: composição digital em camadas",
-            "Cor dominante: tons frios com acentos quentes",
-            "Uso sugerido: mediação e leitura de atenção visual",
-        ],
-    },
-    {
-        "id": "q3",
-        "title": "Núcleo de Luz",
-        "artist": "Laboratório de Imagem",
-        "year": "2026",
-        "wall": "front",
-        "center": (0.0, 1.72, 9.55),
-        "size": (1.55, 1.05),
-        "summary": "Peça central da sala, focada em profundidade, contraste e centralidade.",
-        "details": [
-            "Disposição: parede de fundo",
-            "Objetivo: funcionar como âncora visual da cena",
-            "Interação: ótimo alvo para testes de dwell e zoom",
-        ],
-    },
-    {
-        "id": "q4",
-        "title": "Vestígios de Matéria",
-        "artist": "Arquivo Sensível",
-        "year": "2025",
-        "wall": "right",
-        "center": (3.98, 1.70, 2.55),
-        "size": (1.15, 0.82),
-        "summary": "Texturas e microestruturas inspiradas em observação material.",
-        "details": [
-            "Técnica: composição digital + textura procedural",
-            "Interesse: leitura de superfície e ritmo",
-            "Aplicação: demonstração de inspeção visual",
-        ],
-    },
-    {
-        "id": "q5",
-        "title": "Campo de Perspectiva",
-        "artist": "Unidade Experimental",
-        "year": "2026",
-        "wall": "right",
-        "center": (3.98, 1.65, 5.35),
-        "size": (1.20, 0.90),
-        "summary": "Obra construída para testar percepção de profundidade e parallax.",
-        "details": [
-            "Estrutura: composição geométrica em vários planos",
-            "Função: medir fixação do olhar",
-            "Interação: destaque em experiências com mapa de calor",
-        ],
-    },
-]
-
-
-LEFT_IRIS = [474, 475, 476, 477]
-RIGHT_IRIS = [469, 470, 471, 472]
-LEFT_EYE_H = (33, 133)
-RIGHT_EYE_H = (362, 263)
-LEFT_EYE_V = (159, 145)
-RIGHT_EYE_V = (386, 374)
-LEFT_EYE_TOP_BOTTOM = (159, 145)
-RIGHT_EYE_TOP_BOTTOM = (386, 374)
+Point2D = Tuple[int, int]
+Ellipse = Tuple[Tuple[float, float], Tuple[float, float], float]
 
 
 @dataclass
-class SharedState:
-    lock: threading.Lock = field(default_factory=threading.Lock)
-    gaze_norm: Tuple[float, float] = (0.5, 0.5)
-    face_detected: bool = False
-    blink_count_total: int = 0
-    zoom_level: float = 1.0
-    active_painting_id: Optional[str] = None
-    focus_started_at: Optional[float] = None
-    focus_seconds_by_painting: Dict[str, float] = field(default_factory=dict)
-    blink_timestamps: List[float] = field(default_factory=list)
-    pending_single_blink_ts: Optional[float] = None
-    zoom_events: List[Tuple[float, str, float]] = field(default_factory=list)
-    eye_contact_samples: int = 0
-    gaze_samples_norm: List[Tuple[float, float, float]] = field(default_factory=list)
-    session_started_at: float = field(default_factory=time.time)
-    last_info_title: str = "Nenhum quadro selecionado"
-    last_info_body: str = "Olhe para um quadro por alguns instantes para abrir a ficha rápida."
-    current_blink_ratio: float = 0.0
-    calibration_offset: Tuple[float, float] = (0.0, 0.0)
-    last_rendered_scene: Optional[np.ndarray] = None
-    last_scene_cursor: Tuple[int, int] = (SCENE_W // 2, SCENE_H // 2)
-    debug_text: str = "Aguardando câmera"
+class TrackerConfig:
+    width: int = 640
+    height: int = 480
+    strict_offset: int = 5
+    medium_offset: int = 15
+    relaxed_offset: int = 25
+    roi_size: int = 250
+    kernel_size: int = 5
+    min_contour_area: int = 1000
+    ratio_thresh: float = 3.0
+    max_rays: int = 120
+    ray_sample_n: int = 5
+    max_intersections: int = 1500
+    min_angle_diff_deg: float = 2.0
+    smoothing_window: int = 200
+    circle_scale: float = 2.0
+    pinhole_fx_ratio: float = 0.95
+    pinhole_fy_ratio: float = 0.95
+    heatmap_decay: float = 0.995
+    show_debug_overlay: bool = True
 
 
-STATE = SharedState()
+class IrisTracker3D:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.reset()
 
+    def reset(self) -> None:
+        with threading.Lock():
+            pass
+        self.ray_lines: Deque[Ellipse] = deque(maxlen=120)
+        self.model_centers: Deque[Point2D] = deque(maxlen=400)
+        self.stored_intersections: Deque[Point2D] = deque(maxlen=1500)
+        self.prev_model_center_avg: Point2D = (320, 240)
+        self.locked_model_center_avg: Point2D = self.prev_model_center_avg
+        self.sphere_center_locked_2d: bool = False
+        self.last_sphere_center: Optional[np.ndarray] = None
+        self.last_gaze_dir: Optional[np.ndarray] = None
+        self.calibrated_sphere_center: Optional[np.ndarray] = None
+        self.R_gaze_to_screen: np.ndarray = np.eye(3, dtype=np.float32)
+        self.center_calibrated: bool = False
+        self.latest_result: Dict[str, object] = {}
+        self.latest_raw_uv: Optional[Point2D] = None
+        self.latest_mapped_uv: Optional[Point2D] = None
+        self.affine_2d: Optional[np.ndarray] = None
+        self.multi_points_raw: Dict[str, Point2D] = {}
+        self.multi_points_target: Dict[str, Point2D] = {}
+        self.heatmap: Optional[np.ndarray] = None
+        self.latest_frame_size: Point2D = (640, 480)
 
-def clamp(value: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, value))
+    @staticmethod
+    def crop_to_aspect_ratio(image: np.ndarray, width: int, height: int) -> np.ndarray:
+        current_height, current_width = image.shape[:2]
+        desired_ratio = width / height
+        current_ratio = current_width / current_height
 
-
-def lerp(a: float, b: float, t: float) -> float:
-    return a + (b - a) * t
-
-
-def now_ts() -> float:
-    return time.time()
-
-
-def make_painting_texture(meta: dict, width: int = 420, height: int = 300) -> np.ndarray:
-    seed = sum(ord(c) for c in meta["id"])
-    rng = np.random.default_rng(seed)
-    img = np.zeros((height, width, 3), dtype=np.uint8)
-
-    c1 = np.array(rng.integers(40, 180, size=3), dtype=np.uint8)
-    c2 = np.array(rng.integers(80, 230, size=3), dtype=np.uint8)
-    c3 = np.array(rng.integers(30, 120, size=3), dtype=np.uint8)
-
-    for y in range(height):
-        t = y / max(1, height - 1)
-        color = (1 - t) * c1 + t * c2
-        img[y, :, :] = color.astype(np.uint8)
-
-    for _ in range(80):
-        x1 = int(rng.integers(0, width))
-        y1 = int(rng.integers(0, height))
-        x2 = int(clamp(x1 + int(rng.integers(-120, 120)), 0, width - 1))
-        y2 = int(clamp(y1 + int(rng.integers(-80, 80)), 0, height - 1))
-        col = tuple(int(v) for v in rng.integers(100, 255, size=3))
-        cv2.line(img, (x1, y1), (x2, y2), col, int(rng.integers(1, 4)))
-
-    for _ in range(12):
-        cx = int(rng.integers(0, width))
-        cy = int(rng.integers(0, height))
-        r = int(rng.integers(16, 58))
-        col = tuple(int(v) for v in (0.5 * c3 + 0.5 * rng.integers(120, 255, size=3)).astype(np.uint8))
-        cv2.circle(img, (cx, cy), r, col, -1)
-        cv2.circle(img, (cx, cy), max(4, r // 2), (255, 255, 255), 2)
-
-    cv2.rectangle(img, (8, 8), (width - 8, height - 8), (245, 245, 245), 4)
-    cv2.rectangle(img, (18, 18), (width - 18, height - 18), (20, 20, 20), 1)
-    cv2.putText(img, meta["title"], (24, height - 54), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (15, 15, 15), 3, cv2.LINE_AA)
-    cv2.putText(img, meta["title"], (24, height - 54), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (248, 248, 248), 1, cv2.LINE_AA)
-    cv2.putText(img, f"{meta['artist']} | {meta['year']}", (24, height - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 20, 20), 2, cv2.LINE_AA)
-    cv2.putText(img, f"{meta['artist']} | {meta['year']}", (24, height - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (250, 250, 250), 1, cv2.LINE_AA)
-    return img
-
-
-TEXTURES = {meta["id"]: make_painting_texture(meta) for meta in PAINTINGS}
-
-
-def point_from_landmark(landmark, width: int, height: int) -> np.ndarray:
-    return np.array([landmark.x * width, landmark.y * height], dtype=np.float32)
-
-
-def average_points(points: List[np.ndarray]) -> np.ndarray:
-    if not points:
-        return np.zeros(2, dtype=np.float32)
-    return np.mean(np.stack(points, axis=0), axis=0)
-
-
-class EyeTrackerProcessor(VideoProcessorBase):
-    def __init__(self):
-        self.mesh = mp.solutions.face_mesh.FaceMesh(
-            static_image_mode=False,
-            max_num_faces=1,
-            refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-        )
-        self.prev_smoothed = np.array([0.5, 0.5], dtype=np.float32)
-        self.closed_frames = 0
-        self.eye_closed = False
-        self.last_frame_ts = now_ts()
-
-    def _blink_ratio(self, landmarks, w: int, h: int) -> float:
-        left_h = np.linalg.norm(point_from_landmark(landmarks[LEFT_EYE_H[0]], w, h) - point_from_landmark(landmarks[LEFT_EYE_H[1]], w, h))
-        right_h = np.linalg.norm(point_from_landmark(landmarks[RIGHT_EYE_H[0]], w, h) - point_from_landmark(landmarks[RIGHT_EYE_H[1]], w, h))
-        left_v = np.linalg.norm(point_from_landmark(landmarks[LEFT_EYE_V[0]], w, h) - point_from_landmark(landmarks[LEFT_EYE_V[1]], w, h))
-        right_v = np.linalg.norm(point_from_landmark(landmarks[RIGHT_EYE_V[0]], w, h) - point_from_landmark(landmarks[RIGHT_EYE_V[1]], w, h))
-        left_ratio = left_v / max(left_h, 1e-6)
-        right_ratio = right_v / max(right_h, 1e-6)
-        return float((left_ratio + right_ratio) / 2.0)
-
-    def _estimate_gaze(self, landmarks, w: int, h: int) -> Tuple[float, float]:
-        left_iris_center = average_points([point_from_landmark(landmarks[i], w, h) for i in LEFT_IRIS])
-        right_iris_center = average_points([point_from_landmark(landmarks[i], w, h) for i in RIGHT_IRIS])
-
-        left_inner = point_from_landmark(landmarks[133], w, h)
-        left_outer = point_from_landmark(landmarks[33], w, h)
-        right_inner = point_from_landmark(landmarks[362], w, h)
-        right_outer = point_from_landmark(landmarks[263], w, h)
-
-        left_top = point_from_landmark(landmarks[159], w, h)
-        left_bottom = point_from_landmark(landmarks[145], w, h)
-        right_top = point_from_landmark(landmarks[386], w, h)
-        right_bottom = point_from_landmark(landmarks[374], w, h)
-
-        left_x = (left_iris_center[0] - left_outer[0]) / max(left_inner[0] - left_outer[0], 1e-6)
-        right_x = (right_iris_center[0] - right_inner[0]) / max(right_outer[0] - right_inner[0], 1e-6)
-
-        left_y = (left_iris_center[1] - left_top[1]) / max(left_bottom[1] - left_top[1], 1e-6)
-        right_y = (right_iris_center[1] - right_top[1]) / max(right_bottom[1] - right_top[1], 1e-6)
-
-        gaze_x = float(np.mean([left_x, 1.0 - right_x]))
-        gaze_y = float(np.mean([left_y, right_y]))
-
-        gaze_x = clamp((gaze_x - 0.48) * 1.65 + 0.5, 0.0, 1.0)
-        gaze_y = clamp((gaze_y - 0.5) * 1.75 + 0.5, 0.0, 1.0)
-        return gaze_x, gaze_y
-
-    def _handle_blinks(self, blink_ratio: float):
-        ts = now_ts()
-        blink_threshold = 0.16
-        min_closed_frames = 2
-
-        with STATE.lock:
-            STATE.current_blink_ratio = blink_ratio
-
-        if blink_ratio < blink_threshold:
-            self.closed_frames += 1
-            if self.closed_frames >= min_closed_frames:
-                self.eye_closed = True
+        if current_ratio > desired_ratio:
+            new_width = int(desired_ratio * current_height)
+            offset = (current_width - new_width) // 2
+            cropped_img = image[:, offset:offset + new_width]
         else:
-            if self.eye_closed:
-                self.eye_closed = False
-                self.closed_frames = 0
-                with STATE.lock:
-                    STATE.blink_count_total += 1
-                    STATE.blink_timestamps = [t for t in STATE.blink_timestamps if ts - t <= 1.0]
-                    STATE.blink_timestamps.append(ts)
-                    if len(STATE.blink_timestamps) >= 2 and ts - STATE.blink_timestamps[-2] <= 0.9:
-                        STATE.zoom_level = clamp(STATE.zoom_level + 0.25, 0.75, 2.2)
-                        STATE.zoom_events.append((ts, "zoom_in", STATE.zoom_level))
-                        STATE.pending_single_blink_ts = None
-                        STATE.blink_timestamps.clear()
-                    else:
-                        STATE.pending_single_blink_ts = ts
-            else:
-                self.closed_frames = 0
+            new_height = int(current_width / desired_ratio)
+            offset = (current_height - new_height) // 2
+            cropped_img = image[offset:offset + new_height, :]
 
-        with STATE.lock:
-            pending = STATE.pending_single_blink_ts
-            if pending is not None and ts - pending > 0.85:
-                STATE.zoom_level = clamp(STATE.zoom_level - 0.20, 0.75, 2.2)
-                STATE.zoom_events.append((ts, "zoom_out", STATE.zoom_level))
-                STATE.pending_single_blink_ts = None
-                STATE.blink_timestamps.clear()
+        return cv2.resize(cropped_img, (width, height), interpolation=cv2.INTER_AREA)
 
-    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        img = frame.to_ndarray(format="bgr24")
-        img = cv2.flip(img, 1)
-        h, w = img.shape[:2]
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        result = self.mesh.process(rgb)
+    @staticmethod
+    def apply_binary_threshold(image: np.ndarray, darkest_pixel_value: int, added_threshold: int) -> np.ndarray:
+        threshold = int(darkest_pixel_value) + int(added_threshold)
+        _, thresholded_image = cv2.threshold(image, threshold, 255, cv2.THRESH_BINARY_INV)
+        return thresholded_image
 
-        if result.multi_face_landmarks:
-            landmarks = result.multi_face_landmarks[0].landmark
-            gaze_x, gaze_y = self._estimate_gaze(landmarks, w, h)
-            blink_ratio = self._blink_ratio(landmarks, w, h)
-            self._handle_blinks(blink_ratio)
+    @staticmethod
+    def get_darkest_area(image: np.ndarray) -> Optional[Point2D]:
+        ignore_bounds = 20
+        image_skip_size = 10
+        search_area = 20
+        internal_skip_size = 5
 
-            with STATE.lock:
-                off_x, off_y = STATE.calibration_offset
-                gaze_x = clamp(gaze_x + off_x, 0.0, 1.0)
-                gaze_y = clamp(gaze_y + off_y, 0.0, 1.0)
-                alpha = 0.23
-                self.prev_smoothed[0] = lerp(float(self.prev_smoothed[0]), gaze_x, alpha)
-                self.prev_smoothed[1] = lerp(float(self.prev_smoothed[1]), gaze_y, alpha)
-                STATE.gaze_norm = (float(self.prev_smoothed[0]), float(self.prev_smoothed[1]))
-                STATE.face_detected = True
-                STATE.eye_contact_samples += 1
-                STATE.gaze_samples_norm.append((ts := now_ts(), STATE.gaze_norm[0], STATE.gaze_norm[1]))
-                if len(STATE.gaze_samples_norm) > 8000:
-                    STATE.gaze_samples_norm = STATE.gaze_samples_norm[-8000:]
-                STATE.debug_text = f"Face detectada | gaze=({STATE.gaze_norm[0]:.2f}, {STATE.gaze_norm[1]:.2f}) | blink={blink_ratio:.3f}"
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        min_sum = float("inf")
+        darkest_point: Optional[Point2D] = None
 
-            left_iris = average_points([point_from_landmark(landmarks[i], w, h) for i in LEFT_IRIS]).astype(int)
-            right_iris = average_points([point_from_landmark(landmarks[i], w, h) for i in RIGHT_IRIS]).astype(int)
-            cv2.circle(img, tuple(left_iris), 5, (0, 255, 0), 2)
-            cv2.circle(img, tuple(right_iris), 5, (0, 255, 0), 2)
-            cv2.putText(img, "Eye tracking ativo", (18, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (20, 235, 20), 2, cv2.LINE_AA)
-            cv2.putText(img, "Piscar 2x = zoom | Piscar 1x = afastar", (18, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
-        else:
-            with STATE.lock:
-                STATE.face_detected = False
-                STATE.debug_text = "Nenhum rosto detectado"
-            cv2.putText(img, "Aproxime o rosto e mantenha os olhos visiveis", (18, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2, cv2.LINE_AA)
+        for y in range(ignore_bounds, gray.shape[0] - ignore_bounds, image_skip_size):
+            for x in range(ignore_bounds, gray.shape[1] - ignore_bounds, image_skip_size):
+                current_sum = 0
+                num_pixels = 0
+                for dy in range(0, search_area, internal_skip_size):
+                    if y + dy >= gray.shape[0]:
+                        break
+                    for dx in range(0, search_area, internal_skip_size):
+                        if x + dx >= gray.shape[1]:
+                            break
+                        current_sum += int(gray[y + dy, x + dx])
+                        num_pixels += 1
+                if num_pixels > 0 and current_sum < min_sum:
+                    min_sum = current_sum
+                    darkest_point = (x + search_area // 2, y + search_area // 2)
+        return darkest_point
 
-        return av.VideoFrame.from_ndarray(img, format="bgr24")
+    @staticmethod
+    def mask_outside_square(image: np.ndarray, center: Point2D, size: int) -> np.ndarray:
+        x, y = center
+        half_size = size // 2
+        mask = np.zeros_like(image)
+        top_left_x = max(0, x - half_size)
+        top_left_y = max(0, y - half_size)
+        bottom_right_x = min(image.shape[1], x + half_size)
+        bottom_right_y = min(image.shape[0], y + half_size)
+        mask[top_left_y:bottom_right_y, top_left_x:bottom_right_x] = 255
+        return cv2.bitwise_and(image, mask)
 
+    @staticmethod
+    def filter_contours_by_area_and_return_largest(
+        contours: List[np.ndarray], pixel_thresh: int, ratio_thresh: float
+    ) -> List[np.ndarray]:
+        max_area = 0.0
+        largest_contour = None
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area >= pixel_thresh:
+                x, y, w, h = cv2.boundingRect(contour)
+                if w == 0 or h == 0:
+                    continue
+                length_to_width_ratio = max(w / h, h / w)
+                if length_to_width_ratio <= ratio_thresh and area > max_area:
+                    max_area = area
+                    largest_contour = contour
+        return [largest_contour] if largest_contour is not None else []
 
-def rotation_matrix_yaw_pitch(yaw: float, pitch: float) -> np.ndarray:
-    cy, sy = math.cos(yaw), math.sin(yaw)
-    cp, sp = math.cos(pitch), math.sin(pitch)
-    rot_y = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]], dtype=np.float32)
-    rot_x = np.array([[1, 0, 0], [0, cp, -sp], [0, sp, cp]], dtype=np.float32)
-    return rot_x @ rot_y
+    @staticmethod
+    def optimize_contours_by_angle(contours: List[np.ndarray], image: np.ndarray) -> np.ndarray:
+        if len(contours) < 1 or contours[0] is None or len(contours[0]) == 0:
+            return np.empty((0, 1, 2), dtype=np.int32)
 
+        all_contours = np.concatenate(contours[0], axis=0)
+        if len(all_contours) < 5:
+            return np.empty((0, 1, 2), dtype=np.int32)
 
-def project_point(point: np.ndarray, cam_pos: np.ndarray, yaw: float, pitch: float, focal: float, width: int, height: int) -> Optional[Tuple[int, int, float]]:
-    rel = point - cam_pos
-    rot = rotation_matrix_yaw_pitch(yaw, pitch)
-    cam = rot @ rel
-    z = float(cam[2])
-    if z <= 0.10:
-        return None
-    x2d = int(width / 2 + focal * (cam[0] / z))
-    y2d = int(height / 2 - focal * (cam[1] / z))
-    return x2d, y2d, z
+        spacing = max(1, int(len(all_contours) / 25))
+        filtered_points = []
+        centroid = np.mean(all_contours, axis=0)
+        _ = image  # only to keep parity with the original signature
 
+        for i in range(0, len(all_contours), 1):
+            current_point = all_contours[i]
+            prev_point = all_contours[i - spacing] if i - spacing >= 0 else all_contours[-spacing]
+            next_point = all_contours[i + spacing] if i + spacing < len(all_contours) else all_contours[spacing]
 
-def polygon_from_3d(corners: List[np.ndarray], cam_pos: np.ndarray, yaw: float, pitch: float, focal: float, width: int, height: int) -> Optional[np.ndarray]:
-    pts = []
-    for c in corners:
-        p = project_point(c, cam_pos, yaw, pitch, focal, width, height)
-        if p is None:
+            vec1 = prev_point - current_point
+            vec2 = next_point - current_point
+            vec_to_centroid = centroid - current_point
+            mean_dir = (vec1 + vec2) / 2.0
+
+            if np.linalg.norm(mean_dir) < 1e-6:
+                continue
+
+            cos_threshold = np.cos(np.radians(60))
+            if float(np.dot(vec_to_centroid, mean_dir)) >= cos_threshold:
+                filtered_points.append(current_point)
+
+        if len(filtered_points) < 5:
+            return np.empty((0, 1, 2), dtype=np.int32)
+
+        return np.array(filtered_points, dtype=np.int32).reshape((-1, 1, 2))
+
+    @staticmethod
+    def check_contour_pixels(contour: np.ndarray, image_shape: Tuple[int, int]) -> List[object]:
+        if contour is None or len(contour) < 5:
+            return [0, 0.0, np.zeros(image_shape, dtype=np.uint8)]
+
+        contour_mask = np.zeros(image_shape, dtype=np.uint8)
+        cv2.drawContours(contour_mask, [contour], -1, 255, 1)
+
+        ellipse_mask_thick = np.zeros(image_shape, dtype=np.uint8)
+        ellipse_mask_thin = np.zeros(image_shape, dtype=np.uint8)
+        ellipse = cv2.fitEllipse(contour)
+        cv2.ellipse(ellipse_mask_thick, ellipse, 255, 10)
+        cv2.ellipse(ellipse_mask_thin, ellipse, 255, 4)
+
+        overlap_thick = cv2.bitwise_and(contour_mask, ellipse_mask_thick)
+        overlap_thin = cv2.bitwise_and(contour_mask, ellipse_mask_thin)
+
+        absolute_pixel_total_thick = int(np.sum(overlap_thick > 0))
+        absolute_pixel_total_thin = int(np.sum(overlap_thin > 0))
+        total_border_pixels = int(np.sum(contour_mask > 0))
+        ratio_under_ellipse = absolute_pixel_total_thin / total_border_pixels if total_border_pixels > 0 else 0.0
+
+        return [absolute_pixel_total_thick, ratio_under_ellipse, overlap_thin]
+
+    @staticmethod
+    def check_ellipse_goodness(binary_image: np.ndarray, contour: np.ndarray) -> List[float]:
+        ellipse_goodness = [0.0, 0.0, 0.0]
+        if contour is None or len(contour) < 5:
+            return ellipse_goodness
+
+        ellipse = cv2.fitEllipse(contour)
+        mask = np.zeros_like(binary_image)
+        cv2.ellipse(mask, ellipse, 255, -1)
+
+        ellipse_area = int(np.sum(mask == 255))
+        covered_pixels = int(np.sum((binary_image == 255) & (mask == 255)))
+        if ellipse_area == 0:
+            return ellipse_goodness
+
+        ellipse_goodness[0] = covered_pixels / ellipse_area
+        if ellipse[1][0] > 0 and ellipse[1][1] > 0:
+            ellipse_goodness[2] = min(ellipse[1][1] / ellipse[1][0], ellipse[1][0] / ellipse[1][1])
+        return ellipse_goodness
+
+    @staticmethod
+    def find_line_intersection(ellipse1: Ellipse, ellipse2: Ellipse) -> Optional[Point2D]:
+        (cx1, cy1), (_, minor_axis1), angle1 = ellipse1
+        (cx2, cy2), (_, minor_axis2), angle2 = ellipse2
+
+        angle1_rad = np.deg2rad(angle1)
+        angle2_rad = np.deg2rad(angle2)
+
+        dx1, dy1 = (minor_axis1 / 2) * np.cos(angle1_rad), (minor_axis1 / 2) * np.sin(angle1_rad)
+        dx2, dy2 = (minor_axis2 / 2) * np.cos(angle2_rad), (minor_axis2 / 2) * np.sin(angle2_rad)
+
+        A = np.array([[dx1, -dx2], [dy1, -dy2]], dtype=np.float32)
+        B = np.array([cx2 - cx1, cy2 - cy1], dtype=np.float32)
+
+        if abs(float(np.linalg.det(A))) < 1e-6:
             return None
-        pts.append([p[0], p[1]])
-    return np.array(pts, dtype=np.int32)
 
+        t1, _ = np.linalg.solve(A, B)
+        intersection_x = cx1 + t1 * dx1
+        intersection_y = cy1 + t1 * dy1
+        return (int(intersection_x), int(intersection_y))
 
-def painting_corners(meta: dict) -> List[np.ndarray]:
-    cx, cy, cz = meta["center"]
-    pw, ph = meta["size"]
-    hw = pw / 2.0
-    hh = ph / 2.0
+    def compute_average_intersection(
+        self, frame: np.ndarray, ray_sample_n: int, max_intersections: int, min_angle_diff_deg: float
+    ) -> Optional[Point2D]:
+        if len(self.ray_lines) < 2 or ray_sample_n < 2:
+            return None
 
-    if meta["wall"] == "left":
-        return [
-            np.array([cx, cy + hh, cz - hw], dtype=np.float32),
-            np.array([cx, cy + hh, cz + hw], dtype=np.float32),
-            np.array([cx, cy - hh, cz + hw], dtype=np.float32),
-            np.array([cx, cy - hh, cz - hw], dtype=np.float32),
-        ]
-    if meta["wall"] == "right":
-        return [
-            np.array([cx, cy + hh, cz + hw], dtype=np.float32),
-            np.array([cx, cy + hh, cz - hw], dtype=np.float32),
-            np.array([cx, cy - hh, cz - hw], dtype=np.float32),
-            np.array([cx, cy - hh, cz + hw], dtype=np.float32),
-        ]
-    return [
-        np.array([cx - hw, cy + hh, cz], dtype=np.float32),
-        np.array([cx + hw, cy + hh, cz], dtype=np.float32),
-        np.array([cx + hw, cy - hh, cz], dtype=np.float32),
-        np.array([cx - hw, cy - hh, cz], dtype=np.float32),
-    ]
+        height, width = frame.shape[:2]
+        selected_lines = random.sample(list(self.ray_lines), min(ray_sample_n, len(self.ray_lines)))
+        intersections: List[Point2D] = []
 
+        for i in range(len(selected_lines) - 1):
+            line1 = selected_lines[i]
+            line2 = selected_lines[i + 1]
+            angle1 = float(line1[2])
+            angle2 = float(line2[2])
+            if abs(angle1 - angle2) < min_angle_diff_deg:
+                continue
 
-def paste_texture_on_quad(canvas: np.ndarray, texture: np.ndarray, quad: np.ndarray):
-    if quad is None or len(quad) != 4:
-        return
-    h, w = texture.shape[:2]
-    src = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
-    dst = quad.astype(np.float32)
-    M = cv2.getPerspectiveTransform(src, dst)
-    warped = cv2.warpPerspective(texture, M, (canvas.shape[1], canvas.shape[0]))
-    mask = np.zeros(canvas.shape[:2], dtype=np.uint8)
-    cv2.fillConvexPoly(mask, quad.astype(np.int32), 255)
-    mask3 = cv2.merge([mask, mask, mask])
-    np.copyto(canvas, np.where(mask3 > 0, warped, canvas))
+            intersection = self.find_line_intersection(line1, line2)
+            if intersection is None:
+                continue
 
+            if 0 <= intersection[0] < width and 0 <= intersection[1] < height:
+                intersections.append(intersection)
+                self.stored_intersections.append(intersection)
 
-def draw_room_background(canvas: np.ndarray, cam_pos: np.ndarray, yaw: float, pitch: float, focal: float):
-    w = canvas.shape[1]
-    h = canvas.shape[0]
+        while len(self.stored_intersections) > max_intersections:
+            self.stored_intersections.popleft()
 
-    world = {
-        "floor": [np.array([-4, 0, 0]), np.array([4, 0, 0]), np.array([4, 0, 10]), np.array([-4, 0, 10])],
-        "ceiling": [np.array([-4, 3.3, 0]), np.array([4, 3.3, 0]), np.array([4, 3.3, 10]), np.array([-4, 3.3, 10])],
-        "left": [np.array([-4, 0, 0]), np.array([-4, 3.3, 0]), np.array([-4, 3.3, 10]), np.array([-4, 0, 10])],
-        "right": [np.array([4, 0, 0]), np.array([4, 3.3, 0]), np.array([4, 3.3, 10]), np.array([4, 0, 10])],
-        "front": [np.array([-4, 0, 10]), np.array([4, 0, 10]), np.array([4, 3.3, 10]), np.array([-4, 3.3, 10])],
-    }
+        if not intersections or len(self.stored_intersections) == 0:
+            return None
 
-    colors = {
-        "floor": (70, 42, 18),
-        "ceiling": (45, 45, 55),
-        "left": (58, 60, 78),
-        "right": (58, 60, 78),
-        "front": (76, 78, 92),
-    }
+        avg_x = int(np.mean([pt[0] for pt in self.stored_intersections]))
+        avg_y = int(np.mean([pt[1] for pt in self.stored_intersections]))
+        return (avg_x, avg_y)
 
-    order = ["ceiling", "front", "left", "right", "floor"]
-    for key in order:
-        poly = polygon_from_3d(world[key], cam_pos, yaw, pitch, focal, w, h)
-        if poly is not None:
-            cv2.fillConvexPoly(canvas, poly, colors[key])
-            cv2.polylines(canvas, [poly], True, (120, 120, 138), 2, cv2.LINE_AA)
+    @staticmethod
+    def rotation_from_a_to_b(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        a = a / np.linalg.norm(a)
+        b = b / np.linalg.norm(b)
+        v = np.cross(a, b)
+        c = float(np.dot(a, b))
 
-    for z in np.linspace(1.0, 9.6, 9):
-        left = project_point(np.array([-4, 0.02, z]), cam_pos, yaw, pitch, focal, w, h)
-        right = project_point(np.array([4, 0.02, z]), cam_pos, yaw, pitch, focal, w, h)
-        if left and right:
-            cv2.line(canvas, (left[0], left[1]), (right[0], right[1]), (95, 72, 42), 2, cv2.LINE_AA)
+        if np.linalg.norm(v) < 1e-6:
+            if c > 0:
+                return np.eye(3, dtype=np.float32)
+            axis = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+            if abs(a[0]) > 0.9:
+                axis = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+            v = np.cross(a, axis)
+            v = v / np.linalg.norm(v)
+            s = float(np.linalg.norm(v))
+        else:
+            s = float(np.linalg.norm(v))
+            v = v / s
 
-    for x in np.linspace(-3.5, 3.5, 8):
-        near = project_point(np.array([x, 0.02, 0.25]), cam_pos, yaw, pitch, focal, w, h)
-        far = project_point(np.array([x, 0.02, 9.8]), cam_pos, yaw, pitch, focal, w, h)
-        if near and far:
-            cv2.line(canvas, (near[0], near[1]), (far[0], far[1]), (90, 64, 34), 1, cv2.LINE_AA)
-
-    # luminárias
-    for z in [2.0, 5.2, 8.3]:
-        p1 = polygon_from_3d(
+        vx, vy, vz = v
+        K = np.array(
             [
-                np.array([-0.6, 3.18, z - 0.16]),
-                np.array([0.6, 3.18, z - 0.16]),
-                np.array([0.6, 3.18, z + 0.16]),
-                np.array([-0.6, 3.18, z + 0.16]),
+                [0, -vz, vy],
+                [vz, 0, -vx],
+                [-vy, vx, 0],
             ],
-            cam_pos,
-            yaw,
-            pitch,
-            focal,
-            w,
-            h,
+            dtype=np.float32,
         )
-        if p1 is not None:
-            cv2.fillConvexPoly(canvas, p1, (210, 210, 180))
-            cv2.polylines(canvas, [p1], True, (250, 250, 235), 1, cv2.LINE_AA)
+        return np.eye(3, dtype=np.float32) + K * s + (K @ K) * ((1 - c) / (s ** 2))
 
-    overlay = canvas.copy()
-    for radius, alpha in [(180, 0.05), (260, 0.04), (360, 0.03)]:
-        cv2.circle(overlay, (w // 2, 70), radius, (255, 250, 220), -1)
-        canvas[:] = cv2.addWeighted(overlay, alpha, canvas, 1 - alpha, 0)
+    def compute_gaze_vector(
+        self, pupil_x: int, pupil_y: int, center_x: int, center_y: int, screen_width: int, screen_height: int
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        viewport_width = float(screen_width)
+        viewport_height = float(screen_height)
 
+        fov_y_deg = 45.0
+        aspect_ratio = viewport_width / viewport_height
+        far_clip = 100.0
+        camera_position = np.array([0.0, 0.0, 3.0], dtype=np.float32)
 
-def scene_cursor_from_gaze(gaze_norm: Tuple[float, float]) -> Tuple[int, int]:
-    x = int(clamp(gaze_norm[0], 0.0, 1.0) * (SCENE_W - 1))
-    y = int(clamp(gaze_norm[1], 0.0, 1.0) * (SCENE_H - 1))
-    return x, y
+        fov_y_rad = np.radians(fov_y_deg)
+        half_height_far = np.tan(fov_y_rad / 2) * far_clip
+        half_width_far = half_height_far * aspect_ratio
 
+        ndc_x = (2.0 * pupil_x) / viewport_width - 1.0
+        ndc_y = 1.0 - (2.0 * pupil_y) / viewport_height
 
-def update_focus_state(active_id: Optional[str]):
-    ts = now_ts()
-    with STATE.lock:
-        previous = STATE.active_painting_id
-        if previous == active_id:
-            if active_id and STATE.focus_started_at is None:
-                STATE.focus_started_at = ts
+        far_x = ndc_x * half_width_far
+        far_y = ndc_y * half_height_far
+        far_z = camera_position[2] - far_clip
+        far_point = np.array([far_x, far_y, far_z], dtype=np.float32)
+
+        ray_origin = camera_position
+        ray_direction = far_point - camera_position
+        ray_direction /= np.linalg.norm(ray_direction)
+        ray_direction = -ray_direction
+
+        inner_radius = 1.0 / 1.05
+        sphere_offset_x = (center_x / screen_width) * 2.0 - 1.0
+        sphere_offset_y = 1.0 - (center_y / screen_height) * 2.0
+        sphere_center = np.array([sphere_offset_x * 1.5, sphere_offset_y * 1.5, 0.0], dtype=np.float32)
+
+        origin = ray_origin
+        direction = -ray_direction
+        L = origin - sphere_center
+
+        a = float(np.dot(direction, direction))
+        b = float(2 * np.dot(direction, L))
+        c = float(np.dot(L, L) - inner_radius**2)
+        discriminant = b**2 - 4 * a * c
+
+        if discriminant < 0:
+            t = -float(np.dot(direction, L)) / max(float(np.dot(direction, direction)), 1e-6)
+            intersection_point = origin + t * direction
         else:
-            if previous and STATE.focus_started_at is not None:
-                STATE.focus_seconds_by_painting[previous] = STATE.focus_seconds_by_painting.get(previous, 0.0) + (ts - STATE.focus_started_at)
-            STATE.active_painting_id = active_id
-            STATE.focus_started_at = ts if active_id else None
+            sqrt_disc = float(np.sqrt(discriminant))
+            t1 = (-b - sqrt_disc) / (2 * a)
+            t2 = (-b + sqrt_disc) / (2 * a)
+            candidates = [val for val in (t1, t2) if val > 0]
+            if not candidates:
+                return None, None
+            t = min(candidates)
+            intersection_point = origin + t * direction
 
-        if active_id:
-            meta = next((p for p in PAINTINGS if p["id"] == active_id), None)
-            if meta:
-                dwell = ts - (STATE.focus_started_at or ts)
-                STATE.last_info_title = meta["title"]
-                if dwell >= 0.55:
-                    STATE.last_info_body = (
-                        f"{meta['artist']} ({meta['year']}) — {meta['summary']}\n\n"
-                        + "\n".join(meta["details"])
-                    )
-                else:
-                    STATE.last_info_body = "Fixe o olhar por ~0,6 s para abrir a ficha rápida do quadro."
+        intersection_local = intersection_point - sphere_center
+        norm = float(np.linalg.norm(intersection_local))
+        if norm < 1e-6:
+            return None, None
+        target_direction = intersection_local / norm
+
+        circle_local_center = np.array([0.0, 0.0, inner_radius], dtype=np.float32)
+        circle_local_center /= np.linalg.norm(circle_local_center)
+
+        rotation_axis = np.cross(circle_local_center, target_direction)
+        rotation_axis_norm = float(np.linalg.norm(rotation_axis))
+        if rotation_axis_norm < 1e-6:
+            gaze_rotated = circle_local_center
         else:
-            STATE.last_info_title = "Nenhum quadro selecionado"
-            STATE.last_info_body = "Olhe para um quadro por alguns instantes para abrir a ficha rápida."
+            rotation_axis /= rotation_axis_norm
+            dot = float(np.clip(np.dot(circle_local_center, target_direction), -1.0, 1.0))
+            angle_rad = float(np.arccos(dot))
+            c_ = float(np.cos(angle_rad))
+            s_ = float(np.sin(angle_rad))
+            t_ = 1 - c_
+            x_, y_, z_ = rotation_axis
+            rotation_matrix = np.array(
+                [
+                    [t_ * x_ * x_ + c_, t_ * x_ * y_ - s_ * z_, t_ * x_ * z_ + s_ * y_],
+                    [t_ * x_ * y_ + s_ * z_, t_ * y_ * y_ + c_, t_ * y_ * z_ - s_ * x_],
+                    [t_ * x_ * z_ - s_ * y_, t_ * y_ * z_ + s_ * x_, t_ * z_ * z_ + c_],
+                ],
+                dtype=np.float32,
+            )
+            gaze_local = np.array([0.0, 0.0, inner_radius], dtype=np.float32)
+            gaze_rotated = rotation_matrix @ gaze_local
+            gaze_rotated /= np.linalg.norm(gaze_rotated)
 
+        self.last_sphere_center = sphere_center.copy()
+        self.last_gaze_dir = gaze_rotated.copy()
 
-def render_scene() -> np.ndarray:
-    with STATE.lock:
-        gaze_norm = STATE.gaze_norm
-        zoom = STATE.zoom_level
-        face_ok = STATE.face_detected
-
-    canvas = np.zeros((SCENE_H, SCENE_W, 3), dtype=np.uint8)
-    canvas[:] = (16, 16, 22)
-
-    yaw = (gaze_norm[0] - 0.5) * 0.22
-    pitch = -(gaze_norm[1] - 0.5) * 0.12
-    cam_pos = np.array([(gaze_norm[0] - 0.5) * 0.75, 1.58 + (0.5 - gaze_norm[1]) * 0.15, -2.35], dtype=np.float32)
-    focal = 860.0 * zoom
-
-    draw_room_background(canvas, cam_pos, yaw, pitch, focal)
-
-    # suportes / molduras
-    cursor = scene_cursor_from_gaze(gaze_norm)
-    selected_id = None
-    selected_dwell_ready = False
-
-    projected = []
-    for meta in PAINTINGS:
-        corners = painting_corners(meta)
-        quad = polygon_from_3d(corners, cam_pos, yaw, pitch, focal, SCENE_W, SCENE_H)
-        if quad is None:
-            continue
-        depth_est = float(np.mean([project_point(c, cam_pos, yaw, pitch, focal, SCENE_W, SCENE_H)[2] for c in corners if project_point(c, cam_pos, yaw, pitch, focal, SCENE_W, SCENE_H) is not None]))
-        projected.append((depth_est, meta, quad))
-
-    projected.sort(key=lambda x: x[0], reverse=True)
-
-    for _, meta, quad in projected:
-        shadow = quad + np.array([8, 8], dtype=np.int32)
-        cv2.fillConvexPoly(canvas, shadow, (15, 15, 15))
-        frame_poly = quad.copy()
-        cv2.fillConvexPoly(canvas, frame_poly, (30, 28, 24))
-        inner = frame_poly.astype(np.float32)
-        center = np.mean(inner, axis=0)
-        inner = (center + (inner - center) * 0.90).astype(np.int32)
-        paste_texture_on_quad(canvas, TEXTURES[meta["id"]], inner)
-        cv2.polylines(canvas, [frame_poly], True, (210, 180, 120), 5, cv2.LINE_AA)
-        cv2.polylines(canvas, [frame_poly], True, (245, 232, 188), 1, cv2.LINE_AA)
-
-        if cv2.pointPolygonTest(frame_poly, cursor, False) >= 0:
-            selected_id = meta["id"]
-
-    update_focus_state(selected_id)
-
-    with STATE.lock:
-        active_id = STATE.active_painting_id
-        active_since = STATE.focus_started_at
-    if active_id and active_since:
-        selected_dwell_ready = (now_ts() - active_since) >= 0.55
-
-    for _, meta, quad in projected:
-        if meta["id"] == selected_id:
-            color = (40, 255, 210) if selected_dwell_ready else (50, 200, 255)
-            cv2.polylines(canvas, [quad], True, color, 6, cv2.LINE_AA)
-            label_pos = tuple(np.mean(quad, axis=0).astype(int))
-            cv2.putText(canvas, meta["title"], (label_pos[0] - 85, label_pos[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.78, (0, 0, 0), 4, cv2.LINE_AA)
-            cv2.putText(canvas, meta["title"], (label_pos[0] - 85, label_pos[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.78, color, 2, cv2.LINE_AA)
-
-    if face_ok:
-        cx, cy = cursor
-        cv2.circle(canvas, (cx, cy), 18, (40, 245, 180), 2, cv2.LINE_AA)
-        cv2.line(canvas, (cx - 12, cy), (cx + 12, cy), (40, 245, 180), 1, cv2.LINE_AA)
-        cv2.line(canvas, (cx, cy - 12), (cx, cy + 12), (40, 245, 180), 1, cv2.LINE_AA)
-    else:
-        cv2.putText(canvas, "Sem rastreio ocular no momento", (36, 94), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (40, 100, 255), 2, cv2.LINE_AA)
-
-    panel = canvas.copy()
-    cv2.rectangle(panel, (24, 24), (500, 184), (10, 10, 14), -1)
-    canvas = cv2.addWeighted(panel, 0.38, canvas, 0.62, 0)
-    cv2.rectangle(canvas, (24, 24), (500, 184), (200, 200, 200), 1)
-    cv2.putText(canvas, "Galeria ocular 3D", (42, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (240, 240, 240), 2, cv2.LINE_AA)
-    cv2.putText(canvas, "Olhe para um quadro para abrir informacoes", (42, 92), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (210, 210, 210), 1, cv2.LINE_AA)
-    cv2.putText(canvas, "2 piscadas = zoom | 1 piscada = afastar", (42, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (210, 210, 210), 1, cv2.LINE_AA)
-
-    with STATE.lock:
-        canvas_info_title = STATE.last_info_title
-        zoom = STATE.zoom_level
-        canvas_debug = STATE.debug_text
-        STATE.last_rendered_scene = canvas.copy()
-        STATE.last_scene_cursor = cursor
-
-    cv2.putText(canvas, f"Selecionado: {canvas_info_title}", (42, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (100, 255, 220), 1, cv2.LINE_AA)
-    cv2.putText(canvas, f"Zoom: {zoom:.2f}x", (42, 176), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (250, 220, 120), 1, cv2.LINE_AA)
-    cv2.putText(canvas, canvas_debug[:70], (24, SCENE_H - 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (210, 210, 210), 1, cv2.LINE_AA)
-    return canvas
-
-
-def build_heatmap_overlay(scene: np.ndarray, gaze_samples: List[Tuple[float, float, float]]) -> np.ndarray:
-    if scene is None:
-        scene = np.zeros((SCENE_H, SCENE_W, 3), dtype=np.uint8)
-
-    heat = np.zeros((SCENE_H, SCENE_W), dtype=np.float32)
-    for _, gx, gy in gaze_samples:
-        x = int(clamp(gx, 0.0, 1.0) * (SCENE_W - 1))
-        y = int(clamp(gy, 0.0, 1.0) * (SCENE_H - 1))
-        heat[y, x] += 1.0
-
-    if np.max(heat) > 0:
-        heat = cv2.GaussianBlur(heat, (0, 0), sigmaX=35, sigmaY=35)
-        heat_norm = cv2.normalize(heat, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        heat_color = cv2.applyColorMap(heat_norm, cv2.COLORMAP_JET)
-        overlay = cv2.addWeighted(scene, 0.55, heat_color, 0.45, 0)
-        overlay[heat_norm < 10] = scene[heat_norm < 10]
-        return overlay
-    return scene.copy()
-
-
-def build_report_pdf() -> bytes:
-    with STATE.lock:
-        scene = None if STATE.last_rendered_scene is None else STATE.last_rendered_scene.copy()
-        gaze_samples = list(STATE.gaze_samples_norm)
-        focus = dict(STATE.focus_seconds_by_painting)
-        active = STATE.active_painting_id
-        active_since = STATE.focus_started_at
-        blink_total = STATE.blink_count_total
-        zoom_events = list(STATE.zoom_events)
-        session_started = STATE.session_started_at
-
-    if active and active_since is not None:
-        focus[active] = focus.get(active, 0.0) + (now_ts() - active_since)
-
-    if scene is None:
-        scene = render_scene()
-
-    heatmap = build_heatmap_overlay(scene, gaze_samples)
-    total_duration = max(1.0, now_ts() - session_started)
-
-    label_map = {p["id"]: p["title"] for p in PAINTINGS}
-    labels = [label_map[k] for k, _ in sorted(focus.items(), key=lambda kv: kv[1], reverse=True)]
-    values = [v for _, v in sorted(focus.items(), key=lambda kv: kv[1], reverse=True)]
-
-    buf = io.BytesIO()
-    with PdfPages(buf) as pdf:
-        fig = plt.figure(figsize=(11.69, 8.27))
-        fig.suptitle("Relatório de mapa de calor ocular — Galeria 3D", fontsize=18, fontweight="bold")
-        ax = fig.add_subplot(121)
-        ax.imshow(cv2.cvtColor(scene, cv2.COLOR_BGR2RGB))
-        ax.set_title("Cena final")
-        ax.axis("off")
-
-        ax2 = fig.add_subplot(122)
-        ax2.imshow(cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB))
-        ax2.set_title("Mapa de calor do olhar")
-        ax2.axis("off")
-
-        fig.text(0.08, 0.08, f"Duração da sessão: {total_duration:.1f} s")
-        fig.text(0.08, 0.05, f"Amostras de olhar: {len(gaze_samples)}")
-        fig.text(0.36, 0.08, f"Piscadas detectadas: {blink_total}")
-        fig.text(0.36, 0.05, f"Eventos de zoom: {len(zoom_events)}")
-        pdf.savefig(fig, bbox_inches="tight")
-        plt.close(fig)
-
-        fig = plt.figure(figsize=(11.69, 8.27))
-        gs = fig.add_gridspec(2, 2)
-        ax_bar = fig.add_subplot(gs[:, 0])
-        ax_txt = fig.add_subplot(gs[0, 1])
-        ax_events = fig.add_subplot(gs[1, 1])
-
-        if labels:
-            ax_bar.barh(labels[::-1], values[::-1])
-            ax_bar.set_title("Tempo de foco por quadro (s)")
-            ax_bar.set_xlabel("Segundos")
+        if self.calibrated_sphere_center is not None:
+            sphere_center_out = self.calibrated_sphere_center.copy()
         else:
-            ax_bar.text(0.5, 0.5, "Sem dados suficientes", ha="center", va="center")
-            ax_bar.set_axis_off()
+            sphere_center_out = sphere_center.copy()
 
-        ax_txt.axis("off")
-        lines = [
-            "Resumo automático:",
-            f"- sessão total: {total_duration:.1f} s",
-            f"- gaze samples: {len(gaze_samples)}",
-            f"- piscadas: {blink_total}",
-            f"- zoom events: {len(zoom_events)}",
-            "",
-            "Quadros analisados:",
-        ]
-        for p in PAINTINGS:
-            sec = focus.get(p["id"], 0.0)
-            lines.append(f"- {p['title']}: {sec:.1f} s")
-        ax_txt.text(0.0, 1.0, "\n".join(lines), va="top", fontsize=11)
+        return sphere_center_out, gaze_rotated
 
-        ax_events.axis("off")
-        if zoom_events:
-            ev_lines = ["Eventos de zoom:"]
-            base = session_started
-            for ts, kind, level in zoom_events[-12:]:
-                ev_lines.append(f"- {ts - base:6.1f}s | {kind} | nível {level:.2f}x")
+    def project_gaze_to_uv(self, gaze_dir: np.ndarray, width: int, height: int, cfg: TrackerConfig) -> Optional[Point2D]:
+        g = gaze_dir.copy()
+        if self.center_calibrated:
+            g = self.R_gaze_to_screen @ g
+
+        if g[2] <= 1e-6:
+            return None
+
+        fx = width * cfg.pinhole_fx_ratio
+        fy = height * cfg.pinhole_fy_ratio
+        u = width / 2 + fx * (float(g[0]) / float(g[2]))
+        v = height / 2 - fy * (float(g[1]) / float(g[2]))
+        u = int(np.clip(u, 0, width - 1))
+        v = int(np.clip(v, 0, height - 1))
+        self.latest_raw_uv = (u, v)
+
+        if self.affine_2d is not None:
+            vec = np.array([u, v, 1.0], dtype=np.float32)
+            mapped = self.affine_2d @ vec
+            u = int(np.clip(mapped[0], 0, width - 1))
+            v = int(np.clip(mapped[1], 0, height - 1))
+
+        self.latest_mapped_uv = (u, v)
+        return (u, v)
+
+    def calibrate_center_now(self) -> str:
+        if self.last_gaze_dir is None or self.last_sphere_center is None:
+            return "Ainda não há vetor de olhar suficiente para calibrar."
+
+        forward = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        self.R_gaze_to_screen = self.rotation_from_a_to_b(self.last_gaze_dir, forward)
+        self.calibrated_sphere_center = self.last_sphere_center.copy()
+        self.center_calibrated = True
+        self.sphere_center_locked_2d = True
+        self.locked_model_center_avg = self.prev_model_center_avg
+        return "Calibração central concluída."
+
+    def lock_current_center(self) -> str:
+        self.sphere_center_locked_2d = True
+        self.locked_model_center_avg = self.prev_model_center_avg
+        return f"Centro 2D travado em {self.locked_model_center_avg}."
+
+    def unlock_current_center(self) -> str:
+        self.sphere_center_locked_2d = False
+        return "Centro 2D destravado."
+
+    def clear_all_calibration(self) -> str:
+        self.center_calibrated = False
+        self.R_gaze_to_screen = np.eye(3, dtype=np.float32)
+        self.calibrated_sphere_center = None
+        self.affine_2d = None
+        self.multi_points_raw.clear()
+        self.multi_points_target.clear()
+        self.sphere_center_locked_2d = False
+        return "Calibração central e multiponto removidas."
+
+    def add_multi_calibration_point(self, label: str, target: Point2D) -> str:
+        if self.latest_raw_uv is None:
+            return "Ainda não há ponto bruto do olhar para salvar."
+        self.multi_points_raw[label] = self.latest_raw_uv
+        self.multi_points_target[label] = target
+        return f"Ponto '{label}' salvo. bruto={self.latest_raw_uv} alvo={target}"
+
+    def solve_multi_calibration(self) -> str:
+        if len(self.multi_points_raw) < 3:
+            return "São necessários ao menos 3 pontos para resolver a calibração multiponto."
+
+        labels = sorted(self.multi_points_raw.keys())
+        src = np.array([self.multi_points_raw[k] for k in labels], dtype=np.float32)
+        dst = np.array([self.multi_points_target[k] for k in labels], dtype=np.float32)
+
+        affine, inliers = cv2.estimateAffine2D(src, dst, method=cv2.RANSAC, ransacReprojThreshold=10.0)
+        if affine is None:
+            if len(src) >= 3:
+                affine = cv2.getAffineTransform(src[:3], dst[:3])
+            else:
+                return "Não foi possível ajustar a calibração multiponto."
+
+        self.affine_2d = affine.astype(np.float32)
+        inlier_count = int(inliers.sum()) if inliers is not None else len(src)
+        return f"Calibração multiponto resolvida com {inlier_count}/{len(src)} pontos válidos."
+
+    def reset_heatmap(self) -> None:
+        if self.heatmap is not None:
+            self.heatmap[:] = 0
+
+    def update_heatmap(self, uv: Optional[Point2D], width: int, height: int, cfg: TrackerConfig) -> None:
+        if uv is None:
+            return
+        if self.heatmap is None or self.heatmap.shape != (height, width):
+            self.heatmap = np.zeros((height, width), dtype=np.float32)
+
+        self.heatmap *= cfg.heatmap_decay
+        cv2.circle(self.heatmap, uv, 18, 1.0, -1)
+        cv2.GaussianBlur(self.heatmap, (0, 0), 7, dst=self.heatmap)
+
+    def get_heatmap_bgr(self) -> Optional[np.ndarray]:
+        if self.heatmap is None or float(self.heatmap.max()) <= 1e-9:
+            return None
+
+        normalized = self.heatmap / max(float(self.heatmap.max()), 1e-6)
+        heat_u8 = np.uint8(np.clip(normalized * 255.0, 0, 255))
+        heat_color = cv2.applyColorMap(heat_u8, cv2.COLORMAP_JET)
+        return heat_color
+
+    def process_frame(self, frame: np.ndarray, cfg: TrackerConfig) -> np.ndarray:
+        frame = self.crop_to_aspect_ratio(frame, cfg.width, cfg.height)
+        self.latest_frame_size = (cfg.width, cfg.height)
+
+        darkest_point = self.get_darkest_area(frame)
+        if darkest_point is None:
+            return frame
+
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        darkest_pixel_value = int(gray_frame[darkest_point[1], darkest_point[0]])
+
+        thresholded_image_strict = self.apply_binary_threshold(gray_frame, darkest_pixel_value, cfg.strict_offset)
+        thresholded_image_strict = self.mask_outside_square(thresholded_image_strict, darkest_point, cfg.roi_size)
+
+        thresholded_image_medium = self.apply_binary_threshold(gray_frame, darkest_pixel_value, cfg.medium_offset)
+        thresholded_image_medium = self.mask_outside_square(thresholded_image_medium, darkest_point, cfg.roi_size)
+
+        thresholded_image_relaxed = self.apply_binary_threshold(gray_frame, darkest_pixel_value, cfg.relaxed_offset)
+        thresholded_image_relaxed = self.mask_outside_square(thresholded_image_relaxed, darkest_point, cfg.roi_size)
+
+        image_array = [thresholded_image_relaxed, thresholded_image_medium, thresholded_image_strict]
+        kernel = np.ones((cfg.kernel_size, cfg.kernel_size), np.uint8)
+
+        final_contours: List[np.ndarray] = []
+        final_rotated_rect: Optional[Ellipse] = None
+        best_score = -1.0
+        best_center: Optional[Point2D] = None
+
+        for binary in image_array:
+            dilated = cv2.dilate(binary, kernel, iterations=2)
+            contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            reduced_contours = self.filter_contours_by_area_and_return_largest(
+                contours, cfg.min_contour_area, cfg.ratio_thresh
+            )
+            if len(reduced_contours) == 0 or reduced_contours[0] is None or len(reduced_contours[0]) <= 5:
+                continue
+
+            current_goodness = self.check_ellipse_goodness(dilated, reduced_contours[0])
+            ellipse = cv2.fitEllipse(reduced_contours[0])
+            total_pixels = self.check_contour_pixels(reduced_contours[0], dilated.shape)
+            score = float(current_goodness[0]) * float(total_pixels[0]) * float(total_pixels[0]) * max(float(total_pixels[1]), 1e-6)
+
+            if score > best_score:
+                best_score = score
+                final_contours = reduced_contours
+                best_center = tuple(map(int, ellipse[0]))
+
+        pupil_x = pupil_y = None
+        if final_contours:
+            optimized = self.optimize_contours_by_angle(final_contours, gray_frame)
+            if isinstance(optimized, np.ndarray) and len(optimized) > 5:
+                ellipse = cv2.fitEllipse(optimized)
+                final_rotated_rect = ellipse
+                pupil_x, pupil_y = map(int, ellipse[0])
+                self.ray_lines.append(final_rotated_rect)
+                while len(self.ray_lines) > cfg.max_rays:
+                    self.ray_lines.popleft()
+        elif best_center is not None:
+            pupil_x, pupil_y = best_center
+
+        model_center = self.compute_average_intersection(
+            frame, cfg.ray_sample_n, cfg.max_intersections, cfg.min_angle_diff_deg
+        )
+
+        if not self.sphere_center_locked_2d:
+            if model_center is not None:
+                self.model_centers.append(model_center)
+                avg_x = int(np.mean([p[0] for p in self.model_centers]))
+                avg_y = int(np.mean([p[1] for p in self.model_centers]))
+                model_center_average = (avg_x, avg_y)
+            else:
+                model_center_average = self.prev_model_center_avg
+
+            if model_center_average[0] != 0:
+                self.prev_model_center_avg = model_center_average
+                self.locked_model_center_avg = model_center_average
         else:
-            ev_lines = ["Eventos de zoom:", "- nenhum evento registrado"]
-        ax_events.text(0.0, 1.0, "\n".join(ev_lines), va="top", fontsize=11)
-        pdf.savefig(fig, bbox_inches="tight")
-        plt.close(fig)
+            model_center_average = self.locked_model_center_avg
 
-    buf.seek(0)
-    return buf.getvalue()
+        if pupil_x is None or pupil_y is None:
+            return frame
+
+        if len(self.model_centers) >= 10:
+            distances = [
+                math.hypot(pupil_x - center[0], pupil_y - center[1])
+                for center in list(self.model_centers)[-100:]
+            ]
+            adaptive_radius = max(60, int(np.percentile(distances, 95)))
+        else:
+            adaptive_radius = 120
+
+        cv2.rectangle(
+            frame,
+            (max(0, darkest_point[0] - cfg.roi_size // 2), max(0, darkest_point[1] - cfg.roi_size // 2)),
+            (min(cfg.width - 1, darkest_point[0] + cfg.roi_size // 2), min(cfg.height - 1, darkest_point[1] + cfg.roi_size // 2)),
+            (90, 90, 90),
+            1,
+        )
+        cv2.circle(frame, darkest_point, 4, (0, 255, 255), -1)
+        cv2.circle(frame, model_center_average, adaptive_radius, (255, 50, 50), 2)
+        cv2.circle(frame, model_center_average, 8, (255, 255, 0), -1)
+        cv2.circle(frame, (pupil_x, pupil_y), 5, (255, 255, 255), -1)
+
+        if final_rotated_rect is not None:
+            cv2.ellipse(frame, final_rotated_rect, (20, 255, 255), 2)
+            cv2.line(frame, model_center_average, (pupil_x, pupil_y), (255, 150, 50), 2)
+
+            dx = pupil_x - model_center_average[0]
+            dy = pupil_y - model_center_average[1]
+            extended_x = int(model_center_average[0] + cfg.circle_scale * dx)
+            extended_y = int(model_center_average[1] + cfg.circle_scale * dy)
+            cv2.line(frame, (pupil_x, pupil_y), (extended_x, extended_y), (200, 255, 0), 3)
+
+        sphere_center, gaze_dir = self.compute_gaze_vector(
+            pupil_x, pupil_y, model_center_average[0], model_center_average[1], cfg.width, cfg.height
+        )
+
+        gaze_uv = None
+        if sphere_center is not None and gaze_dir is not None:
+            gaze_uv = self.project_gaze_to_uv(gaze_dir, cfg.width, cfg.height, cfg)
+            self.update_heatmap(gaze_uv, cfg.width, cfg.height, cfg)
+            if gaze_uv is not None:
+                cv2.circle(frame, gaze_uv, 8, (0, 0, 255), -1)
+
+        if cfg.show_debug_overlay and sphere_center is not None and gaze_dir is not None:
+            origin_text = f"Origem: ({sphere_center[0]:.2f}, {sphere_center[1]:.2f}, {sphere_center[2]:.2f})"
+            dir_text = f"Direcao: ({gaze_dir[0]:.2f}, {gaze_dir[1]:.2f}, {gaze_dir[2]:.2f})"
+            raw_text = f"Bruto: {self.latest_raw_uv if self.latest_raw_uv else 'None'}"
+            map_text = f"Mapeado: {self.latest_mapped_uv if self.latest_mapped_uv else 'None'}"
+            status = []
+            status.append("Centro OK" if self.center_calibrated else "Centro OFF")
+            status.append("Multi OK" if self.affine_2d is not None else "Multi OFF")
+            status.append("2D travado" if self.sphere_center_locked_2d else "2D livre")
+            status_text = " | ".join(status)
+
+            for idx, text in enumerate([origin_text, dir_text, raw_text, map_text, status_text]):
+                y = frame.shape[0] - 75 + idx * 15
+                cv2.putText(frame, text, (11, y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 0), 3)
+                cv2.putText(frame, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 0), 1)
+
+        self.latest_result = {
+            "darkest_point": darkest_point,
+            "pupil_center": (pupil_x, pupil_y),
+            "model_center": model_center_average,
+            "sphere_center": sphere_center,
+            "gaze_dir": gaze_dir,
+            "raw_uv": self.latest_raw_uv,
+            "mapped_uv": self.latest_mapped_uv,
+            "center_calibrated": self.center_calibrated,
+            "has_multi_calibration": self.affine_2d is not None,
+        }
+        return frame
 
 
-def reset_session():
-    global STATE
-    with STATE.lock:
-        STATE.gaze_norm = (0.5, 0.5)
-        STATE.face_detected = False
-        STATE.blink_count_total = 0
-        STATE.zoom_level = 1.0
-        STATE.active_painting_id = None
-        STATE.focus_started_at = None
-        STATE.focus_seconds_by_painting = {}
-        STATE.blink_timestamps = []
-        STATE.pending_single_blink_ts = None
-        STATE.zoom_events = []
-        STATE.eye_contact_samples = 0
-        STATE.gaze_samples_norm = []
-        STATE.session_started_at = now_ts()
-        STATE.last_info_title = "Nenhum quadro selecionado"
-        STATE.last_info_body = "Olhe para um quadro por alguns instantes para abrir a ficha rápida."
-        STATE.current_blink_ratio = 0.0
-        STATE.last_rendered_scene = None
-        STATE.last_scene_cursor = (SCENE_W // 2, SCENE_H // 2)
-        STATE.debug_text = "Sessão reiniciada"
+TRACKER = IrisTracker3D()
+CONFIG_LOCK = threading.Lock()
+CURRENT_CONFIG = TrackerConfig()
 
 
-def set_center_calibration():
-    with STATE.lock:
-        gx, gy = STATE.gaze_norm
-        STATE.calibration_offset = (0.5 - gx, 0.5 - gy)
-        STATE.debug_text = f"Calibrado para centro: offset=({STATE.calibration_offset[0]:.3f}, {STATE.calibration_offset[1]:.3f})"
+def get_config() -> TrackerConfig:
+    with CONFIG_LOCK:
+        return CURRENT_CONFIG
 
 
-def clear_calibration():
-    with STATE.lock:
-        STATE.calibration_offset = (0.0, 0.0)
-        STATE.debug_text = "Calibração zerada"
+def set_config(cfg: TrackerConfig) -> None:
+    global CURRENT_CONFIG
+    with CONFIG_LOCK:
+        CURRENT_CONFIG = cfg
+        TRACKER.ray_lines = deque(TRACKER.ray_lines, maxlen=cfg.max_rays)
+        TRACKER.stored_intersections = deque(TRACKER.stored_intersections, maxlen=cfg.max_intersections)
 
 
-def app_sidebar():
-    st.sidebar.title("Controles")
-    st.sidebar.markdown("Use webcam, mantenha o rosto centralizado e os olhos visíveis.")
-
-    col_a, col_b = st.sidebar.columns(2)
-    if col_a.button("Calibrar centro", use_container_width=True):
-        set_center_calibration()
-    if col_b.button("Zerar calib.", use_container_width=True):
-        clear_calibration()
-
-    if st.sidebar.button("Reiniciar sessão", use_container_width=True):
-        reset_session()
-
-    with STATE.lock:
-        blink_total = STATE.blink_count_total
-        zoom_level = STATE.zoom_level
-        gaze = STATE.gaze_norm
-        blink_ratio = STATE.current_blink_ratio
-        debug_text = STATE.debug_text
-
-    st.sidebar.metric("Zoom", f"{zoom_level:.2f}x")
-    st.sidebar.metric("Piscadas", blink_total)
-    st.sidebar.metric("Gaze X", f"{gaze[0]:.2f}")
-    st.sidebar.metric("Gaze Y", f"{gaze[1]:.2f}")
-    st.sidebar.caption(f"Blink ratio atual: {blink_ratio:.3f}")
-    st.sidebar.code(debug_text)
-
-    st.sidebar.markdown("### Gestos")
-    st.sidebar.markdown("- **2 piscadas rápidas**: aproxima\n- **1 piscada isolada**: afasta\n- **olhar fixo ~0,6s**: abre informações do quadro")
+TARGET_LABELS = {
+    "TL": lambda w, h: (int(w * 0.10), int(h * 0.10)),
+    "TR": lambda w, h: (int(w * 0.90), int(h * 0.10)),
+    "BL": lambda w, h: (int(w * 0.10), int(h * 0.90)),
+    "BR": lambda w, h: (int(w * 0.90), int(h * 0.90)),
+    "C": lambda w, h: (int(w * 0.50), int(h * 0.50)),
+}
 
 
-reset_session_once = st.session_state.get("reset_session_once")
-if reset_session_once is None:
-    reset_session()
-    st.session_state["reset_session_once"] = True
+def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
+    image = frame.to_ndarray(format="bgr24")
+    cfg = get_config()
+    processed = TRACKER.process_frame(image, cfg)
+    return av.VideoFrame.from_ndarray(processed, format="bgr24")
 
-app_sidebar()
 
-st.title("👁️ Simulacro — Galeria 3D controlada pelo olhar")
-st.caption("Versão adaptada para Streamlit: sem tkinter, sem janelas OpenCV locais e pronta para rodar em repositório hospedado.")
+def render_sidebar() -> None:
+    st.sidebar.header("Controles do rastreador")
 
-st_autorefresh(interval=350, key="gallery_refresh")
+    cfg = TrackerConfig(
+        width=st.sidebar.select_slider("Largura", options=[320, 480, 640, 800], value=640),
+        height=st.sidebar.select_slider("Altura", options=[240, 360, 480, 600], value=480),
+        strict_offset=st.sidebar.slider("Threshold strict", 0, 30, 5),
+        medium_offset=st.sidebar.slider("Threshold medium", 0, 40, 15),
+        relaxed_offset=st.sidebar.slider("Threshold relaxed", 0, 60, 25),
+        roi_size=st.sidebar.slider("Tamanho da ROI", 120, 360, 250),
+        kernel_size=st.sidebar.select_slider("Kernel morfológico", options=[3, 5, 7, 9], value=5),
+        min_contour_area=st.sidebar.slider("Área mínima do contorno", 100, 5000, 1000, step=50),
+        ratio_thresh=st.sidebar.slider("Razão máxima largura/altura", 1.1, 6.0, 3.0, step=0.1),
+        max_rays=st.sidebar.slider("Máximo de raios", 20, 300, 120),
+        ray_sample_n=st.sidebar.slider("Raios por interseção", 2, 20, 5),
+        max_intersections=st.sidebar.slider("Máximo de interseções", 50, 3000, 1500, step=50),
+        min_angle_diff_deg=st.sidebar.slider("Diferença angular mínima", 0.5, 20.0, 2.0, step=0.5),
+        smoothing_window=st.sidebar.slider("Janela de suavização", 10, 400, 200),
+        circle_scale=st.sidebar.slider("Escala da linha do olhar", 1.0, 4.0, 2.0, step=0.1),
+        pinhole_fx_ratio=st.sidebar.slider("Projeção FX", 0.2, 2.0, 0.95, step=0.05),
+        pinhole_fy_ratio=st.sidebar.slider("Projeção FY", 0.2, 2.0, 0.95, step=0.05),
+        heatmap_decay=st.sidebar.slider("Decaimento do heatmap", 0.900, 1.000, 0.995, step=0.001),
+        show_debug_overlay=st.sidebar.toggle("Mostrar overlay técnico", value=True),
+    )
+    set_config(cfg)
 
-left_col, right_col = st.columns([1.05, 1.25], gap="large")
+    st.sidebar.subheader("Calibração")
+    if st.sidebar.button("Calibrar centro agora", use_container_width=True):
+        st.sidebar.success(TRACKER.calibrate_center_now())
 
-with left_col:
-    st.subheader("Câmera / rastreamento ocular")
-    webrtc_streamer(
-        key="eye-gallery-webrtc",
+    cols = st.sidebar.columns(2)
+    if cols[0].button("Travar centro 2D", use_container_width=True):
+        cols[0].success(TRACKER.lock_current_center())
+    if cols[1].button("Destravar centro 2D", use_container_width=True):
+        cols[1].success(TRACKER.unlock_current_center())
+
+    if st.sidebar.button("Limpar calibrações", use_container_width=True):
+        st.sidebar.warning(TRACKER.clear_all_calibration())
+
+    if st.sidebar.button("Resetar tracker", use_container_width=True):
+        TRACKER.reset()
+        st.sidebar.info("Tracker resetado.")
+
+    if st.sidebar.button("Resetar heatmap", use_container_width=True):
+        TRACKER.reset_heatmap()
+        st.sidebar.info("Heatmap resetado.")
+
+    st.sidebar.subheader("Calibração multiponto")
+    w, h = cfg.width, cfg.height
+    cols = st.sidebar.columns(2)
+    messages = []
+    buttons = [
+        (cols[0], "Salvar TL", "TL"),
+        (cols[1], "Salvar TR", "TR"),
+    ]
+    for col, label, key in buttons:
+        if col.button(label, use_container_width=True):
+            messages.append(TRACKER.add_multi_calibration_point(key, TARGET_LABELS[key](w, h)))
+
+    cols = st.sidebar.columns(2)
+    buttons = [
+        (cols[0], "Salvar BL", "BL"),
+        (cols[1], "Salvar BR", "BR"),
+    ]
+    for col, label, key in buttons:
+        if col.button(label, use_container_width=True):
+            messages.append(TRACKER.add_multi_calibration_point(key, TARGET_LABELS[key](w, h)))
+
+    if st.sidebar.button("Salvar Centro", use_container_width=True):
+        messages.append(TRACKER.add_multi_calibration_point("C", TARGET_LABELS["C"](w, h)))
+
+    if st.sidebar.button("Resolver multiponto", use_container_width=True):
+        messages.append(TRACKER.solve_multi_calibration())
+
+    for msg in messages:
+        st.sidebar.info(msg)
+
+    if TRACKER.multi_points_raw:
+        st.sidebar.caption(f"Pontos salvos: {sorted(TRACKER.multi_points_raw.keys())}")
+
+
+def render_status() -> None:
+    result = TRACKER.latest_result
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Pupila", str(result.get("pupil_center", "-")))
+    col2.metric("Centro ocular 2D", str(result.get("model_center", "-")))
+    col3.metric("Bruto", str(result.get("raw_uv", "-")))
+    col4.metric("Mapeado", str(result.get("mapped_uv", "-")))
+
+    with st.expander("Resumo técnico"):
+        st.json(
+            {
+                "center_calibrated": bool(result.get("center_calibrated", False)),
+                "has_multi_calibration": bool(result.get("has_multi_calibration", False)),
+                "sphere_center": (
+                    result.get("sphere_center").tolist() if isinstance(result.get("sphere_center"), np.ndarray) else None
+                ),
+                "gaze_dir": result.get("gaze_dir").tolist() if isinstance(result.get("gaze_dir"), np.ndarray) else None,
+                "stored_rays": len(TRACKER.ray_lines),
+                "stored_intersections": len(TRACKER.stored_intersections),
+            }
+        )
+
+
+def render_heatmap_section() -> None:
+    st.subheader("Heatmap do olhar")
+    heatmap_bgr = TRACKER.get_heatmap_bgr()
+    if heatmap_bgr is None:
+        st.info("O heatmap aparecerá depois que o olhar começar a ser projetado.")
+        return
+
+    heatmap_rgb = cv2.cvtColor(heatmap_bgr, cv2.COLOR_BGR2RGB)
+    st.image(heatmap_rgb, caption="Mapa de calor acumulado", use_container_width=True)
+
+    success, png_bytes = cv2.imencode(".png", heatmap_bgr)
+    if success:
+        st.download_button(
+            "Baixar heatmap PNG",
+            data=png_bytes.tobytes(),
+            file_name="heatmap_iris.png",
+            mime="image/png",
+            use_container_width=True,
+        )
+
+
+def main() -> None:
+    st.set_page_config(page_title="Rastreamento de Íris 3D", layout="wide")
+    st.title("Rastreamento de íris/pupila em Streamlit")
+    st.write(
+        "Esta versão foi adaptada para web. Ela mantém a lógica do seu código: limiarização da pupila, "
+        "ajuste de elipse, projeção de raios, interseção para estimar o centro da esfera ocular, "
+        "vetor de olhar 3D e calibração central/multiponto."
+    )
+    st.caption(
+        "Uso: clique em START, permita a câmera, olhe para o centro e clique em 'Calibrar centro agora'. "
+        "Depois, se quiser mais precisão, salve TL/TR/BL/BR/C e resolva o multiponto."
+    )
+
+    render_sidebar()
+
+    rtc_ctx = webrtc_streamer(
+        key="iris-tracker-3d",
         mode=WebRtcMode.SENDRECV,
-        video_processor_factory=EyeTrackerProcessor,
-        media_stream_constraints={"video": True, "audio": False},
+        media_stream_constraints={
+            "video": {"width": {"ideal": get_config().width}, "height": {"ideal": get_config().height}},
+            "audio": False,
+        },
+        video_frame_callback=video_frame_callback,
         async_processing=True,
     )
-    st.info("Para melhor resultado, use boa iluminação e mantenha a webcam na altura dos olhos.")
 
-with right_col:
-    st.subheader("Sala 3D")
-    scene = render_scene()
-    st.image(scene, channels="BGR", use_container_width=True)
+    if rtc_ctx.state.playing:
+        st.success("Câmera ativa.")
+    else:
+        st.info("Clique em START para iniciar a câmera.")
 
-    with STATE.lock:
-        title = STATE.last_info_title
-        body = STATE.last_info_body
-        focus = dict(STATE.focus_seconds_by_painting)
-        active = STATE.active_painting_id
-        since = STATE.focus_started_at
+    render_status()
+    render_heatmap_section()
 
-    if active and since is not None:
-        focus[active] = focus.get(active, 0.0) + (now_ts() - since)
 
-    st.markdown(f"### {title}")
-    st.write(body)
-
-    if focus:
-        ranking = sorted(focus.items(), key=lambda kv: kv[1], reverse=True)
-        human = []
-        label_map = {p["id"]: p["title"] for p in PAINTINGS}
-        for pid, sec in ranking:
-            human.append(f"**{label_map.get(pid, pid)}** — {sec:.1f} s")
-        st.markdown("**Tempo de foco acumulado:**  "+" | ".join(human[:5]))
-
-st.divider()
-
-report_col1, report_col2, report_col3 = st.columns([1, 1, 1.2])
-with report_col1:
-    if st.button("Gerar prévia do mapa de calor", use_container_width=True):
-        with STATE.lock:
-            last_scene = None if STATE.last_rendered_scene is None else STATE.last_rendered_scene.copy()
-            gaze_samples = list(STATE.gaze_samples_norm)
-        preview = build_heatmap_overlay(last_scene if last_scene is not None else scene, gaze_samples)
-        st.session_state["heat_preview"] = preview
-
-with report_col2:
-    pdf_bytes = build_report_pdf()
-    st.download_button(
-        "Baixar relatório PDF",
-        data=pdf_bytes,
-        file_name="relatorio_mapa_calor_galeria_3d.pdf",
-        mime="application/pdf",
-        use_container_width=True,
-    )
-
-with report_col3:
-    st.markdown("O relatório PDF inclui a cena final, o mapa de calor, resumo da sessão, tempo de foco por quadro e eventos de zoom.")
-
-preview = st.session_state.get("heat_preview")
-if preview is not None:
-    st.subheader("Prévia do mapa de calor")
-    st.image(preview, channels="BGR", use_container_width=True)
-
-st.markdown("---")
-st.markdown(
-    "**Observação importante:** esta versão foi adaptada para webcam comum em Streamlit. "
-    "Para precisão igual à da foto com elipse verde sobre a pupila, o ideal é usar câmera ocular dedicada/IR e um app nativo em OpenCV."
-)
+if __name__ == "__main__":
+    main()
