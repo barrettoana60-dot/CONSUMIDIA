@@ -1,18 +1,3 @@
-# REMOVIDO: import subprocess
-# REMOVIDO: import sys
-
-# REMOVIDO: def install_system_deps():
-# REMOVIDO:     try:
-# REMOVIDO:         subprocess.run(
-# REMOVIDO:             ["apt-get", "install", "-y",
-# REMOVIDO:              "libgl1-mesa-glx", # REMOVIDO
-# REMOVIDO:              "libglib2.0-0"],
-# REMOVIDO:             capture_output=True
-# REMOVIDO:         )
-# REMOVIDO:     except Exception:
-# REMOVIDO:         pass
-
-# REMOVIDO: install_system_deps() # REMOVIDO
 
 import cv2
 import numpy as np
