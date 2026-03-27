@@ -1,5 +1,6 @@
-streamlit>=1.50
-streamlit-webrtc>=0.63.0
-opencv-python-headless>=4.10
-numpy>=1.26
-av>=14.0.0
+opencv-python
+numpy
+mediapipe
+scipy
+pyautogui
+keyboard
