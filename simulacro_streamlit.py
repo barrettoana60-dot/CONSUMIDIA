@@ -10,10 +10,8 @@ from collections import deque
 from typing import Dict, List, Optional, Tuple
 
 import av
-import cv2
 import numpy as np
 import streamlit as st
-import mediapipe as mp
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -23,6 +21,56 @@ from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas as pdf_canvas
 from streamlit_webrtc import WebRtcMode, RTCConfiguration, VideoProcessorBase, webrtc_streamer
 
+CV2_IMPORT_ERROR = None
+MP_IMPORT_ERROR = None
+
+try:
+    import cv2
+except Exception as e:
+    cv2 = None
+    CV2_IMPORT_ERROR = e
+
+try:
+    import mediapipe as mp
+except Exception as e:
+    mp = None
+    MP_IMPORT_ERROR = e
+
+
+if CV2_IMPORT_ERROR is not None or MP_IMPORT_ERROR is not None:
+    st.set_page_config(page_title="Sala 3D com Rastreamento Ocular", layout="wide")
+    st.title("Sala 3D com Rastreamento Ocular")
+    st.error("O app carregou, mas as dependências nativas de visão não subiram corretamente no servidor.")
+    if CV2_IMPORT_ERROR is not None:
+        st.code(f"cv2 import error: {CV2_IMPORT_ERROR}")
+    if MP_IMPORT_ERROR is not None:
+        st.code(f"mediapipe import error: {MP_IMPORT_ERROR}")
+    st.markdown(
+        """
+Use estes arquivos no diretório raiz do repositório:
+
+requirements.txt
+```
+streamlit==1.44.1
+streamlit-webrtc==0.64.5
+mediapipe==0.10.30
+numpy==1.26.4
+matplotlib==3.9.4
+Pillow==10.4.0
+reportlab==4.4.10
+av==17.0.0
+```
+
+packages.txt
+```
+libgl1
+libglib2.0-0
+```
+
+No Streamlit Community Cloud, defina Python 3.11 em Advanced settings e depois faça um reboot/redeploy completo do app.
+        """
+    )
+    st.stop()
 
 # ============================================================
 # CONFIG
@@ -40,13 +88,13 @@ ROOM_HALF_HEIGHT = 3.0
 ROOM_DEPTH = 9.0
 DEFAULT_FOCAL = 820.0
 RTC_CONFIGURATION = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
-FONT = cv2.FONT_HERSHEY_SIMPLEX
+FONT = cv2.FONT_HERSHEY_SIMPLEX if cv2 is not None else 0
 
 os.makedirs(EXPORT_DIR, exist_ok=True)
 os.makedirs(REPORT_DIR, exist_ok=True)
 os.makedirs(ASSETS_DIR, exist_ok=True)
 
-mp_face_mesh = mp.solutions.face_mesh
+mp_face_mesh = mp.solutions.face_mesh if mp is not None else None
 
 RIGHT_EYE_POINTS = [33, 133, 159, 145, 158, 153, 160, 144]
 LEFT_EYE_POINTS = [362, 263, 386, 374, 385, 380, 387, 373]
