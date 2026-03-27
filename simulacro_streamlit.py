@@ -1,4 +1,13 @@
-rom __future__ import annotations
+
+"""
+Iris tracker for Streamlit Cloud
+- webcam via streamlit-webrtc
+- MediaPipe Face Mesh with robust imports across versions
+- no tkinter / no cv2.imshow
+- safe for headless deployment with opencv-python-headless
+"""
+
+from __future__ import annotations
 
 import io
 import math
