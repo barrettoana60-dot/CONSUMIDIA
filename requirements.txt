@@ -1,6 +1,8 @@
-opencv-python
+streamlit
+streamlit-webrtc
+opencv-python-headless
 numpy
 mediapipe
 scipy
-pyautogui
-keyboard
+av
+reportlab
