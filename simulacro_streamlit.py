@@ -1,1303 +1,1496 @@
 
-import streamlit as st
-import streamlit.components.v1 as components
+import argparse
+import math
+import os
+import sys
+import time
+import threading
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple, Dict
 
-st.set_page_config(page_title="Simulacro Streamlit – Tracking Ocular", layout="wide")
+import cv2
+import numpy as np
+import pygame
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
 
-st.title("Simulacro Streamlit – tracking ocular como controle principal")
-st.caption("Versão Streamlit sem tkinter: cursor controlado pelo olho, foco por permanência do olhar, 1 piscada afasta e 2 piscadas aproximam.")
+# =============================================================================
+# Utilidades matemáticas
+# =============================================================================
 
-HTML_APP = r"""
-<div id="ocular-gallery-root">
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap');
-  :root{
-    --bg:#060d1a;
-    --bg2:#08101f;
-    --panel:rgba(10,16,30,.84);
-    --soft:rgba(255,255,255,.05);
-    --line:rgba(255,255,255,.08);
-    --text:#e8f0ff;
-    --muted:#89a0c7;
-    --cyan:#5dade2;
-    --violet:#a569bd;
-    --gold:#f0c040;
-    --ok:#2ecc71;
-    --warn:#f39c12;
-    --danger:#e74c3c;
-    font-family:'Space Grotesk',system-ui,sans-serif;
-  }
-  *{box-sizing:border-box}
-  body{background:transparent;margin:0}
-  #ocular-gallery-root{
-    color:var(--text);
-    min-height:1380px;
-    border-radius:24px;
-    padding:16px;
-    overflow:hidden;
-    background:
-      radial-gradient(ellipse 70% 40% at 20% 0%, rgba(93,173,226,.08) 0%, transparent 55%),
-      radial-gradient(ellipse 60% 40% at 80% 100%, rgba(165,105,189,.09) 0%, transparent 55%),
-      linear-gradient(180deg, #050b16 0%, #07101d 100%);
-    border:1px solid rgba(255,255,255,.05);
-  }
-  .topbar{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;flex-wrap:wrap;margin-bottom:14px}
-  .headline h2{margin:0;font-size:25px;font-weight:800;letter-spacing:-.4px}
-  .headline p{margin:6px 0 0;color:var(--muted);font-size:13px;line-height:1.5;max-width:920px}
-  .controls{display:flex;gap:8px;flex-wrap:wrap}
-  .btn{
-    appearance:none;border:none;cursor:pointer;
-    padding:10px 14px;border-radius:12px;
-    font-size:13px;font-weight:800;color:var(--text);
-    background:rgba(255,255,255,.06);
-    border:1px solid rgba(255,255,255,.10);
-    transition:.18s ease;
-  }
-  .btn:hover{transform:translateY(-1px);background:rgba(93,173,226,.12);border-color:rgba(93,173,226,.35)}
-  .btn.primary{background:rgba(93,173,226,.18);border-color:rgba(93,173,226,.35)}
-  .btn.warn{background:rgba(243,156,18,.14);border-color:rgba(243,156,18,.35)}
-  .btn.subtle{background:rgba(165,105,189,.14);border-color:rgba(165,105,189,.35)}
-  .btn.danger{background:rgba(231,76,60,.14);border-color:rgba(231,76,60,.35)}
-  .layout{display:grid;grid-template-columns:minmax(0,1.72fr) 330px;gap:14px;min-height:1120px}
-  .scene-panel{
-    position:relative;min-height:960px;overflow:hidden;border-radius:22px;
-    border:1px solid var(--line);
-    background:rgba(255,255,255,.02);
-    box-shadow:0 26px 70px rgba(0,0,0,.36);
-  }
-  #scene-shell{position:absolute;inset:0}
-  #room,#heatmap{position:absolute;inset:0;width:100%;height:100%;display:block}
-  #heatmap{display:none}
-  #gazeCursor{
-    position:absolute;left:50%;top:50%;width:28px;height:28px;transform:translate(-50%,-50%);
-    border-radius:50%;border:2px solid rgba(255,255,255,.95);
-    box-shadow:0 0 0 6px rgba(93,173,226,.14),0 0 24px rgba(93,173,226,.28);
-    pointer-events:none;z-index:7;
-  }
-  #gazeCursor::after{content:"";position:absolute;inset:5px;border-radius:50%;background:rgba(255,255,255,.82)}
-  .chip{
-    position:absolute;z-index:8;
-    display:flex;align-items:center;gap:8px;
-    padding:8px 12px;border-radius:999px;
-    background:rgba(6,13,26,.84);border:1px solid rgba(255,255,255,.08);
-    font-size:12px;color:var(--muted);backdrop-filter:blur(12px);
-  }
-  .chip strong{color:var(--text)}
-  #statusChip{left:14px;top:14px}
-  #controlChip{left:174px;top:14px}
-  #blinkChip{left:336px;top:14px}
-  .dot{width:9px;height:9px;border-radius:50%;background:var(--danger);box-shadow:0 0 16px rgba(231,76,60,.4)}
-  .dot.on{background:var(--ok);box-shadow:0 0 16px rgba(46,204,113,.4)}
-  .meter{
-    position:absolute;top:14px;right:14px;z-index:8;width:210px;
-    padding:10px 12px;border-radius:14px;
-    background:rgba(6,13,26,.84);border:1px solid rgba(255,255,255,.08);
-  }
-  .meter .label{font-family:'JetBrains Mono',monospace;color:var(--muted);font-size:11px;margin-bottom:6px}
-  .bar{height:8px;border-radius:999px;background:rgba(255,255,255,.06);overflow:hidden}
-  .bar>div{height:100%;width:0%;background:linear-gradient(90deg,#5dade2 0%,#a569bd 100%);border-radius:999px;transition:width .06s}
-  #permissionNote{
-    position:absolute;left:14px;bottom:14px;z-index:8;max-width:70%;
-    padding:10px 13px;border-radius:12px;background:rgba(6,13,26,.86);
-    border:1px solid rgba(255,255,255,.07);color:var(--muted);font-size:12px;line-height:1.45;
-  }
-  #blinkToast{
-    position:absolute;left:50%;bottom:18px;transform:translateX(-50%);z-index:9;
-    padding:8px 16px;border-radius:999px;background:rgba(6,13,26,.90);
-    border:1px solid rgba(93,173,226,.22);font-family:'JetBrains Mono',monospace;
-    font-size:12px;color:var(--muted);opacity:0;transition:opacity .25s;
-  }
-  #blinkToast.show{opacity:1}
-  #artInfoFloat{
-    position:absolute;z-index:9;min-width:220px;max-width:290px;pointer-events:none;
-    transform:translate(-50%,-122%);
-    opacity:0;transition:opacity .15s ease;
-    padding:12px 14px;border-radius:14px;
-    background:rgba(6,13,26,.92);border:1px solid rgba(93,173,226,.22);
-    box-shadow:0 18px 45px rgba(0,0,0,.35);backdrop-filter:blur(14px);
-  }
-  #artInfoFloat.show{opacity:1}
-  #artInfoFloat .ttl{font-size:13px;font-weight:800;margin-bottom:4px}
-  #artInfoFloat .sub{font-size:11px;color:var(--cyan);font-weight:700;margin-bottom:4px}
-  #artInfoFloat .txt{font-size:11px;color:var(--muted);line-height:1.4}
+EPS = 1e-8
 
-  .sidebar{display:flex;flex-direction:column;gap:12px}
-  .card{
-    background:rgba(255,255,255,.025);
-    border:1px solid rgba(255,255,255,.07);
-    border-radius:16px;
-    padding:14px;
-    box-shadow:inset 0 1px 0 rgba(255,255,255,.03);
-  }
-  .card h3{margin:0 0 10px;font-size:13px;color:var(--muted);letter-spacing:.5px;text-transform:uppercase}
-  .videoWrap{position:relative;width:100%;aspect-ratio:16/10;overflow:hidden;border-radius:12px;border:1px solid rgba(255,255,255,.07);background:#030812}
-  #video{width:100%;height:100%;object-fit:cover;transform:scaleX(-1);background:#02060d}
-  #camOverlay{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
-  .stats{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-  .stat{background:rgba(255,255,255,.025);border:1px solid rgba(255,255,255,.06);border-radius:12px;padding:10px}
-  .stat .k{font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;margin-bottom:5px}
-  .stat .v{font-size:20px;font-weight:800;font-variant-numeric:tabular-nums}
-  .small{margin-top:8px;color:var(--muted);font-size:11.5px;line-height:1.45}
-  .manualZoom{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px}
-  .metaLine{display:flex;justify-content:space-between;gap:8px;padding:7px 0;border-bottom:1px solid rgba(255,255,255,.05);font-size:12px;color:var(--muted)}
-  .metaLine strong{color:var(--text)}
-  .metaLine:last-child{border-bottom:none}
-  #selectedTitle{font-size:17px;font-weight:800;line-height:1.2;margin-bottom:4px}
-  #selectedArtist{font-size:12px;color:var(--cyan);font-weight:700;margin-bottom:8px}
-  #selectedDesc{font-size:12.5px;color:var(--muted);line-height:1.5}
-  #artList{display:grid;gap:8px;max-height:260px;overflow:auto}
-  #artList::-webkit-scrollbar{width:4px}
-  #artList::-webkit-scrollbar-thumb{background:rgba(255,255,255,.12);border-radius:4px}
-  .artRow{
-    display:grid;grid-template-columns:12px 1fr auto;gap:8px;align-items:center;
-    padding:10px;border-radius:12px;background:rgba(255,255,255,.025);
-    border:1px solid rgba(255,255,255,.06);cursor:pointer;transition:.15s ease;
-  }
-  .artRow:hover{background:rgba(93,173,226,.06);border-color:rgba(93,173,226,.28)}
-  .artBullet{width:12px;height:12px;border-radius:50%}
-  .artRow .title{font-size:13px;font-weight:700;margin-bottom:2px}
-  .artRow .sub{font-size:11px;color:var(--muted)}
-  .badge{
-    font-size:10px;font-weight:700;color:#bfd6f6;background:rgba(93,173,226,.12);
-    border:1px solid rgba(93,173,226,.2);padding:4px 8px;border-radius:999px;white-space:nowrap
-  }
-  .blinkGuide{display:grid;grid-template-columns:1fr 1fr;gap:6px}
-  .blinkCard{
-    background:rgba(255,255,255,.025);border:1px solid rgba(255,255,255,.06);
-    border-radius:10px;padding:8px;text-align:center;
-  }
-  .blinkCard .icon{font-size:18px;margin-bottom:3px}
-  .blinkCard .bl{font-size:11px;font-weight:700;margin-bottom:2px}
-  .blinkCard .desc{font-size:10.5px;color:var(--muted)}
-  #log{
-    min-height:110px;max-height:160px;overflow:auto;border-radius:10px;padding:8px;
-    background:rgba(2,6,15,.7);border:1px solid rgba(255,255,255,.06);
-    color:var(--muted);font-size:11px;line-height:1.4;font-family:'JetBrains Mono',monospace;white-space:pre-wrap;
-  }
-  @media (max-width:1080px){
-    .layout{grid-template-columns:1fr}
-    .scene-panel{min-height:700px}
-    #ocular-gallery-root{min-height:1520px}
-    .topbar{flex-direction:column}
-    #controlChip{left:14px;top:52px}
-    #blinkChip{left:168px;top:52px}
-    .meter{top:92px;right:14px}
-  }
-</style>
 
-<div class="topbar">
-  <div class="headline">
-    <h2>Sala 3D – tracking ocular como controle principal</h2>
-    <p>Esta versão usa o <strong>olho como controle principal</strong>: o cursor é movido pelo deslocamento da pupila dentro dos olhos, com foco da obra por permanência do olhar. <strong>1 piscada afasta</strong> e <strong>2 piscadas rápidas aproximam</strong>. A navegação lateral não usa pose da cabeça.</p>
-  </div>
-  <div class="controls">
-    <button class="btn primary" id="startBtn">▶ Iniciar</button>
-    <button class="btn warn" id="calibrateBtn">⊕ Calibrar olhos</button>
-    <button class="btn subtle" id="invertBtn">↔ Inverter X</button>
-    <button class="btn" id="zoomInBtn">＋ Aproximar</button>
-    <button class="btn" id="zoomOutBtn">－ Afastar</button>
-    <button class="btn" id="exportBtn">↓ PDF</button>
-    <button class="btn danger" id="stopBtn">■ Parar</button>
-  </div>
-</div>
+def clamp(value, min_value, max_value):
+    return max(min_value, min(max_value, value))
 
-<div class="layout">
-  <div class="scene-panel">
-    <div id="scene-shell">
-      <canvas id="room"></canvas>
-      <canvas id="heatmap"></canvas>
-      <div id="gazeCursor"></div>
-      <div class="chip" id="statusChip"><span id="statusDot" class="dot"></span><span id="statusText">Parado</span></div>
-      <div class="chip" id="controlChip">Controle: <strong id="controlText">Olho</strong></div>
-      <div class="chip" id="blinkChip">Blink: <strong id="blinkText">Aguardando</strong></div>
-      <div class="meter"><div class="label">Dwell / seleção</div><div class="bar"><div id="dwellFill"></div></div></div>
-      <div id="permissionNote">Clique em iniciar, permita a câmera e depois clique em calibrar olhando reto. Nesta versão, o cursor lateral é guiado pelo olho; o blink controla o zoom.</div>
-      <div id="blinkToast">Blink detectado</div>
-      <div id="artInfoFloat"><div class="ttl" id="floatTitle"></div><div class="sub" id="floatSub"></div><div class="txt" id="floatTxt"></div></div>
-    </div>
-  </div>
 
-  <div class="sidebar">
-    <div class="card">
-      <h3>Câmera</h3>
-      <div class="videoWrap">
-        <video id="video" autoplay muted playsinline></video>
-        <canvas id="camOverlay"></canvas>
-      </div>
-      <div class="manualZoom">
-        <button class="btn" id="zoomInBtn2">＋ Aproximar</button>
-        <button class="btn" id="zoomOutBtn2">－ Afastar</button>
-      </div>
-      <div class="small" id="cameraHelp">O overlay desenha o contorno dos olhos e a pupila estimada. A pose da cabeça não controla a sala; o deslocamento da pupila controla o cursor.</div>
-    </div>
+def lerp(a, b, t):
+    return a + (b - a) * t
 
-    <div class="card">
-      <h3>Estado</h3>
-      <div class="stats">
-        <div class="stat"><div class="k">Qualidade</div><div class="v" id="qualityValue">0.00</div></div>
-        <div class="stat"><div class="k">Zoom</div><div class="v" id="zoomValue">1.0x</div></div>
-        <div class="stat"><div class="k">Fixações</div><div class="v" id="fixValue">0</div></div>
-        <div class="stat"><div class="k">Obras vistas</div><div class="v" id="seenValue">0</div></div>
-      </div>
-      <div class="small">
-        <div class="metaLine"><span>Modo</span><strong id="modeValue">Ocular</strong></div>
-        <div class="metaLine"><span>Piscada</span><strong id="blinkDebug">—</strong></div>
-        <div class="metaLine"><span>Obra em foco</span><strong id="hoverValue">Nenhuma</strong></div>
-        <div class="metaLine"><span>Calibração</span><strong id="calibValue">Pendente</strong></div>
-      </div>
-    </div>
 
-    <div class="card">
-      <h3>Obra selecionada</h3>
-      <div id="selectedTitle">Nenhuma obra selecionada</div>
-      <div id="selectedArtist">Olhe para uma obra até o dwell completar.</div>
-      <div id="selectedDesc">Quando a obra entra em foco, aparece uma ficha genérica em cima dela e aqui na lateral. O zoom também pode ser manual ou por piscada.</div>
-    </div>
+def lerp_vec(a: np.ndarray, b: np.ndarray, t: float) -> np.ndarray:
+    return a + (b - a) * t
 
-    <div class="card">
-      <h3>Mapa da sala</h3>
-      <div id="artList"></div>
-    </div>
 
-    <div class="card">
-      <h3>Guia de zoom</h3>
-      <div class="blinkGuide">
-        <div class="blinkCard"><div class="icon">👁</div><div class="bl">1 piscada</div><div class="desc">Afasta</div></div>
-        <div class="blinkCard"><div class="icon">👁👁</div><div class="bl">2 piscadas</div><div class="desc">Aproxima</div></div>
-      </div>
-      <div class="small">O zoom manual continua ativo. O mapa de calor só vai para o PDF exportado.</div>
-    </div>
+def normalize(v: np.ndarray) -> np.ndarray:
+    n = np.linalg.norm(v)
+    if n < EPS:
+        return v.copy()
+    return v / n
 
-    <div class="card">
-      <h3>Log</h3>
-      <div id="log"></div>
-    </div>
-  </div>
-</div>
 
-<script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+def rotation_from_a_to_b(a, b):
+    """
+    Calcula matriz de rotação R tal que R @ a = b.
+    Baseado na mesma ideia usada no código base do usuário.
+    """
+    a = normalize(np.asarray(a, dtype=np.float32))
+    b = normalize(np.asarray(b, dtype=np.float32))
 
-<script>
-(function(){
-'use strict';
+    v = np.cross(a, b)
+    c = float(np.dot(a, b))
 
-const $ = sel => document.querySelector(sel);
-const roomCanvas = $('#room');
-const heatCanvas = $('#heatmap');
-const video = $('#video');
-const camOverlay = $('#camOverlay');
-const scenePanel = document.querySelector('.scene-panel');
-const roomCtx = roomCanvas.getContext('2d');
-const heatCtx = heatCanvas.getContext('2d');
-const overlayCtx = camOverlay.getContext('2d');
-const analysisCanvas = document.createElement('canvas');
-analysisCanvas.width = 220;
-analysisCanvas.height = 160;
-const analysisCtx = analysisCanvas.getContext('2d', {willReadFrequently:true});
+    if np.linalg.norm(v) < 1e-6:
+        if c > 0.0:
+            return np.eye(3, dtype=np.float32)
+        axis = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        if abs(a[0]) > 0.9:
+            axis = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        v = np.cross(a, axis)
+        v = normalize(v)
+        s = np.linalg.norm(v)
+    else:
+        s = np.linalg.norm(v)
+        v = v / s
 
-const gazeCursor = $('#gazeCursor');
-const statusDot = $('#statusDot');
-const statusText = $('#statusText');
-const blinkText = $('#blinkText');
-const controlText = $('#controlText');
-const dwellFill = $('#dwellFill');
-const permissionNote = $('#permissionNote');
-const blinkToast = $('#blinkToast');
-const floatBox = $('#artInfoFloat');
-const floatTitle = $('#floatTitle');
-const floatSub = $('#floatSub');
-const floatTxt = $('#floatTxt');
-const qualityValue = $('#qualityValue');
-const zoomValue = $('#zoomValue');
-const fixValue = $('#fixValue');
-const seenValue = $('#seenValue');
-const modeValue = $('#modeValue');
-const blinkDebug = $('#blinkDebug');
-const hoverValue = $('#hoverValue');
-const calibValue = $('#calibValue');
-const selectedTitle = $('#selectedTitle');
-const selectedArtist = $('#selectedArtist');
-const selectedDesc = $('#selectedDesc');
-const artList = $('#artList');
-const logBox = $('#log');
+    vx, vy, vz = v
+    K = np.array([
+        [0, -vz, vy],
+        [vz, 0, -vx],
+        [-vy, vx, 0],
+    ], dtype=np.float32)
 
-const clamp = (v,a,b) => Math.min(b, Math.max(a, v));
-const lerp = (a,b,t) => a + (b-a) * t;
-const dist = (a,b) => Math.hypot(a.x-b.x, a.y-b.y);
-const avg = arr => arr.reduce((s,v)=>s+v,0) / Math.max(1, arr.length);
-function log(msg){
-  const line = '[' + new Date().toLocaleTimeString() + '] ' + msg;
-  logBox.textContent += (logBox.textContent ? '\n' : '') + line;
-  logBox.scrollTop = logBox.scrollHeight;
-}
-window.addEventListener('error', e => log('ERRO: ' + (e.message || '?')));
-window.addEventListener('unhandledrejection', e => log('PROMISE: ' + String(e.reason)));
+    if s < 1e-6:
+        return np.eye(3, dtype=np.float32)
 
-const state = {
-  running:false,
-  stream:null,
-  faceMesh:null,
-  camera:null,
-  raf:null,
-  startedAt:0,
+    R = np.eye(3, dtype=np.float32) + K * s + (K @ K) * ((1.0 - c) / (s ** 2 + EPS))
+    return R.astype(np.float32)
 
-  gaze:{
-    x:0.5, y:0.5,
-    targetX:0.5, targetY:0.5,
-    rawX:0.5, rawY:0.5,
-    quality:0,
-    invertX:true,
-    history:[]
-  },
 
-  eye:{
-    baselineReady:false,
-    calibSamples:[],
-    baseX:0,
-    baseY:0,
-    gainX:2.3,
-    gainY:1.85,
-    lastPupilLeft:null,
-    lastPupilRight:null,
-    lastRaw:{x:0, y:0},
-    lostFrames:0
-  },
+# =============================================================================
+# Estruturas do cenário
+# =============================================================================
 
-  blink:{
-    baseline:0.28,
-    baselineReady:false,
-    warmup:0,
-    phase:'open',
-    closeFrames:0,
-    openFrames:0,
-    minCloseFrames:2,
-    minOpenFrames:2,
-    closeTs:0,
-    pendingSingleTs:0,
-    lastEventTs:0,
-    lastBlinkTs:0,
-    closeRatio:0.70,
-    openRatio:0.86,
-    minMs:35,
-    maxMs:420,
-    doubleWindowMs:620,
-    lastLabel:'—'
-  },
+@dataclass
+class Painting:
+    id: str
+    title: str
+    artist: str
+    year: int
+    description: str
+    wall: str
+    center: np.ndarray
+    width: float
+    height: float
+    color: Tuple[int, int, int]
+    info_lines: List[str] = field(default_factory=list)
 
-  hover:{
-    id:null,
-    startTs:0,
-    dwellMs:850
-  },
+    def __post_init__(self):
+        if not self.info_lines:
+            self.info_lines = [
+                f"Título: {self.title}",
+                f"Artista: {self.artist}",
+                f"Ano: {self.year}",
+                self.description,
+            ]
 
-  selectedId:null,
-  fixations:0,
-  seen:new Set(),
-  heatPoints:[],
-  focusedHistory:[],
+    def corners(self) -> np.ndarray:
+        cx, cy, cz = self.center.astype(float)
+        w2 = self.width / 2.0
+        h2 = self.height / 2.0
 
-  zoom:{
-    level:0,
-    target:0
-  },
+        if self.wall in ("front", "back"):
+            return np.array([
+                [cx - w2, cy - h2, cz],
+                [cx + w2, cy - h2, cz],
+                [cx + w2, cy + h2, cz],
+                [cx - w2, cy + h2, cz],
+            ], dtype=np.float32)
+        elif self.wall in ("left", "right"):
+            return np.array([
+                [cx, cy - h2, cz - w2],
+                [cx, cy - h2, cz + w2],
+                [cx, cy + h2, cz + w2],
+                [cx, cy + h2, cz - w2],
+            ], dtype=np.float32)
+        else:
+            raise ValueError(f"Parede inválida: {self.wall}")
 
-  trackingQuality:0,
-  metrics:{lastQualityTs:0},
-};
 
-const LEFT_EYE_RING = [33,160,158,133,153,144];
-const RIGHT_EYE_RING = [362,385,387,263,373,380];
-const LEFT_EYE_BOX = [33,133,159,145];
-const RIGHT_EYE_BOX = [362,263,386,374];
-const LEFT_IRIS = [468,469,470,471,472];
-const RIGHT_IRIS = [473,474,475,476,477];
+@dataclass
+class HitInfo:
+    painting: Optional[Painting]
+    point: Optional[np.ndarray]
+    distance: float = 1e9
 
-const artworks = [
-  {id:'a1', title:'Memórias de Superfície', artist:'Lívia Andrade', year:'2024', theme:'Pintura', desc:'Pintura em camadas com relevo cromático, matéria espessa e memória visual acumulada.', color:'#e74c3c', plane:'back', x:-2.85, y:2.1, z:9.85, w:1.70, h:1.15},
-  {id:'a2', title:'Campo Sensível', artist:'Diego Marins', year:'2025', theme:'Generativo', desc:'Peça digital com pulsações geométricas, partículas e luz recortando o espaço expositivo.', color:'#27ae60', plane:'back', x:0.0, y:2.15, z:9.85, w:1.75, h:1.20},
-  {id:'a3', title:'Eco de Matéria', artist:'Marina Teles', year:'2026', theme:'Objeto expandido', desc:'Estruturas ópticas e profundidade simulada, evocando lente, microscopia e brilho holográfico.', color:'#f39c12', plane:'back', x:2.85, y:2.1, z:9.85, w:1.70, h:1.18},
-  {id:'a4', title:'Horizonte Índigo', artist:'Ciro Menezes', year:'2023', theme:'Geometria', desc:'Superfícies geométricas com vibração cromática e sobreposição ótica nas bordas.', color:'#8e44ad', plane:'left', x:-4.82, y:2.05, z:6.05, w:1.58, h:1.08},
-  {id:'a5', title:'Traço Latente', artist:'Rafaela Costa', year:'2022', theme:'Pintura', desc:'Pintura que pede leitura periférica, contraste baixo e foco seletivo do observador.', color:'#2980b9', plane:'right', x:4.82, y:2.02, z:5.75, w:1.58, h:1.08},
-  {id:'a6', title:'Arquivo Luminoso', artist:'Bruno Faria', year:'2021', theme:'Instalação', desc:'Camadas translúcidas, emissão suave e sensação de arquivo suspenso no espaço.', color:'#f1c40f', plane:'left', x:-4.82, y:1.25, z:3.25, w:1.25, h:0.94},
-  {id:'a7', title:'Fenda de Sinal', artist:'Nina Prado', year:'2024', theme:'Digital', desc:'Imagem em recorte horizontal que combina ruído, oscilação e compressão poética.', color:'#16a085', plane:'right', x:4.82, y:1.24, z:3.15, w:1.25, h:0.94}
-];
 
-let projectedArtworks = [];
+class GalleryRoom:
+    def __init__(self):
+        self.room_min = np.array([-7.0, 0.0, -12.0], dtype=np.float32)
+        self.room_max = np.array([7.0, 4.0, 2.0], dtype=np.float32)
+        self.paintings: List[Painting] = self._build_paintings()
+        self.floor_color = (52, 52, 62)
+        self.ceiling_color = (42, 42, 52)
+        self.wall_color = (88, 88, 102)
+        self.trim_color = (125, 115, 95)
 
-function buildArtList(){
-  artList.innerHTML = '';
-  artworks.forEach(art => {
-    const row = document.createElement('div');
-    row.className = 'artRow';
-    row.innerHTML = '<div class="artBullet" style="background:' + art.color + '"></div>'
-      + '<div><div class="title">' + art.title + '</div><div class="sub">' + art.artist + ' · ' + art.year + '</div></div>'
-      + '<div class="badge">' + art.theme + '</div>';
-    row.addEventListener('click', () => selectArtwork(art.id, true));
-    artList.appendChild(row);
-  });
-}
-buildArtList();
+    def _build_paintings(self) -> List[Painting]:
+        return [
+            Painting(
+                id="Q1",
+                title="Origem do Olhar",
+                artist="Sistema Ocular IA",
+                year=2026,
+                description="Quadro técnico sobre rastreamento ocular, vetores e foco.",
+                wall="front",
+                center=np.array([-4.2, 2.1, -11.6], dtype=np.float32),
+                width=2.2,
+                height=1.5,
+                color=(210, 92, 92),
+            ),
+            Painting(
+                id="Q2",
+                title="Mapa de Atenção",
+                artist="Visual Analytics",
+                year=2026,
+                description="Representação do comportamento visual em forma de calor.",
+                wall="front",
+                center=np.array([0.0, 2.15, -11.6], dtype=np.float32),
+                width=2.6,
+                height=1.7,
+                color=(92, 184, 210),
+            ),
+            Painting(
+                id="Q3",
+                title="Esfera e Pupila",
+                artist="Modelo Geométrico",
+                year=2026,
+                description="Interpretação geométrica do centro ocular e da pupila.",
+                wall="front",
+                center=np.array([4.2, 2.05, -11.6], dtype=np.float32),
+                width=2.2,
+                height=1.45,
+                color=(148, 209, 96),
+            ),
+            Painting(
+                id="Q4",
+                title="Raios de Interseção",
+                artist="Intersections Lab",
+                year=2026,
+                description="Quadro lateral mostrando o cruzamento de raios estimados.",
+                wall="left",
+                center=np.array([-6.9, 2.1, -5.0], dtype=np.float32),
+                width=2.4,
+                height=1.55,
+                color=(188, 142, 66),
+            ),
+            Painting(
+                id="Q5",
+                title="Blink Commands",
+                artist="HCI Museum",
+                year=2026,
+                description="Dupla piscada aproxima, piscada única afasta da obra.",
+                wall="right",
+                center=np.array([6.9, 2.0, -6.0], dtype=np.float32),
+                width=2.5,
+                height=1.55,
+                color=(128, 120, 220),
+            ),
+        ]
 
-function setStatus(on, text){
-  statusDot.classList.toggle('on', !!on);
-  statusText.textContent = text;
-}
+    def intersect_painting(self, ray_origin: np.ndarray, ray_dir: np.ndarray) -> HitInfo:
+        best = HitInfo(painting=None, point=None, distance=1e9)
 
-function flash(msg){
-  blinkToast.textContent = msg;
-  blinkToast.classList.add('show');
-  clearTimeout(flash._t);
-  flash._t = setTimeout(() => blinkToast.classList.remove('show'), 1000);
-}
+        for p in self.paintings:
+            if p.wall == "front":
+                plane_z = p.center[2]
+                if abs(ray_dir[2]) < EPS:
+                    continue
+                t = (plane_z - ray_origin[2]) / ray_dir[2]
+                if t <= 0:
+                    continue
+                point = ray_origin + ray_dir * t
+                if (abs(point[0] - p.center[0]) <= p.width / 2.0 and
+                        abs(point[1] - p.center[1]) <= p.height / 2.0):
+                    d = float(np.linalg.norm(point - ray_origin))
+                    if d < best.distance:
+                        best = HitInfo(painting=p, point=point, distance=d)
 
-function resizeCanvases(){
-  const rect = scenePanel.getBoundingClientRect();
-  const dpr = window.devicePixelRatio || 1;
-  [roomCanvas, heatCanvas].forEach(c => {
-    c.width = Math.floor(rect.width * dpr);
-    c.height = Math.floor(rect.height * dpr);
-    c.style.width = rect.width + 'px';
-    c.style.height = rect.height + 'px';
-  });
-  roomCtx.setTransform(dpr,0,0,dpr,0,0);
-  heatCtx.setTransform(dpr,0,0,dpr,0,0);
+            elif p.wall == "left" or p.wall == "right":
+                plane_x = p.center[0]
+                if abs(ray_dir[0]) < EPS:
+                    continue
+                t = (plane_x - ray_origin[0]) / ray_dir[0]
+                if t <= 0:
+                    continue
+                point = ray_origin + ray_dir * t
+                if (abs(point[2] - p.center[2]) <= p.width / 2.0 and
+                        abs(point[1] - p.center[1]) <= p.height / 2.0):
+                    d = float(np.linalg.norm(point - ray_origin))
+                    if d < best.distance:
+                        best = HitInfo(painting=p, point=point, distance=d)
 
-  const vr = video.getBoundingClientRect();
-  camOverlay.width = Math.max(1, Math.floor(vr.width * dpr));
-  camOverlay.height = Math.max(1, Math.floor(vr.height * dpr));
-  camOverlay.style.width = vr.width + 'px';
-  camOverlay.style.height = vr.height + 'px';
-  overlayCtx.setTransform(dpr,0,0,dpr,0,0);
-}
-window.addEventListener('resize', resizeCanvases);
+        return best
 
-function smoothHistory(v){
-  state.gaze.history.push(v);
-  if(state.gaze.history.length > 8) state.gaze.history.shift();
-  return {
-    x: avg(state.gaze.history.map(p => p.x)),
-    y: avg(state.gaze.history.map(p => p.y))
-  };
-}
 
-function eyeBox(landmarks, idxs, vw, vh){
-  const pts = idxs.map(i => ({x:landmarks[i].x * vw, y:landmarks[i].y * vh}));
-  const minX = Math.min(...pts.map(p=>p.x));
-  const maxX = Math.max(...pts.map(p=>p.x));
-  const minY = Math.min(...pts.map(p=>p.y));
-  const maxY = Math.max(...pts.map(p=>p.y));
-  const padX = (maxX - minX) * 0.34;
-  const padY = (maxY - minY) * 0.58;
-  const x = clamp(minX - padX, 0, vw - 1);
-  const y = clamp(minY - padY, 0, vh - 1);
-  const w = clamp((maxX - minX) + padX * 2, 12, vw - x);
-  const h = clamp((maxY - minY) + padY * 2, 10, vh - y);
-  return {x, y, w, h};
-}
+# =============================================================================
+# Renderização 3D em software (perspectiva manual)
+# =============================================================================
 
-function irisCenter(landmarks, idxs, vw, vh){
-  const pts = idxs.filter(i => landmarks[i]).map(i => ({x:landmarks[i].x * vw, y:landmarks[i].y * vh}));
-  if(!pts.length) return null;
-  return {
-    x: avg(pts.map(p=>p.x)),
-    y: avg(pts.map(p=>p.y))
-  };
-}
+class Software3DRenderer:
+    def __init__(self, width: int, height: int):
+        self.width = width
+        self.height = height
+        self.bg = (18, 18, 24)
+        self.fov = math.radians(66.0)
+        self.near = 0.1
+        self.far = 200.0
 
-function darkestPointInROI(imgData, w, h){
-  let min = 255, bestX = Math.floor(w/2), bestY = Math.floor(h/2);
-  for(let y=2;y<h-2;y+=2){
-    for(let x=2;x<w-2;x+=2){
-      const idx = (y*w + x) * 4;
-      const g = imgData.data[idx] * 0.299 + imgData.data[idx+1] * 0.587 + imgData.data[idx+2] * 0.114;
-      if(g < min){
-        min = g;
-        bestX = x;
-        bestY = y;
-      }
-    }
-  }
-  return {x:bestX, y:bestY, gray:min};
-}
+    def project(self, point_world: np.ndarray, cam_pos: np.ndarray, cam_rot: np.ndarray):
+        """
+        cam_rot: matriz 3x3 câmera->mundo; usamos transposta para mundo->câmera.
+        Convenção: câmera olha para -Z.
+        """
+        rel = point_world - cam_pos
+        cam = cam_rot.T @ rel
 
-function pupilFromThreshold(box){
-  if(box.w < 10 || box.h < 8) return null;
-  const sx = Math.floor(box.x), sy = Math.floor(box.y);
-  const sw = Math.floor(box.w), sh = Math.floor(box.h);
-  if(sw <= 2 || sh <= 2) return null;
+        z_forward = -cam[2]
+        if z_forward <= self.near:
+            return None
 
-  analysisCtx.drawImage(video, 0, 0, analysisCanvas.width, analysisCanvas.height);
-  const scaleX = analysisCanvas.width / video.videoWidth;
-  const scaleY = analysisCanvas.height / video.videoHeight;
-  const rx = Math.floor(box.x * scaleX);
-  const ry = Math.floor(box.y * scaleY);
-  const rw = Math.max(4, Math.floor(box.w * scaleX));
-  const rh = Math.max(4, Math.floor(box.h * scaleY));
-  if(rx + rw >= analysisCanvas.width || ry + rh >= analysisCanvas.height) return null;
+        aspect = self.width / max(self.height, 1)
+        f = 1.0 / math.tan(self.fov / 2.0)
 
-  const roi = analysisCtx.getImageData(rx, ry, rw, rh);
-  const dark = darkestPointInROI(roi, rw, rh);
-  const thresholds = [5, 15, 25];
-  let best = null;
+        ndc_x = (cam[0] * f / aspect) / z_forward
+        ndc_y = (cam[1] * f) / z_forward
 
-  thresholds.forEach(off => {
-    const t = dark.gray + off;
-    let sumX = 0, sumY = 0, count = 0;
-    let minX = rw, minY = rh, maxX = 0, maxY = 0;
-    for(let y=0;y<rh;y++){
-      for(let x=0;x<rw;x++){
-        const idx = (y*rw + x) * 4;
-        const g = roi.data[idx] * 0.299 + roi.data[idx+1] * 0.587 + roi.data[idx+2] * 0.114;
-        if(g <= t){
-          sumX += x; sumY += y; count++;
-          if(x<minX) minX = x;
-          if(y<minY) minY = y;
-          if(x>maxX) maxX = x;
-          if(y>maxY) maxY = y;
+        screen_x = int((ndc_x + 1.0) * 0.5 * self.width)
+        screen_y = int((1.0 - ndc_y) * 0.5 * self.height)
+        return screen_x, screen_y, z_forward
+
+    def project_many(self, points_world, cam_pos, cam_rot):
+        projected = []
+        depths = []
+        for p in points_world:
+            pr = self.project(np.asarray(p, dtype=np.float32), cam_pos, cam_rot)
+            if pr is None:
+                return None, None
+            projected.append((pr[0], pr[1]))
+            depths.append(pr[2])
+        return projected, float(np.mean(depths))
+
+    def draw_polygon(self, surf, pts_2d, color, outline=None, width=0):
+        if len(pts_2d) >= 3:
+            pygame.draw.polygon(surf, color, pts_2d, width)
+            if outline is not None and width == 0:
+                pygame.draw.polygon(surf, outline, pts_2d, 2)
+
+    def render_room(self, surf, room: GalleryRoom, cam_pos: np.ndarray, cam_rot: np.ndarray,
+                    focused_painting: Optional[Painting], hover_t: float):
+        surf.fill(self.bg)
+
+        xmin, ymin, zmin = room.room_min
+        xmax, ymax, zmax = room.room_max
+
+        corners = {
+            "fbl": np.array([xmin, ymin, zmin], dtype=np.float32),
+            "fbr": np.array([xmax, ymin, zmin], dtype=np.float32),
+            "ftl": np.array([xmin, ymax, zmin], dtype=np.float32),
+            "ftr": np.array([xmax, ymax, zmin], dtype=np.float32),
+            "bbl": np.array([xmin, ymin, zmax], dtype=np.float32),
+            "bbr": np.array([xmax, ymin, zmax], dtype=np.float32),
+            "btl": np.array([xmin, ymax, zmax], dtype=np.float32),
+            "btr": np.array([xmax, ymax, zmax], dtype=np.float32),
         }
-      }
-    }
-    if(count < 8) return;
-    const spreadX = maxX - minX;
-    const spreadY = maxY - minY;
-    const compact = 1 / (1 + spreadX + spreadY);
-    const score = count * compact;
-    if(!best || score > best.score){
-      best = {
-        score,
-        x: sumX / count,
-        y: sumY / count
-      };
-    }
-  });
 
-  if(!best) return null;
-  return {
-    x: box.x + best.x / scaleX,
-    y: box.y + best.y / scaleY
-  };
-}
+        surfaces = [
+            ("floor", [corners["fbl"], corners["fbr"], corners["bbr"], corners["bbl"]], room.floor_color),
+            ("ceiling", [corners["ftl"], corners["ftr"], corners["btr"], corners["btl"]], room.ceiling_color),
+            ("front", [corners["fbl"], corners["fbr"], corners["ftr"], corners["ftl"]], room.wall_color),
+            ("left", [corners["fbl"], corners["bbl"], corners["btl"], corners["ftl"]], tuple(max(0, c - 10) for c in room.wall_color)),
+            ("right", [corners["fbr"], corners["bbr"], corners["btr"], corners["ftr"]], tuple(max(0, c - 6) for c in room.wall_color)),
+            ("back", [corners["bbl"], corners["bbr"], corners["btr"], corners["btl"]], tuple(max(0, c - 20) for c in room.wall_color)),
+        ]
 
-function distance2d(a,b){
-  return Math.hypot(a.x-b.x, a.y-b.y);
-}
+        draw_items = []
 
-function ear(landmarks, side, vw, vh){
-  let p;
-  if(side === 'left'){
-    p = {
-      a:{x:landmarks[33].x*vw, y:landmarks[33].y*vh},
-      b:{x:landmarks[160].x*vw, y:landmarks[160].y*vh},
-      c:{x:landmarks[158].x*vw, y:landmarks[158].y*vh},
-      d:{x:landmarks[133].x*vw, y:landmarks[133].y*vh},
-      e:{x:landmarks[153].x*vw, y:landmarks[153].y*vh},
-      f:{x:landmarks[144].x*vw, y:landmarks[144].y*vh},
-    };
-  } else {
-    p = {
-      a:{x:landmarks[362].x*vw, y:landmarks[362].y*vh},
-      b:{x:landmarks[385].x*vw, y:landmarks[385].y*vh},
-      c:{x:landmarks[387].x*vw, y:landmarks[387].y*vh},
-      d:{x:landmarks[263].x*vw, y:landmarks[263].y*vh},
-      e:{x:landmarks[373].x*vw, y:landmarks[373].y*vh},
-      f:{x:landmarks[380].x*vw, y:landmarks[380].y*vh},
-    };
-  }
-  const v1 = distance2d(p.b, p.f);
-  const v2 = distance2d(p.c, p.e);
-  const h = distance2d(p.a, p.d);
-  return h > 0.0001 ? (v1 + v2) / (2 * h) : 0.25;
-}
+        for name, poly3d, color in surfaces:
+            pts2d, depth = self.project_many(poly3d, cam_pos, cam_rot)
+            if pts2d is not None:
+                draw_items.append((depth, "poly", pts2d, color, (32, 32, 38), name))
 
-function drawEyeOverlay(landmarks, pupilL, pupilR, boxL, boxR){
-  const r = video.getBoundingClientRect();
-  overlayCtx.clearRect(0,0,r.width,r.height);
-  overlayCtx.save();
-  overlayCtx.translate(r.width, 0);
-  overlayCtx.scale(-1,1);
+        for p in room.paintings:
+            corners3d = p.corners()
+            pts2d, depth = self.project_many(corners3d, cam_pos, cam_rot)
+            if pts2d is None:
+                continue
 
-  function drawPath(idxs, color){
-    overlayCtx.beginPath();
-    idxs.forEach((i, n) => {
-      if(!landmarks[i]) return;
-      const x = landmarks[i].x * r.width;
-      const y = landmarks[i].y * r.height;
-      if(n===0) overlayCtx.moveTo(x,y); else overlayCtx.lineTo(x,y);
-    });
-    overlayCtx.closePath();
-    overlayCtx.strokeStyle = color;
-    overlayCtx.lineWidth = 1.8;
-    overlayCtx.stroke();
-  }
+            border = (240, 230, 210)
+            fill = p.color
+            outline = border
+            if focused_painting and focused_painting.id == p.id:
+                pulse = 0.55 + 0.45 * hover_t
+                fill = tuple(int(clamp(c + 40 * pulse, 0, 255)) for c in p.color)
+                outline = (255, 255, 120)
 
-  drawPath(LEFT_EYE_RING, 'rgba(93,173,226,.9)');
-  drawPath(RIGHT_EYE_RING, 'rgba(93,173,226,.9)');
+            draw_items.append((depth - 0.005, "frame_shadow", pts2d, (0, 0, 0), None, p))
+            draw_items.append((depth - 0.002, "painting", pts2d, fill, outline, p))
 
-  [boxL, boxR].forEach(box => {
-    if(!box) return;
-    overlayCtx.strokeStyle = 'rgba(240,192,64,.45)';
-    overlayCtx.strokeRect(box.x, box.y, box.w, box.h);
-  });
+            # Moldura interna
+            inner = self._shrink_polygon(pts2d, 0.86)
+            draw_items.append((depth - 0.001, "inner", inner, tuple(int(c * 0.33) for c in fill), (24, 24, 24), p))
 
-  [pupilL, pupilR].forEach(p => {
-    if(!p) return;
-    overlayCtx.fillStyle = 'rgba(255,255,255,.9)';
-    overlayCtx.beginPath();
-    overlayCtx.arc(p.x, p.y, 4.2, 0, Math.PI*2);
-    overlayCtx.fill();
-    overlayCtx.strokeStyle = 'rgba(231,76,60,.85)';
-    overlayCtx.lineWidth = 1.5;
-    overlayCtx.beginPath();
-    overlayCtx.arc(p.x, p.y, 8, 0, Math.PI*2);
-    overlayCtx.stroke();
-  });
+        draw_items.sort(key=lambda item: item[0], reverse=True)
 
-  overlayCtx.restore();
-}
+        for _, kind, pts2d, color, outline, payload in draw_items:
+            if kind == "frame_shadow":
+                shadow = [(x + 4, y + 4) for x, y in pts2d]
+                self.draw_polygon(surf, shadow, (0, 0, 0))
+            else:
+                self.draw_polygon(surf, pts2d, color, outline=outline)
 
-function processBlink(avgEar){
-  const b = state.blink;
-  if(!b.baselineReady){
-    if(avgEar > 0.12 && avgEar < 0.60){
-      b.baseline = lerp(b.baseline, avgEar, 0.16);
-      b.warmup += 1;
-      if(b.warmup > 12){
-        b.baselineReady = true;
-        blinkText.textContent = 'Pronto';
-        calibValue.textContent = state.eye.baselineReady ? 'Ok' : 'Olhe reto e calibre';
-      }
-    }
-    return;
-  }
+        # Rodapés decorativos na parede
+        self._draw_trim(surf, room, cam_pos, cam_rot)
 
-  b.baseline = lerp(b.baseline, clamp(avgEar, 0.12, 0.5), avgEar > b.baseline * 0.85 ? 0.04 : 0.0);
-  const ratio = avgEar / Math.max(0.0001, b.baseline);
-  const now = performance.now();
+    def _draw_trim(self, surf, room, cam_pos, cam_rot):
+        xmin, _, zmin = room.room_min
+        xmax, _, zmax = room.room_max
+        trim_h = 0.32
+        y0 = 0.05
+        y1 = y0 + trim_h
 
-  if(b.phase === 'open'){
-    if(ratio < b.closeRatio){
-      b.closeFrames += 1;
-      if(b.closeFrames >= b.minCloseFrames){
-        b.phase = 'closed';
-        b.closeTs = now;
-        b.openFrames = 0;
-      }
-    } else {
-      b.closeFrames = 0;
-    }
-  } else {
-    if(ratio > b.openRatio){
-      b.openFrames += 1;
-      if(b.openFrames >= b.minOpenFrames){
-        const dur = now - b.closeTs;
-        b.phase = 'open';
-        b.closeFrames = 0;
-        b.openFrames = 0;
-        if(dur >= b.minMs && dur <= b.maxMs){
-          registerBlink(now);
+        trim_polys = [
+            [np.array([xmin, y0, zmin]), np.array([xmax, y0, zmin]), np.array([xmax, y1, zmin]), np.array([xmin, y1, zmin])],
+            [np.array([xmin, y0, zmin]), np.array([xmin, y0, zmax]), np.array([xmin, y1, zmax]), np.array([xmin, y1, zmin])],
+            [np.array([xmax, y0, zmin]), np.array([xmax, y0, zmax]), np.array([xmax, y1, zmax]), np.array([xmax, y1, zmin])],
+        ]
+
+        items = []
+        for poly in trim_polys:
+            pts2d, depth = self.project_many(poly, cam_pos, cam_rot)
+            if pts2d is not None:
+                items.append((depth, pts2d))
+        items.sort(key=lambda x: x[0], reverse=True)
+        for _, pts2d in items:
+            self.draw_polygon(surf, pts2d, room.trim_color, outline=(70, 56, 45))
+
+    @staticmethod
+    def _shrink_polygon(pts, scale=0.9):
+        cx = sum(p[0] for p in pts) / len(pts)
+        cy = sum(p[1] for p in pts) / len(pts)
+        out = []
+        for x, y in pts:
+            out.append((int(cx + (x - cx) * scale), int(cy + (y - cy) * scale)))
+        return out
+
+
+# =============================================================================
+# Rastreamento ocular: adaptação do cálculo enviado pelo usuário
+# =============================================================================
+
+ray_lines = []
+model_centers = []
+stored_intersections = []
+max_rays = 100
+prev_model_center_avg = (320, 240)
+max_observed_distance = 202
+sphere_center_locked_2d = False
+locked_model_center_avg = prev_model_center_avg
+
+
+def crop_to_aspect_ratio(image, width=640, height=480):
+    current_height, current_width = image.shape[:2]
+    desired_ratio = width / height
+    current_ratio = current_width / current_height
+
+    if current_ratio > desired_ratio:
+        new_width = int(desired_ratio * current_height)
+        offset = (current_width - new_width) // 2
+        cropped_img = image[:, offset:offset + new_width]
+    else:
+        new_height = int(current_width / desired_ratio)
+        offset = (current_height - new_height) // 2
+        cropped_img = image[offset:offset + new_height, :]
+
+    return cv2.resize(cropped_img, (width, height))
+
+
+def apply_binary_threshold(image, darkest_pixel_value, added_threshold):
+    threshold = int(darkest_pixel_value + added_threshold)
+    _, thresholded = cv2.threshold(image, threshold, 255, cv2.THRESH_BINARY_INV)
+    return thresholded
+
+
+def get_darkest_area(image):
+    ignore_bounds = 20
+    image_skip_size = 10
+    search_area = 20
+    internal_skip_size = 5
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    min_sum = float("inf")
+    darkest_point = None
+
+    for y in range(ignore_bounds, gray.shape[0] - ignore_bounds, image_skip_size):
+        for x in range(ignore_bounds, gray.shape[1] - ignore_bounds, image_skip_size):
+            current_sum = 0
+            num_pixels = 0
+            for dy in range(0, search_area, internal_skip_size):
+                if y + dy >= gray.shape[0]:
+                    break
+                for dx in range(0, search_area, internal_skip_size):
+                    if x + dx >= gray.shape[1]:
+                        break
+                    current_sum += int(gray[y + dy, x + dx])
+                    num_pixels += 1
+
+            if num_pixels > 0 and current_sum < min_sum:
+                min_sum = current_sum
+                darkest_point = (x + search_area // 2, y + search_area // 2)
+
+    if darkest_point is None:
+        darkest_point = (gray.shape[1] // 2, gray.shape[0] // 2)
+    return darkest_point
+
+
+def mask_outside_square(image, center, size):
+    x, y = center
+    half_size = size // 2
+
+    mask = np.zeros_like(image)
+    top_left_x = max(0, x - half_size)
+    top_left_y = max(0, y - half_size)
+    bottom_right_x = min(image.shape[1], x + half_size)
+    bottom_right_y = min(image.shape[0], y + half_size)
+    mask[top_left_y:bottom_right_y, top_left_x:bottom_right_x] = 255
+    return cv2.bitwise_and(image, mask)
+
+
+def optimize_contours_by_angle(contours, image):
+    if len(contours) < 1 or contours[0] is None or len(contours[0]) < 5:
+        return contours
+
+    all_contours = np.concatenate(contours[0], axis=0)
+    if len(all_contours) < 12:
+        return np.array(all_contours, dtype=np.int32).reshape((-1, 1, 2))
+
+    spacing = max(1, int(len(all_contours) / 25))
+    filtered_points = []
+
+    centroid = np.mean(all_contours, axis=0)
+
+    for i in range(0, len(all_contours)):
+        current_point = all_contours[i]
+        prev_point = all_contours[i - spacing] if i - spacing >= 0 else all_contours[-spacing]
+        next_point = all_contours[i + spacing] if i + spacing < len(all_contours) else all_contours[spacing]
+
+        vec1 = prev_point - current_point
+        vec2 = next_point - current_point
+
+        denom = (np.linalg.norm(vec1) * np.linalg.norm(vec2)) + EPS
+        dot = float(np.dot(vec1.ravel(), vec2.ravel()))
+        angle_cos = clamp(dot / denom, -1.0, 1.0)
+        _ = math.acos(angle_cos)
+
+        vec_to_centroid = centroid - current_point
+        cos_threshold = math.cos(math.radians(60.0))
+
+        direction = (vec1 + vec2) / 2.0
+        dot2 = float(np.dot(vec_to_centroid.ravel(), direction.ravel()))
+        if dot2 >= cos_threshold:
+            filtered_points.append(current_point)
+
+    if not filtered_points:
+        filtered_points = list(all_contours)
+    return np.array(filtered_points, dtype=np.int32).reshape((-1, 1, 2))
+
+
+def filter_contours_by_area_and_return_largest(contours, pixel_thresh, ratio_thresh):
+    max_area = 0
+    largest_contour = None
+
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < pixel_thresh:
+            continue
+
+        x, y, w, h = cv2.boundingRect(contour)
+        if w == 0 or h == 0:
+            continue
+        ratio = max(w / h, h / w)
+        if ratio <= ratio_thresh and area > max_area:
+            max_area = area
+            largest_contour = contour
+
+    return [largest_contour] if largest_contour is not None else []
+
+
+def check_contour_pixels(contour, image_shape):
+    if contour is None or len(contour) < 5:
+        return [0, 0.0, np.zeros(image_shape, dtype=np.uint8)]
+
+    contour_mask = np.zeros(image_shape, dtype=np.uint8)
+    cv2.drawContours(contour_mask, [contour], -1, 255, 1)
+
+    ellipse_mask_thick = np.zeros(image_shape, dtype=np.uint8)
+    ellipse_mask_thin = np.zeros(image_shape, dtype=np.uint8)
+    ellipse = cv2.fitEllipse(contour)
+
+    cv2.ellipse(ellipse_mask_thick, ellipse, 255, 10)
+    cv2.ellipse(ellipse_mask_thin, ellipse, 255, 4)
+
+    overlap_thick = cv2.bitwise_and(contour_mask, ellipse_mask_thick)
+    overlap_thin = cv2.bitwise_and(contour_mask, ellipse_mask_thin)
+
+    absolute_pixel_total_thick = int(np.sum(overlap_thick > 0))
+    total_border_pixels = int(np.sum(contour_mask > 0))
+    ratio_under_ellipse = absolute_pixel_total_thick / max(total_border_pixels, 1)
+
+    return [absolute_pixel_total_thick, ratio_under_ellipse, overlap_thin]
+
+
+def check_ellipse_goodness(binary_image, contour):
+    ellipse_goodness = [0.0, 0.0, 0.0]
+    if contour is None or len(contour) < 5:
+        return ellipse_goodness
+
+    ellipse = cv2.fitEllipse(contour)
+    mask = np.zeros_like(binary_image)
+    cv2.ellipse(mask, ellipse, 255, -1)
+
+    ellipse_area = int(np.sum(mask == 255))
+    covered_pixels = int(np.sum((binary_image == 255) & (mask == 255)))
+    if ellipse_area <= 0:
+        return ellipse_goodness
+
+    ellipse_goodness[0] = covered_pixels / max(ellipse_area, 1)
+    axes_lengths = ellipse[1]
+    if axes_lengths[0] > 0 and axes_lengths[1] > 0:
+        ellipse_goodness[2] = min(axes_lengths[1] / axes_lengths[0], axes_lengths[0] / axes_lengths[1])
+
+    return ellipse_goodness
+
+
+def update_and_average_point(point_list, new_point, N):
+    point_list.append(new_point)
+    if len(point_list) > N:
+        point_list.pop(0)
+
+    if not point_list:
+        return None
+
+    avg_x = int(np.mean([p[0] for p in point_list]))
+    avg_y = int(np.mean([p[1] for p in point_list]))
+    return avg_x, avg_y
+
+
+def find_line_intersection(ellipse1, ellipse2):
+    (cx1, cy1), (_, minor_axis1), angle1 = ellipse1
+    (cx2, cy2), (_, minor_axis2), angle2 = ellipse2
+
+    angle1_rad = np.deg2rad(angle1)
+    angle2_rad = np.deg2rad(angle2)
+
+    dx1, dy1 = (minor_axis1 / 2.0) * np.cos(angle1_rad), (minor_axis1 / 2.0) * np.sin(angle1_rad)
+    dx2, dy2 = (minor_axis2 / 2.0) * np.cos(angle2_rad), (minor_axis2 / 2.0) * np.sin(angle2_rad)
+
+    A = np.array([[dx1, -dx2], [dy1, -dy2]], dtype=np.float32)
+    B = np.array([cx2 - cx1, cy2 - cy1], dtype=np.float32)
+
+    det = float(np.linalg.det(A))
+    if abs(det) < 1e-8:
+        return None
+
+    t1, _ = np.linalg.solve(A, B)
+    ix = cx1 + t1 * dx1
+    iy = cy1 + t1 * dy1
+    return int(ix), int(iy)
+
+
+def prune_intersections(intersections, maximum_intersections):
+    if len(intersections) <= maximum_intersections:
+        return intersections
+    return intersections[-maximum_intersections:]
+
+
+def compute_average_intersection(frame, ray_lines_list, N, M):
+    global stored_intersections
+
+    if len(ray_lines_list) < 2 or N < 2:
+        return None
+
+    height, width = frame.shape[:2]
+    N = min(N, len(ray_lines_list))
+    selected_indices = np.random.choice(len(ray_lines_list), size=N, replace=False)
+    selected_lines = [ray_lines_list[i] for i in selected_indices]
+
+    intersections = []
+
+    for i in range(len(selected_lines) - 1):
+        line1 = selected_lines[i]
+        line2 = selected_lines[i + 1]
+        angle1 = line1[2]
+        angle2 = line2[2]
+
+        if abs(angle1 - angle2) >= 2.0:
+            intersection = find_line_intersection(line1, line2)
+            if intersection is not None:
+                if 0 <= intersection[0] < width and 0 <= intersection[1] < height:
+                    intersections.append(intersection)
+                    stored_intersections.append(intersection)
+
+    if len(stored_intersections) > M:
+        stored_intersections = prune_intersections(stored_intersections, M)
+
+    if not stored_intersections:
+        return None
+
+    avg_x = int(np.mean([pt[0] for pt in stored_intersections]))
+    avg_y = int(np.mean([pt[1] for pt in stored_intersections]))
+    return avg_x, avg_y
+
+
+def compute_gaze_vector(x, y, center_x, center_y, screen_width=640, screen_height=480):
+    """
+    Adaptado do cálculo enviado pelo usuário.
+    Retorna:
+      sphere_center_out, gaze_rotated
+    """
+    viewport_width = screen_width
+    viewport_height = screen_height
+
+    fov_y_deg = 45.0
+    aspect_ratio = viewport_width / viewport_height
+    far_clip = 100.0
+
+    camera_position = np.array([0.0, 0.0, 3.0], dtype=np.float32)
+
+    fov_y_rad = np.radians(fov_y_deg)
+    half_height_far = np.tan(fov_y_rad / 2.0) * far_clip
+    half_width_far = half_height_far * aspect_ratio
+
+    ndc_x = (2.0 * x) / viewport_width - 1.0
+    ndc_y = 1.0 - (2.0 * y) / viewport_height
+
+    far_x = ndc_x * half_width_far
+    far_y = ndc_y * half_height_far
+    far_z = camera_position[2] - far_clip
+    far_point = np.array([far_x, far_y, far_z], dtype=np.float32)
+
+    ray_origin = camera_position
+    ray_direction = far_point - camera_position
+    ray_direction = normalize(ray_direction)
+    ray_direction = -ray_direction
+
+    inner_radius = 1.0 / 1.05
+    sphere_offset_x = (center_x / screen_width) * 2.0 - 1.0
+    sphere_offset_y = 1.0 - (center_y / screen_height) * 2.0
+    sphere_center = np.array([sphere_offset_x * 1.5, sphere_offset_y * 1.5, 0.0], dtype=np.float32)
+
+    origin = ray_origin
+    direction = -ray_direction
+    L = origin - sphere_center
+
+    a = float(np.dot(direction, direction))
+    b = float(2 * np.dot(direction, L))
+    c = float(np.dot(L, L) - inner_radius**2)
+
+    discriminant = b**2 - 4 * a * c
+    if discriminant < 0:
+        t = -float(np.dot(direction, L)) / (float(np.dot(direction, direction)) + EPS)
+        intersection_point = origin + t * direction
+        intersection_local = intersection_point - sphere_center
+        target_direction = normalize(intersection_local)
+    else:
+        sqrt_disc = math.sqrt(max(discriminant, 0.0))
+        t1 = (-b - sqrt_disc) / (2 * a + EPS)
+        t2 = (-b + sqrt_disc) / (2 * a + EPS)
+
+        t = None
+        if t1 > 0 and t2 > 0:
+            t = min(t1, t2)
+        elif t1 > 0:
+            t = t1
+        elif t2 > 0:
+            t = t2
+        if t is None:
+            return None, None
+
+        intersection_point = origin + t * direction
+        intersection_local = intersection_point - sphere_center
+        target_direction = normalize(intersection_local)
+
+    circle_local_center = np.array([0.0, 0.0, inner_radius], dtype=np.float32)
+    circle_local_center = normalize(circle_local_center)
+
+    rotation_axis = np.cross(circle_local_center, target_direction)
+    rotation_axis_norm = np.linalg.norm(rotation_axis)
+
+    if rotation_axis_norm < 1e-6:
+        return sphere_center, circle_local_center
+
+    rotation_axis = rotation_axis / rotation_axis_norm
+    dot = float(np.clip(np.dot(circle_local_center, target_direction), -1.0, 1.0))
+    angle_rad = math.acos(dot)
+
+    c0 = math.cos(angle_rad)
+    s0 = math.sin(angle_rad)
+    t0 = 1.0 - c0
+    x0, y0, z0 = rotation_axis
+
+    rotation_matrix = np.array([
+        [t0 * x0 * x0 + c0, t0 * x0 * y0 - s0 * z0, t0 * x0 * z0 + s0 * y0],
+        [t0 * x0 * y0 + s0 * z0, t0 * y0 * y0 + c0, t0 * y0 * z0 - s0 * x0],
+        [t0 * x0 * z0 - s0 * y0, t0 * y0 * z0 + s0 * x0, t0 * z0 * z0 + c0],
+    ], dtype=np.float32)
+
+    gaze_local = np.array([0.0, 0.0, inner_radius], dtype=np.float32)
+    gaze_rotated = rotation_matrix @ gaze_local
+    gaze_rotated = normalize(gaze_rotated)
+
+    return sphere_center, gaze_rotated
+
+
+class EyeTracker:
+    def __init__(self, camera_index: int = 0, preview: bool = False):
+        self.camera_index = camera_index
+        self.preview = preview
+        self.cap = None
+        self.thread = None
+        self.running = False
+        self.lock = threading.Lock()
+
+        self.latest_frame = None
+        self.latest_debug_frame = None
+        self.gaze_vector = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        self.sphere_center = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        self.pupil_center_2d = (320, 240)
+        self.eye_center_2d = (320, 240)
+        self.ellipse = None
+        self.ellipse_found = False
+        self.confidence = 0.0
+        self.frame_count = 0
+        self.fps = 0.0
+        self._fps_t0 = time.time()
+        self._fps_count = 0
+
+        # Blink
+        self.closed_frames = 0
+        self.open_frames = 0
+        self.last_blink_time = 0.0
+        self.last_blinks: List[float] = []
+        self.single_blink_flag = False
+        self.double_blink_flag = False
+        self.total_blinks = 0
+        self.total_double_blinks = 0
+
+        # calibração do olhar para a tela
+        self.calibrated = False
+        self.R_gaze_to_screen = np.eye(3, dtype=np.float32)
+
+        # suavização
+        self.smooth_gaze = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        self.smooth_strength = 0.22
+
+    def start(self):
+        self.cap = cv2.VideoCapture(self.camera_index)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Não foi possível abrir a câmera {self.camera_index}")
+        self.running = True
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+        if self.thread is not None:
+            self.thread.join(timeout=2.0)
+        if self.cap is not None:
+            self.cap.release()
+        if self.preview:
+            cv2.destroyAllWindows()
+
+    def calibrate_center(self):
+        with self.lock:
+            current = self.smooth_gaze.copy()
+        target = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        self.R_gaze_to_screen = rotation_from_a_to_b(current, target)
+        self.calibrated = True
+
+    def consume_single_blink(self) -> bool:
+        with self.lock:
+            v = self.single_blink_flag
+            self.single_blink_flag = False
+            return v
+
+    def consume_double_blink(self) -> bool:
+        with self.lock:
+            v = self.double_blink_flag
+            self.double_blink_flag = False
+            return v
+
+    def get_state(self):
+        with self.lock:
+            return {
+                "gaze_vector": self.smooth_gaze.copy(),
+                "sphere_center": self.sphere_center.copy(),
+                "ellipse_found": self.ellipse_found,
+                "ellipse": self.ellipse,
+                "pupil_center_2d": self.pupil_center_2d,
+                "eye_center_2d": self.eye_center_2d,
+                "confidence": self.confidence,
+                "fps": self.fps,
+                "total_blinks": self.total_blinks,
+                "total_double_blinks": self.total_double_blinks,
+            }
+
+    def get_screen_gaze(self):
+        with self.lock:
+            g = self.smooth_gaze.copy()
+        if self.calibrated:
+            g = self.R_gaze_to_screen @ g
+        g = normalize(g)
+        return g
+
+    def _register_blink(self, blink_time: float):
+        self.total_blinks += 1
+        self.last_blinks.append(blink_time)
+        self.last_blinks = [t for t in self.last_blinks if blink_time - t <= 0.80]
+
+        if len(self.last_blinks) >= 2 and (self.last_blinks[-1] - self.last_blinks[-2]) <= 0.65:
+            self.double_blink_flag = True
+            self.total_double_blinks += 1
+            self.last_blinks = []
+        else:
+            self.single_blink_flag = True
+
+    def _update_blink_logic(self, ellipse_found: bool):
+        now = time.time()
+
+        if ellipse_found:
+            self.open_frames += 1
+            if 2 <= self.closed_frames <= 8:
+                self._register_blink(now)
+            self.closed_frames = 0
+        else:
+            self.closed_frames += 1
+            self.open_frames = 0
+
+        # evita consumir piscada única imediatamente caso venha uma segunda
+        if self.single_blink_flag and self.double_blink_flag:
+            self.single_blink_flag = False
+
+        if self.single_blink_flag and self.last_blinks:
+            # Aguarda pequena janela para ver se vira dupla piscada
+            if now - self.last_blinks[-1] < 0.32:
+                pass
+
+    def _run(self):
+        while self.running:
+            ok, frame = self.cap.read()
+            if not ok or frame is None:
+                time.sleep(0.01)
+                continue
+
+            result = self._process_frame(frame)
+
+            with self.lock:
+                self.latest_frame = frame
+                self.latest_debug_frame = result.get("debug_frame")
+                self.gaze_vector = result["gaze_vector"]
+                self.sphere_center = result["sphere_center"]
+                self.ellipse_found = result["ellipse_found"]
+                self.ellipse = result["ellipse"]
+                self.pupil_center_2d = result["pupil_center"]
+                self.eye_center_2d = result["eye_center"]
+                self.confidence = result["confidence"]
+
+                self.smooth_gaze = normalize(lerp_vec(self.smooth_gaze, self.gaze_vector, self.smooth_strength))
+
+                self._fps_count += 1
+                dt = time.time() - self._fps_t0
+                if dt >= 1.0:
+                    self.fps = self._fps_count / dt
+                    self._fps_t0 = time.time()
+                    self._fps_count = 0
+
+            self._update_blink_logic(result["ellipse_found"])
+
+            if self.preview and result.get("debug_frame") is not None:
+                cv2.imshow("Eye Tracker Preview", result["debug_frame"])
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    self.running = False
+                    break
+
+    def _process_frame(self, frame):
+        global ray_lines, model_centers, prev_model_center_avg
+
+        frame = crop_to_aspect_ratio(frame)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        darkest_point = get_darkest_area(frame)
+        darkest_pixel_value = gray[darkest_point[1], darkest_point[0]]
+
+        thr_strict = apply_binary_threshold(gray, darkest_pixel_value, 5)
+        thr_medium = apply_binary_threshold(gray, darkest_pixel_value, 15)
+        thr_relaxed = apply_binary_threshold(gray, darkest_pixel_value, 25)
+
+        thr_strict = mask_outside_square(thr_strict, darkest_point, 250)
+        thr_medium = mask_outside_square(thr_medium, darkest_point, 250)
+        thr_relaxed = mask_outside_square(thr_relaxed, darkest_point, 250)
+
+        images = [thr_relaxed, thr_medium, thr_strict]
+        best_score = -1.0
+        best_ellipse = None
+        best_center = None
+        best_contour = None
+
+        kernel = np.ones((5, 5), np.uint8)
+
+        for img in images:
+            dilated = cv2.dilate(img, kernel, iterations=2)
+            contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            reduced = filter_contours_by_area_and_return_largest(contours, 1000, 3)
+
+            if len(reduced) == 0 or reduced[0] is None or len(reduced[0]) < 5:
+                continue
+
+            contour = reduced[0]
+            goodness = check_ellipse_goodness(dilated, contour)
+            contour_pixels = check_contour_pixels(contour, dilated.shape)
+            score = goodness[0] * max(contour_pixels[0], 1) * max(contour_pixels[1], 0.01)
+
+            if score > best_score:
+                best_score = score
+                best_contour = contour
+                best_ellipse = cv2.fitEllipse(contour)
+                best_center = tuple(map(int, best_ellipse[0]))
+
+        debug_frame = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        cv2.circle(debug_frame, darkest_point, 5, (0, 0, 255), -1)
+
+        ellipse_found = best_ellipse is not None
+        confidence = float(best_score) if best_score > 0 else 0.0
+        pupil_center = (320, 240)
+        eye_center = prev_model_center_avg
+        gaze_vector = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        sphere_center = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+
+        if ellipse_found:
+            optimized = optimize_contours_by_angle([best_contour], gray)
+            if optimized is not None and len(optimized) >= 5:
+                best_ellipse = cv2.fitEllipse(optimized)
+
+            pupil_center = tuple(map(int, best_ellipse[0]))
+            ray_lines.append(best_ellipse)
+            if len(ray_lines) > max_rays:
+                ray_lines = ray_lines[-max_rays:]
+
+            model_center = compute_average_intersection(frame, ray_lines, 5, 1500)
+            if model_center is not None:
+                model_center_avg = update_and_average_point(model_centers, model_center, 200)
+                if model_center_avg is not None:
+                    prev_model_center_avg = model_center_avg
+            eye_center = prev_model_center_avg
+
+            sc, gv = compute_gaze_vector(
+                pupil_center[0],
+                pupil_center[1],
+                eye_center[0],
+                eye_center[1],
+                screen_width=640,
+                screen_height=480,
+            )
+            if sc is not None and gv is not None:
+                sphere_center = sc
+                gaze_vector = gv
+
+            cv2.ellipse(debug_frame, best_ellipse, (20, 255, 255), 2)
+            cv2.circle(debug_frame, pupil_center, 5, (0, 255, 0), -1)
+            cv2.circle(debug_frame, eye_center, 6, (255, 200, 0), -1)
+            cv2.line(debug_frame, eye_center, pupil_center, (255, 120, 40), 2)
+
+            dx = pupil_center[0] - eye_center[0]
+            dy = pupil_center[1] - eye_center[1]
+            ext = (int(eye_center[0] + dx * 2.0), int(eye_center[1] + dy * 2.0))
+            cv2.line(debug_frame, pupil_center, ext, (0, 255, 180), 2)
+
+        cv2.putText(debug_frame, f"Conf: {confidence:.1f}", (10, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.62, (50, 220, 50), 2)
+        cv2.putText(debug_frame, f"Ellipse: {'OK' if ellipse_found else 'NO'}", (10, 46),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.62, (50, 220, 50), 2)
+
+        return {
+            "gaze_vector": gaze_vector.astype(np.float32),
+            "sphere_center": sphere_center.astype(np.float32),
+            "ellipse_found": ellipse_found,
+            "ellipse": best_ellipse,
+            "pupil_center": pupil_center,
+            "eye_center": eye_center,
+            "confidence": confidence,
+            "debug_frame": debug_frame,
         }
-      }
-    } else {
-      b.openFrames = 0;
-    }
-  }
-
-  if(b.pendingSingleTs && now - b.pendingSingleTs > b.doubleWindowMs){
-    b.pendingSingleTs = 0;
-    doZoomOut('1 piscada: afasta');
-  }
-}
-
-function registerBlink(now){
-  const b = state.blink;
-  if(b.pendingSingleTs && now - b.pendingSingleTs <= b.doubleWindowMs){
-    b.pendingSingleTs = 0;
-    doZoomIn('2 piscadas: aproxima');
-    b.lastLabel = 'duplo';
-  } else {
-    b.pendingSingleTs = now;
-    b.lastLabel = 'simples';
-    flash('1 piscada detectada');
-  }
-  b.lastBlinkTs = now;
-  blinkDebug.textContent = b.lastLabel;
-}
-
-function calibrateEyes(){
-  state.eye.baselineReady = false;
-  state.eye.calibSamples = [];
-  state.blink.baselineReady = false;
-  state.blink.warmup = 0;
-  blinkText.textContent = 'Calibrando';
-  calibValue.textContent = 'Calibrando';
-  permissionNote.textContent = 'Calibrando olhos: olhe reto por 1 segundo com o rosto parado. O cursor será recentrado pelo padrão da pupila dentro dos olhos.';
-  log('Calibração ocular reiniciada.');
-}
-
-function commitCalibration(){
-  if(state.eye.calibSamples.length < 8) return false;
-  state.eye.baseX = avg(state.eye.calibSamples.map(s => s.x));
-  state.eye.baseY = avg(state.eye.calibSamples.map(s => s.y));
-  state.eye.baselineReady = true;
-  calibValue.textContent = 'Ok';
-  permissionNote.textContent = 'Calibração concluída. O olho controla a lateral e a vertical do cursor; 1 piscada afasta e 2 piscadas aproximam.';
-  log('Calibração ocular concluída.');
-  return true;
-}
-
-function onResults(results){
-  if(!state.running) return;
-  const r = video.getBoundingClientRect();
-  overlayCtx.clearRect(0,0,r.width,r.height);
-
-  const lm = results.multiFaceLandmarks && results.multiFaceLandmarks[0];
-  if(!lm){
-    state.gaze.quality = lerp(state.gaze.quality, 0, 0.18);
-    state.eye.lostFrames += 1;
-    hoverValue.textContent = 'Nenhuma';
-    blinkText.textContent = 'Sem leitura';
-    return;
-  }
-
-  const vw = r.width;
-  const vh = r.height;
-
-  const boxL = eyeBox(lm, LEFT_EYE_BOX, vw, vh);
-  const boxR = eyeBox(lm, RIGHT_EYE_BOX, vw, vh);
-
-  const irisL = irisCenter(lm, LEFT_IRIS, vw, vh);
-  const irisR = irisCenter(lm, RIGHT_IRIS, vw, vh);
-  const pupilL = pupilFromThreshold(boxL) || irisL;
-  const pupilR = pupilFromThreshold(boxR) || irisR;
-
-  drawEyeOverlay(lm, pupilL, pupilR, boxL, boxR);
-
-  if(!pupilL || !pupilR){
-    state.gaze.quality = lerp(state.gaze.quality, 0.1, 0.18);
-    blinkText.textContent = 'Leitura fraca';
-    return;
-  }
-
-  const rawLeftX = ((pupilL.x - boxL.x) / Math.max(1, boxL.w)) - 0.5;
-  const rawLeftY = ((pupilL.y - boxL.y) / Math.max(1, boxL.h)) - 0.5;
-  const rawRightX = ((pupilR.x - boxR.x) / Math.max(1, boxR.w)) - 0.5;
-  const rawRightY = ((pupilR.y - boxR.y) / Math.max(1, boxR.h)) - 0.5;
-
-  const rawX = (rawLeftX + rawRightX) * 0.5;
-  const rawY = (rawLeftY + rawRightY) * 0.5;
-
-  state.eye.lastRaw = {x:rawX, y:rawY};
-
-  if(!state.eye.baselineReady){
-    state.eye.calibSamples.push({x:rawX, y:rawY});
-    if(state.eye.calibSamples.length > 18) state.eye.calibSamples.shift();
-    commitCalibration();
-  }
-
-  const dx = rawX - state.eye.baseX;
-  const dy = rawY - state.eye.baseY;
-  let targetX = 0.5 + dx * state.eye.gainX * (state.gaze.invertX ? -1 : 1);
-  let targetY = 0.5 + dy * state.eye.gainY;
-
-  targetX = clamp(targetX, 0.03, 0.97);
-  targetY = clamp(targetY, 0.05, 0.95);
-
-  const smooth = smoothHistory({x:targetX, y:targetY});
-  state.gaze.targetX = smooth.x;
-  state.gaze.targetY = smooth.y;
-  state.gaze.quality = lerp(state.gaze.quality, 0.74, 0.14);
-
-  const eyeWidth = (boxL.w + boxR.w) / 2;
-  const binocularAgreement = 1 - clamp(Math.abs(rawLeftX - rawRightX) * 1.8 + Math.abs(rawLeftY - rawRightY) * 1.2, 0, 1);
-  const sizeScore = clamp((eyeWidth - 32) / 90, 0, 1);
-  state.trackingQuality = clamp(binocularAgreement * 0.55 + sizeScore * 0.45, 0.05, 0.99);
-  qualityValue.textContent = state.trackingQuality.toFixed(2);
-
-  const earL = ear(lm, 'left', vw, vh);
-  const earR = ear(lm, 'right', vw, vh);
-  const avgEar = (earL + earR) * 0.5;
-  processBlink(avgEar);
-  blinkText.textContent = state.blink.baselineReady ? (state.blink.pendingSingleTs ? 'Aguardando 2ª' : 'Pronto') : 'Calibrando';
-
-  hoverValue.textContent = state.hover.id ? (artworks.find(a => a.id === state.hover.id)?.title || 'Obra') : 'Nenhuma';
-}
-
-function startTracking(){
-  if(state.running) return;
-  if(!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)){
-    permissionNote.textContent = 'Este navegador não expõe getUserMedia para câmera.';
-    log('getUserMedia indisponível.');
-    return;
-  }
-
-  navigator.mediaDevices.getUserMedia({video:{facingMode:'user', width:{ideal:1280}, height:{ideal:720}}, audio:false})
-    .then(stream => {
-      state.stream = stream;
-      video.srcObject = stream;
-      video.onloadedmetadata = async () => {
-        await video.play();
-        resizeCanvases();
-
-        state.faceMesh = new window.FaceMesh({
-          locateFile: file => 'https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/' + file
-        });
-        state.faceMesh.setOptions({
-          maxNumFaces:1,
-          refineLandmarks:true,
-          minDetectionConfidence:0.5,
-          minTrackingConfidence:0.5
-        });
-        state.faceMesh.onResults(onResults);
-
-        const loop = async () => {
-          if(!state.running || !state.faceMesh || video.readyState < 2) return;
-          try {
-            await state.faceMesh.send({image: video});
-          } catch (err) {
-            log('Falha no FaceMesh: ' + err);
-          }
-          state.raf = requestAnimationFrame(loop);
-        };
-
-        state.running = true;
-        state.startedAt = performance.now();
-        resetInteractionState();
-        setStatus(true, 'Ativo');
-        controlText.textContent = 'Olho';
-        modeValue.textContent = 'Ocular';
-        permissionNote.textContent = 'Tracking ocular ativo. Agora clique em “Calibrar olhos” olhando reto.';
-        log('Câmera iniciada.');
-        loop();
-      };
-    })
-    .catch(err => {
-      permissionNote.textContent = 'Não consegui abrir a câmera: ' + err;
-      log('Erro de câmera: ' + err);
-    });
-}
-
-function stopTracking(){
-  state.running = false;
-  if(state.raf) cancelAnimationFrame(state.raf);
-  state.raf = null;
-  if(state.stream){
-    state.stream.getTracks().forEach(t => t.stop());
-    state.stream = null;
-  }
-  if(state.faceMesh){
-    try { state.faceMesh.close(); } catch(e) {}
-    state.faceMesh = null;
-  }
-  video.srcObject = null;
-  overlayCtx.clearRect(0,0,camOverlay.width,camOverlay.height);
-  setStatus(false, 'Parado');
-  permissionNote.textContent = 'Tracking parado.';
-  log('Tracking parado.');
-}
-
-function resetInteractionState(){
-  state.hover.id = null;
-  state.hover.startTs = 0;
-  state.selectedId = null;
-  state.fixations = 0;
-  state.seen = new Set();
-  state.heatPoints = [];
-  state.focusedHistory = [];
-  state.eye.baselineReady = false;
-  state.eye.calibSamples = [];
-  state.blink.baselineReady = false;
-  state.blink.warmup = 0;
-  state.blink.pendingSingleTs = 0;
-  state.gaze.history = [];
-  state.gaze.x = 0.5;
-  state.gaze.y = 0.5;
-  state.gaze.targetX = 0.5;
-  state.gaze.targetY = 0.5;
-  state.zoom.level = 0;
-  state.zoom.target = 0;
-  updateSelectedInfo(null);
-  fixValue.textContent = '0';
-  seenValue.textContent = '0';
-  zoomValue.textContent = '1.0x';
-  blinkDebug.textContent = '—';
-  calibValue.textContent = 'Pendente';
-  qualityValue.textContent = '0.00';
-  dwellFill.style.width = '0%';
-  floatBox.classList.remove('show');
-  heatCtx.clearRect(0,0,heatCanvas.width,heatCanvas.height);
-}
-
-function updateSelectedInfo(art){
-  if(!art){
-    selectedTitle.textContent = 'Nenhuma obra selecionada';
-    selectedArtist.textContent = 'Olhe para uma obra até o dwell completar.';
-    selectedDesc.textContent = 'Quando a obra entra em foco, aparece uma ficha genérica em cima dela e aqui na lateral.';
-    return;
-  }
-  selectedTitle.textContent = art.title;
-  selectedArtist.textContent = art.artist + ' · ' + art.year + ' · ' + art.theme;
-  selectedDesc.textContent = art.desc;
-}
-
-function projectPoint(x,y,z, cameraX, cameraZ, fov, w, h){
-  const cx = w * 0.5;
-  const cy = h * 0.56;
-  const relX = x - cameraX;
-  const relY = y - 1.6;
-  const relZ = z - cameraZ;
-  if(relZ <= 0.1) return null;
-  const s = fov / relZ;
-  return {
-    x: cx + relX * s,
-    y: cy - relY * s,
-    s, z: relZ
-  };
-}
-
-function artworkPoly(art, cameraX, cameraZ, fov, w, h){
-  let pts = [];
-  if(art.plane === 'back'){
-    pts = [
-      projectPoint(art.x - art.w/2, art.y + art.h/2, art.z, cameraX, cameraZ, fov, w, h),
-      projectPoint(art.x + art.w/2, art.y + art.h/2, art.z, cameraX, cameraZ, fov, w, h),
-      projectPoint(art.x + art.w/2, art.y - art.h/2, art.z, cameraX, cameraZ, fov, w, h),
-      projectPoint(art.x - art.w/2, art.y - art.h/2, art.z, cameraX, cameraZ, fov, w, h)
-    ];
-  } else if(art.plane === 'left'){
-    pts = [
-      projectPoint(art.x, art.y + art.h/2, art.z - art.w/2, cameraX, cameraZ, fov, w, h),
-      projectPoint(art.x, art.y + art.h/2, art.z + art.w/2, cameraX, cameraZ, fov, w, h),
-      projectPoint(art.x, art.y - art.h/2, art.z + art.w/2, cameraX, cameraZ, fov, w, h),
-      projectPoint(art.x, art.y - art.h/2, art.z - art.w/2, cameraX, cameraZ, fov, w, h)
-    ];
-  } else {
-    pts = [
-      projectPoint(art.x, art.y + art.h/2, art.z + art.w/2, cameraX, cameraZ, fov, w, h),
-      projectPoint(art.x, art.y + art.h/2, art.z - art.w/2, cameraX, cameraZ, fov, w, h),
-      projectPoint(art.x, art.y - art.h/2, art.z - art.w/2, cameraX, cameraZ, fov, w, h),
-      projectPoint(art.x, art.y - art.h/2, art.z + art.w/2, cameraX, cameraZ, fov, w, h)
-    ];
-  }
-  if(pts.some(p => !p)) return null;
-  return pts;
-}
-
-function drawPoly(ctx, pts, fill, stroke, lineWidth){
-  ctx.beginPath();
-  ctx.moveTo(pts[0].x, pts[0].y);
-  for(let i=1;i<pts.length;i++) ctx.lineTo(pts[i].x, pts[i].y);
-  ctx.closePath();
-  if(fill){ ctx.fillStyle = fill; ctx.fill(); }
-  if(stroke){ ctx.strokeStyle = stroke; ctx.lineWidth = lineWidth || 1; ctx.stroke(); }
-}
-
-function pointInPoly(pt, poly){
-  let c = false;
-  for(let i=0, j=poly.length-1; i<poly.length; j=i++){
-    const xi = poly[i].x, yi = poly[i].y;
-    const xj = poly[j].x, yj = poly[j].y;
-    const intersect = ((yi > pt.y) !== (yj > pt.y)) && (pt.x < (xj-xi)*(pt.y-yi)/(yj-yi + 1e-6) + xi);
-    if(intersect) c = !c;
-  }
-  return c;
-}
-
-function drawRoom(){
-  const w = roomCanvas.clientWidth;
-  const h = roomCanvas.clientHeight;
-  roomCtx.clearRect(0,0,w,h);
-
-  const cameraX = lerp(-1.6, 1.6, state.gaze.x);
-  const cameraZ = -1.25 - state.zoom.level * 0.9;
-  const fov = 620 + state.zoom.level * 120;
-
-  const leftWall = [
-    projectPoint(-5.2, 3.7, 0.8, cameraX, cameraZ, fov, w, h),
-    projectPoint(-5.2, 3.7, 10.4, cameraX, cameraZ, fov, w, h),
-    projectPoint(-5.2, 0.1, 10.4, cameraX, cameraZ, fov, w, h),
-    projectPoint(-5.2, 0.1, 0.8, cameraX, cameraZ, fov, w, h)
-  ];
-  const rightWall = [
-    projectPoint(5.2, 3.7, 10.4, cameraX, cameraZ, fov, w, h),
-    projectPoint(5.2, 3.7, 0.8, cameraX, cameraZ, fov, w, h),
-    projectPoint(5.2, 0.1, 0.8, cameraX, cameraZ, fov, w, h),
-    projectPoint(5.2, 0.1, 10.4, cameraX, cameraZ, fov, w, h)
-  ];
-  const backWall = [
-    projectPoint(-5.2, 3.7, 10.4, cameraX, cameraZ, fov, w, h),
-    projectPoint(5.2, 3.7, 10.4, cameraX, cameraZ, fov, w, h),
-    projectPoint(5.2, 0.1, 10.4, cameraX, cameraZ, fov, w, h),
-    projectPoint(-5.2, 0.1, 10.4, cameraX, cameraZ, fov, w, h)
-  ];
-  const floor = [
-    projectPoint(-5.2, 0.1, 0.8, cameraX, cameraZ, fov, w, h),
-    projectPoint(5.2, 0.1, 0.8, cameraX, cameraZ, fov, w, h),
-    projectPoint(5.2, 0.1, 10.4, cameraX, cameraZ, fov, w, h),
-    projectPoint(-5.2, 0.1, 10.4, cameraX, cameraZ, fov, w, h)
-  ];
-  const ceil = [
-    projectPoint(-5.2, 3.7, 10.4, cameraX, cameraZ, fov, w, h),
-    projectPoint(5.2, 3.7, 10.4, cameraX, cameraZ, fov, w, h),
-    projectPoint(5.2, 3.7, 0.8, cameraX, cameraZ, fov, w, h),
-    projectPoint(-5.2, 3.7, 0.8, cameraX, cameraZ, fov, w, h)
-  ];
-
-  roomCtx.fillStyle = '#06101f';
-  roomCtx.fillRect(0,0,w,h);
-
-  if(floor.every(Boolean)) drawPoly(roomCtx, floor, 'rgba(230,236,245,.12)', 'rgba(255,255,255,.05)', 1.1);
-  if(ceil.every(Boolean)) drawPoly(roomCtx, ceil, 'rgba(255,255,255,.02)', 'rgba(255,255,255,.03)', 1.0);
-  if(leftWall.every(Boolean)) drawPoly(roomCtx, leftWall, 'rgba(77,96,136,.16)', 'rgba(255,255,255,.04)', 1);
-  if(rightWall.every(Boolean)) drawPoly(roomCtx, rightWall, 'rgba(65,82,120,.16)', 'rgba(255,255,255,.04)', 1);
-  if(backWall.every(Boolean)) drawPoly(roomCtx, backWall, 'rgba(78,92,122,.20)', 'rgba(255,255,255,.04)', 1);
-
-  roomCtx.save();
-  roomCtx.globalAlpha = 0.18;
-  for(let i=0;i<24;i++){
-    const px = ((i * 73) % w);
-    const py = ((i * 41) % h);
-    roomCtx.fillStyle = i % 2 ? 'rgba(93,173,226,.32)' : 'rgba(165,105,189,.26)';
-    roomCtx.beginPath();
-    roomCtx.arc(px + (state.gaze.x - 0.5) * 50, py + (state.gaze.y - 0.5) * 28, 1.2 + (i % 3), 0, Math.PI*2);
-    roomCtx.fill();
-  }
-  roomCtx.restore();
-
-  projectedArtworks = [];
-  artworks.forEach(art => {
-    const poly = artworkPoly(art, cameraX, cameraZ, fov, w, h);
-    if(!poly) return;
-    const cx = avg(poly.map(p=>p.x));
-    const cy = avg(poly.map(p=>p.y));
-    const depth = avg(poly.map(p=>p.z));
-    projectedArtworks.push({art, poly, center:{x:cx, y:cy}, depth});
-  });
-
-  projectedArtworks.sort((a,b) => b.depth - a.depth);
-  projectedArtworks.forEach(item => {
-    const focused = item.art.id === state.hover.id || item.art.id === state.selectedId;
-    const glow = focused ? 26 : 12;
-    roomCtx.save();
-    roomCtx.shadowBlur = glow;
-    roomCtx.shadowColor = focused ? item.art.color : 'rgba(0,0,0,.15)';
-    drawPoly(roomCtx, item.poly, item.art.color, focused ? 'rgba(255,255,255,.88)' : 'rgba(255,255,255,.18)', focused ? 2.5 : 1.2);
-    roomCtx.restore();
-
-    const inner = item.poly.map((p, i) => {
-      const c = item.center;
-      return {x: lerp(c.x, p.x, 0.88), y: lerp(c.y, p.y, 0.88)};
-    });
-    drawPoly(roomCtx, inner, 'rgba(255,255,255,.12)', null, 0);
-    roomCtx.fillStyle = 'rgba(255,255,255,.72)';
-    roomCtx.font = focused ? '700 13px Space Grotesk' : '600 11px Space Grotesk';
-    roomCtx.textAlign = 'center';
-    roomCtx.fillText(item.art.title, item.center.x, item.center.y + 4);
-
-    if(focused){
-      roomCtx.strokeStyle = 'rgba(240,192,64,.92)';
-      roomCtx.lineWidth = 2;
-      drawPoly(roomCtx, item.poly, null, roomCtx.strokeStyle, 2);
-    }
-  });
-
-  drawHeatPoint();
-  drawFloatInfo();
-}
-
-function drawHeatPoint(){
-  const w = heatCanvas.clientWidth;
-  const h = heatCanvas.clientHeight;
-  const x = state.gaze.x * w;
-  const y = state.gaze.y * h;
-  state.heatPoints.push({x,y});
-  if(state.heatPoints.length > 3200) state.heatPoints.shift();
-
-  const g = heatCtx.createRadialGradient(x, y, 0, x, y, 28);
-  g.addColorStop(0, 'rgba(255,96,32,.20)');
-  g.addColorStop(1, 'rgba(255,96,32,0)');
-  heatCtx.fillStyle = g;
-  heatCtx.fillRect(x-28, y-28, 56, 56);
-}
-
-function drawFloatInfo(){
-  const focused = projectedArtworks.find(p => p.art.id === state.hover.id) || projectedArtworks.find(p => p.art.id === state.selectedId);
-  if(!focused){
-    floatBox.classList.remove('show');
-    return;
-  }
-  floatTitle.textContent = focused.art.title;
-  floatSub.textContent = focused.art.artist + ' · ' + focused.art.year + ' · ' + focused.art.theme;
-  floatTxt.textContent = focused.art.desc;
-  floatBox.style.left = focused.center.x + 'px';
-  floatBox.style.top = focused.center.y + 'px';
-  floatBox.classList.add('show');
-}
-
-function updateHover(){
-  const w = roomCanvas.clientWidth;
-  const h = roomCanvas.clientHeight;
-  const pt = {x: state.gaze.x * w, y: state.gaze.y * h};
-
-  let best = null;
-  projectedArtworks.forEach(item => {
-    const inside = pointInPoly(pt, item.poly);
-    const d = Math.hypot(pt.x - item.center.x, pt.y - item.center.y);
-    const score = (inside ? 0 : 1) * 1000 + d;
-    if(!best || score < best.score){
-      best = {item, score, inside, d};
-    }
-  });
-
-  if(!best){
-    state.hover.id = null;
-    state.hover.startTs = 0;
-    dwellFill.style.width = '0%';
-    return;
-  }
-
-  const threshold = best.inside ? 999 : 92;
-  if(best.d > threshold){
-    state.hover.id = null;
-    state.hover.startTs = 0;
-    dwellFill.style.width = '0%';
-    return;
-  }
-
-  if(state.hover.id !== best.item.art.id){
-    state.hover.id = best.item.art.id;
-    state.hover.startTs = performance.now();
-    state.fixations += 1;
-    fixValue.textContent = String(state.fixations);
-  }
-
-  const held = performance.now() - state.hover.startTs;
-  const pct = clamp(held / state.hover.dwellMs, 0, 1);
-  dwellFill.style.width = (pct * 100).toFixed(1) + '%';
-
-  if(pct >= 1 && state.selectedId !== state.hover.id){
-    selectArtwork(state.hover.id, true);
-    state.hover.startTs = performance.now();
-  }
-}
-
-function selectArtwork(id, viaGaze){
-  state.selectedId = id;
-  const art = artworks.find(a => a.id === id);
-  if(!art) return;
-  updateSelectedInfo(art);
-  state.seen.add(id);
-  seenValue.textContent = String(state.seen.size);
-  if(viaGaze) flash('Obra selecionada');
-}
-
-function doZoomIn(label){
-  state.zoom.target = clamp(state.zoom.target + 1, 0, 3);
-  flash(label || 'Aproximando');
-  zoomValue.textContent = (1 + state.zoom.target * 0.35).toFixed(1) + 'x';
-}
-function doZoomOut(label){
-  state.zoom.target = clamp(state.zoom.target - 1, 0, 3);
-  flash(label || 'Afastando');
-  zoomValue.textContent = (1 + state.zoom.target * 0.35).toFixed(1) + 'x';
-}
-
-function animate(){
-  state.gaze.x = lerp(state.gaze.x, state.gaze.targetX, 0.13);
-  state.gaze.y = lerp(state.gaze.y, state.gaze.targetY, 0.13);
-  state.zoom.level = lerp(state.zoom.level, state.zoom.target, 0.10);
-
-  gazeCursor.style.left = (state.gaze.x * 100).toFixed(2) + '%';
-  gazeCursor.style.top = (state.gaze.y * 100).toFixed(2) + '%';
-
-  drawRoom();
-  updateHover();
-
-  blinkDebug.textContent = state.blink.lastLabel;
-  qualityValue.textContent = state.trackingQuality.toFixed(2);
-  hoverValue.textContent = state.hover.id ? (artworks.find(a => a.id === state.hover.id)?.title || 'Obra') : 'Nenhuma';
-
-  requestAnimationFrame(animate);
-}
-
-async function exportPdf(){
-  try{
-    const { jsPDF } = window.jspdf;
-    const pdf = new jsPDF({orientation:'landscape', unit:'pt', format:'a4'});
-    const roomImg = roomCanvas.toDataURL('image/png');
-    const heatImg = heatCanvas.toDataURL('image/png');
-
-    pdf.setFillColor(6,13,26);
-    pdf.rect(0,0,842,595,'F');
-    pdf.setTextColor(232,240,255);
-    pdf.setFont('helvetica', 'bold');
-    pdf.setFontSize(18);
-    pdf.text('Relatório da galeria ocular', 28, 32);
-
-    pdf.setFont('helvetica', 'normal');
-    pdf.setFontSize(10);
-    pdf.setTextColor(137,160,199);
-    pdf.text('Controle principal por olho. 1 piscada afasta. 2 piscadas aproximam.', 28, 50);
-
-    pdf.addImage(roomImg, 'PNG', 28, 70, 500, 340);
-    pdf.setFontSize(12);
-    pdf.setTextColor(232,240,255);
-    pdf.text('Heatmap do relatório', 560, 84);
-    pdf.addImage(heatImg, 'PNG', 540, 96, 260, 180);
-
-    pdf.setFontSize(11);
-    pdf.setTextColor(232,240,255);
-    pdf.text('Resumo', 540, 300);
-    pdf.setTextColor(137,160,199);
-    pdf.text('Fixações: ' + state.fixations, 540, 322);
-    pdf.text('Obras vistas: ' + state.seen.size, 540, 338);
-    pdf.text('Qualidade ocular: ' + state.trackingQuality.toFixed(2), 540, 354);
-    pdf.text('Zoom final: ' + (1 + state.zoom.target * 0.35).toFixed(1) + 'x', 540, 370);
-
-    let y = 400;
-    Array.from(state.seen).slice(0,5).forEach(id => {
-      const art = artworks.find(a => a.id === id);
-      if(!art) return;
-      pdf.setTextColor(232,240,255);
-      pdf.text(art.title + ' — ' + art.artist, 540, y);
-      pdf.setTextColor(137,160,199);
-      const lines = pdf.splitTextToSize(art.desc, 240);
-      pdf.text(lines, 540, y + 14);
-      y += 42;
-    });
-
-    pdf.save('relatorio_galeria_ocular.pdf');
-    flash('PDF exportado');
-  }catch(err){
-    log('Falha ao exportar PDF: ' + err);
-  }
-}
-
-document.getElementById('startBtn').addEventListener('click', startTracking);
-document.getElementById('stopBtn').addEventListener('click', stopTracking);
-document.getElementById('calibrateBtn').addEventListener('click', calibrateEyes);
-document.getElementById('invertBtn').addEventListener('click', () => {
-  state.gaze.invertX = !state.gaze.invertX;
-  log('Invert X: ' + (state.gaze.invertX ? 'ligado' : 'desligado'));
-});
-document.getElementById('zoomInBtn').addEventListener('click', () => doZoomIn('Zoom manual'));
-document.getElementById('zoomOutBtn').addEventListener('click', () => doZoomOut('Zoom manual'));
-document.getElementById('zoomInBtn2').addEventListener('click', () => doZoomIn('Zoom manual'));
-document.getElementById('zoomOutBtn2').addEventListener('click', () => doZoomOut('Zoom manual'));
-document.getElementById('exportBtn').addEventListener('click', exportPdf);
-
-resizeCanvases();
-resetInteractionState();
-setStatus(false, 'Parado');
-controlText.textContent = 'Olho';
-modeValue.textContent = 'Ocular';
-blinkText.textContent = 'Aguardando';
-log('Interface pronta.');
-animate();
-})();
-</script>
-</div>
-"""
-
-components.html(HTML_APP, height=1520, scrolling=True)
+
+
+# =============================================================================
+# Heatmap e relatório PDF
+# =============================================================================
+
+class HeatmapReport:
+    def __init__(self, width: int, height: int, room: GalleryRoom):
+        self.width = width
+        self.height = height
+        self.room = room
+        self.heatmap = np.zeros((height, width), dtype=np.float32)
+        self.painting_times: Dict[str, float] = {p.id: 0.0 for p in room.paintings}
+        self.painting_hits: Dict[str, int] = {p.id: 0 for p in room.paintings}
+        self.painting_titles: Dict[str, str] = {p.id: p.title for p in room.paintings}
+        self.session_start = time.time()
+        self.last_frame_time = time.time()
+        self.last_background_frame = None
+        self.total_samples = 0
+
+    def add_gaze(self, x: int, y: int, focused: Optional[Painting], dt: float):
+        if 0 <= x < self.width and 0 <= y < self.height:
+            self._splat(x, y, sigma=22, amount=1.0)
+            self.total_samples += 1
+
+        if focused is not None:
+            self.painting_times[focused.id] += dt
+            self.painting_hits[focused.id] += 1
+
+    def set_background_frame(self, surf: pygame.Surface):
+        arr = pygame.surfarray.array3d(surf)
+        arr = np.transpose(arr, (1, 0, 2))
+        self.last_background_frame = arr.copy()
+
+    def _splat(self, x: int, y: int, sigma=16, amount=1.0):
+        radius = sigma * 3
+        x0 = max(0, x - radius)
+        x1 = min(self.width, x + radius + 1)
+        y0 = max(0, y - radius)
+        y1 = min(self.height, y + radius + 1)
+
+        xs = np.arange(x0, x1) - x
+        ys = np.arange(y0, y1) - y
+        xv, yv = np.meshgrid(xs, ys)
+        kernel = np.exp(-(xv**2 + yv**2) / (2.0 * sigma**2))
+        self.heatmap[y0:y1, x0:x1] += kernel.astype(np.float32) * amount
+
+    def save_pdf(self, pdf_path: str, blink_count: int, double_blinks: int):
+        session_duration = max(1.0, time.time() - self.session_start)
+        most_viewed_id = max(self.painting_times, key=lambda k: self.painting_times[k])
+        most_viewed_title = self.painting_titles[most_viewed_id]
+        most_viewed_seconds = self.painting_times[most_viewed_id]
+
+        heat = self.heatmap.copy()
+        if heat.max() > 0:
+            heat = heat / heat.max()
+
+        with PdfPages(pdf_path) as pdf:
+            # Página 1: resumo
+            fig = plt.figure(figsize=(11.69, 8.27))
+            fig.patch.set_facecolor("white")
+            plt.axis("off")
+            plt.text(0.05, 0.92, "Relatório de Mapa de Calor - Sala 3D Controlada pelo Olhar",
+                     fontsize=22, fontweight="bold")
+            plt.text(0.05, 0.84, f"Duração da sessão: {session_duration:.1f} s", fontsize=14)
+            plt.text(0.05, 0.79, f"Amostras de olhar: {self.total_samples}", fontsize=14)
+            plt.text(0.05, 0.74, f"Piscadas detectadas: {blink_count}", fontsize=14)
+            plt.text(0.05, 0.69, f"Duplas piscadas: {double_blinks}", fontsize=14)
+            plt.text(0.05, 0.62, f"Quadro mais observado: {most_viewed_title}", fontsize=16)
+            plt.text(0.05, 0.57, f"Tempo acumulado: {most_viewed_seconds:.2f} s", fontsize=14)
+
+            lines = [
+                "Interações:",
+                "- olhar em um quadro exibe informações",
+                "- dupla piscada aproxima a obra",
+                "- piscada única afasta / sai do zoom",
+                "",
+                "Observação:",
+                "O mapa de calor abaixo usa as posições do cursor de olhar ao longo da sessão.",
+            ]
+            y = 0.48
+            for line in lines:
+                plt.text(0.05, y, line, fontsize=13)
+                y -= 0.05
+
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+
+            # Página 2: heatmap
+            fig, ax = plt.subplots(figsize=(12, 7))
+            ax.set_title("Mapa de calor do olhar na sala", fontsize=18)
+            if self.last_background_frame is not None:
+                ax.imshow(self.last_background_frame)
+                ax.imshow(heat, cmap="jet", alpha=0.52, extent=[0, self.width, self.height, 0])
+            else:
+                ax.imshow(heat, cmap="jet")
+            ax.set_xlim([0, self.width])
+            ax.set_ylim([self.height, 0])
+            ax.set_xlabel("X da janela")
+            ax.set_ylabel("Y da janela")
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+
+            # Página 3: análise por quadro
+            labels = [self.painting_titles[k] for k in self.painting_times.keys()]
+            values = [self.painting_times[k] for k in self.painting_times.keys()]
+            hits = [self.painting_hits[k] for k in self.painting_times.keys()]
+
+            fig, axes = plt.subplots(2, 1, figsize=(12, 9))
+            axes[0].bar(labels, values)
+            axes[0].set_title("Tempo acumulado por quadro (s)")
+            axes[0].tick_params(axis="x", rotation=20)
+
+            axes[1].bar(labels, hits)
+            axes[1].set_title("Quantidade de amostras por quadro")
+            axes[1].tick_params(axis="x", rotation=20)
+            plt.tight_layout()
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+
+
+# =============================================================================
+# App principal da sala 3D
+# =============================================================================
+
+class EyeGazeGalleryApp:
+    def __init__(self, camera_index=0, preview=False):
+        pygame.init()
+        pygame.font.init()
+
+        self.width = 1280
+        self.height = 720
+        self.screen = pygame.display.set_mode((self.width, self.height))
+        pygame.display.set_caption("Sala 3D por Rastreamento Ocular")
+        self.clock = pygame.time.Clock()
+
+        self.font_title = pygame.font.SysFont("Segoe UI", 30, bold=True)
+        self.font_body = pygame.font.SysFont("Segoe UI", 22)
+        self.font_small = pygame.font.SysFont("Segoe UI", 18)
+
+        self.renderer = Software3DRenderer(self.width, self.height)
+        self.room = GalleryRoom()
+        self.report = HeatmapReport(self.width, self.height, self.room)
+        self.tracker = EyeTracker(camera_index=camera_index, preview=preview)
+
+        self.running = True
+        self.calibration_message = "Pressione C olhando para o centro da sala para calibrar."
+        self.cam_pos = np.array([0.0, 1.65, 1.2], dtype=np.float32)
+        self.cam_rot = np.eye(3, dtype=np.float32)
+
+        self.current_hover: Optional[Painting] = None
+        self.hover_strength = 0.0
+        self.hover_start_time = 0.0
+        self.zoomed_painting: Optional[Painting] = None
+        self.zoom_anim = 0.0
+
+        self.cursor_x = self.width // 2
+        self.cursor_y = self.height // 2
+        self.cursor_visible = True
+
+        self.session_message = "Olhe para um quadro para ver detalhes."
+        self.last_message_time = time.time()
+        self.last_dt = 1.0 / 60.0
+
+        self.inspect_card_alpha = 0.0
+
+    def set_message(self, msg: str):
+        self.session_message = msg
+        self.last_message_time = time.time()
+
+    def _gaze_to_room_ray(self, gaze_vec: np.ndarray):
+        g = normalize(gaze_vec.astype(np.float32))
+
+        if g[2] <= 0.05:
+            g[2] = 0.05
+            g = normalize(g)
+
+        # Após calibração, g aponta "para a frente" com +Z; no mundo da sala, frente é -Z.
+        ray_dir_world = normalize(np.array([g[0], g[1], -g[2]], dtype=np.float32))
+        ray_origin = self.cam_pos.copy()
+        return ray_origin, ray_dir_world
+
+    def _gaze_to_screen_cursor(self, gaze_vec: np.ndarray):
+        g = normalize(gaze_vec.astype(np.float32))
+        f = (self.width * 0.5) / math.tan(self.renderer.fov / 2.0)
+        z = max(0.15, float(g[2]))
+        x = int(self.width / 2 + f * (g[0] / z))
+        y = int(self.height / 2 - f * (g[1] / z))
+        x = int(clamp(x, 0, self.width - 1))
+        y = int(clamp(y, 0, self.height - 1))
+        return x, y
+
+    def _draw_cursor(self, surf):
+        if not self.cursor_visible:
+            return
+        x, y = self.cursor_x, self.cursor_y
+        pygame.draw.circle(surf, (255, 80, 80), (x, y), 10, 2)
+        pygame.draw.circle(surf, (255, 80, 80), (x, y), 2)
+
+    def _draw_hud(self, surf, tracker_state):
+        pad = 14
+        panel = pygame.Surface((420, 150), pygame.SRCALPHA)
+        panel.fill((10, 10, 16, 180))
+        surf.blit(panel, (12, 12))
+
+        fps_text = self.font_small.render(f"FPS câmera: {tracker_state['fps']:.1f}", True, (230, 230, 230))
+        conf_text = self.font_small.render(f"Confiança: {tracker_state['confidence']:.1f}", True, (230, 230, 230))
+        blink_text = self.font_small.render(
+            f"Piscadas: {tracker_state['total_blinks']} | Duplas: {tracker_state['total_double_blinks']}",
+            True, (230, 230, 230)
+        )
+        cal_text = self.font_small.render(
+            "Calibrado" if self.tracker.calibrated else "Sem calibração",
+            True,
+            (130, 255, 130) if self.tracker.calibrated else (255, 170, 80),
+        )
+
+        surf.blit(fps_text, (24, 24))
+        surf.blit(conf_text, (24, 52))
+        surf.blit(blink_text, (24, 80))
+        surf.blit(cal_text, (24, 108))
+
+        msg_bg = pygame.Surface((self.width - 24, 44), pygame.SRCALPHA)
+        msg_bg.fill((10, 10, 16, 145))
+        surf.blit(msg_bg, (12, self.height - 56))
+
+        message = self.session_message
+        if time.time() - self.last_message_time > 5.0 and self.current_hover is None and self.zoomed_painting is None:
+            message = "Olhe para um quadro. Dupla piscada aproxima, piscada única afasta."
+        msg_text = self.font_body.render(message, True, (245, 245, 245))
+        surf.blit(msg_text, (24, self.height - 48))
+
+        if not self.tracker.calibrated:
+            t = self.font_body.render(self.calibration_message, True, (255, 240, 120))
+            surf.blit(t, (24, self.height - 88))
+
+    def _draw_info_panel(self, surf, painting: Painting):
+        panel_w = 430
+        panel_h = 220
+        panel = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
+        panel.fill((8, 8, 14, 220))
+
+        title = self.font_title.render(painting.title, True, (255, 255, 255))
+        artist = self.font_body.render(f"{painting.artist} · {painting.year}", True, (220, 220, 220))
+        pid = self.font_small.render(f"ID: {painting.id}", True, (160, 210, 255))
+
+        panel.blit(title, (18, 16))
+        panel.blit(artist, (18, 58))
+        panel.blit(pid, (18, 88))
+
+        y = 122
+        for line in self._wrap_text(painting.description, self.font_small, panel_w - 36):
+            txt = self.font_small.render(line, True, (230, 230, 230))
+            panel.blit(txt, (18, y))
+            y += 24
+
+        panel.blit(self.font_small.render("Dupla piscada para aproximar", True, (255, 225, 120)), (18, panel_h - 48))
+        panel.blit(self.font_small.render("Piscada única para afastar", True, (255, 225, 120)), (18, panel_h - 24))
+
+        surf.blit(panel, (self.width - panel_w - 18, 18))
+
+    def _draw_zoom_card(self, surf, painting: Painting):
+        self.inspect_card_alpha = lerp(self.inspect_card_alpha, 1.0, 0.14)
+        alpha = int(clamp(self.inspect_card_alpha * 255, 0, 255))
+
+        overlay = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, int(180 * self.zoom_anim)))
+        surf.blit(overlay, (0, 0))
+
+        card_w = int(920 * (0.8 + 0.2 * self.zoom_anim))
+        card_h = int(520 * (0.8 + 0.2 * self.zoom_anim))
+        card_x = (self.width - card_w) // 2
+        card_y = (self.height - card_h) // 2
+
+        card = pygame.Surface((card_w, card_h), pygame.SRCALPHA)
+        card.fill((18, 18, 24, alpha))
+
+        margin = 34
+        frame_rect = pygame.Rect(margin, margin, int(card_w * 0.48), card_h - 2 * margin)
+        info_rect = pygame.Rect(frame_rect.right + 28, margin, card_w - frame_rect.width - 3 * margin, card_h - 2 * margin)
+
+        pygame.draw.rect(card, (250, 244, 232), frame_rect, border_radius=8)
+        inner = frame_rect.inflate(-24, -24)
+        pygame.draw.rect(card, painting.color, inner, border_radius=6)
+        pygame.draw.rect(card, (28, 28, 32), inner.inflate(-20, -20), border_radius=5)
+
+        card.blit(self.font_title.render(painting.title, True, (255, 255, 255)), (info_rect.x, info_rect.y))
+        card.blit(self.font_body.render(f"{painting.artist} · {painting.year}", True, (220, 220, 220)), (info_rect.x, info_rect.y + 44))
+        card.blit(self.font_small.render(f"Quadro {painting.id}", True, (160, 210, 255)), (info_rect.x, info_rect.y + 78))
+
+        y = info_rect.y + 122
+        for line in self._wrap_text(painting.description, self.font_body, info_rect.width - 6):
+            card.blit(self.font_body.render(line, True, (235, 235, 235)), (info_rect.x, y))
+            y += 30
+
+        tips = [
+            "Modo zoom ativo",
+            "Piscada única para afastar",
+            "Continue olhando para analisar a obra",
+        ]
+        y += 24
+        for tip in tips:
+            card.blit(self.font_small.render(tip, True, (255, 230, 130)), (info_rect.x, y))
+            y += 26
+
+        pygame.draw.rect(card, (255, 255, 255, alpha), card.get_rect(), 2, border_radius=16)
+        surf.blit(card, (card_x, card_y))
+
+    @staticmethod
+    def _wrap_text(text, font, max_width):
+        words = text.split()
+        lines = []
+        current = ""
+        for w in words:
+            test = w if not current else current + " " + w
+            if font.size(test)[0] <= max_width:
+                current = test
+            else:
+                if current:
+                    lines.append(current)
+                current = w
+        if current:
+            lines.append(current)
+        return lines
+
+    def _update_focus(self, gaze_vec, dt):
+        ray_origin, ray_dir = self._gaze_to_room_ray(gaze_vec)
+        hit = self.room.intersect_painting(ray_origin, ray_dir)
+
+        self.cursor_x, self.cursor_y = self._gaze_to_screen_cursor(gaze_vec)
+
+        if hit.painting is not None:
+            if self.current_hover is None or self.current_hover.id != hit.painting.id:
+                self.current_hover = hit.painting
+                self.hover_start_time = time.time()
+                self.set_message(f"Foco em {hit.painting.title}")
+            self.hover_strength = min(1.0, self.hover_strength + dt * 2.0)
+        else:
+            self.hover_strength = max(0.0, self.hover_strength - dt * 2.4)
+            if self.hover_strength <= 0.02:
+                self.current_hover = None
+
+        self.report.add_gaze(self.cursor_x, self.cursor_y, self.current_hover, dt)
+
+    def _handle_blinks(self):
+        if self.tracker.consume_double_blink():
+            if self.current_hover is not None:
+                self.zoomed_painting = self.current_hover
+                self.set_message(f"Zoom em {self.current_hover.title}")
+            else:
+                self.set_message("Dupla piscada detectada, mas nenhum quadro estava em foco.")
+
+        # Piscada única só afasta se não tiver ocorrido dupla na janela curta
+        if self.tracker.consume_single_blink():
+            if self.zoomed_painting is not None:
+                self.set_message(f"Saindo do zoom de {self.zoomed_painting.title}")
+                self.zoomed_painting = None
+            else:
+                self.set_message("Piscada única detectada.")
+
+    def run(self):
+        self.tracker.start()
+        self.set_message("Sistema iniciado. Pressione C olhando para o centro para calibrar.")
+
+        try:
+            while self.running:
+                dt = self.clock.tick(60) / 1000.0
+                self.last_dt = dt
+
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        self.running = False
+                    elif event.type == pygame.KEYDOWN:
+                        if event.key in (pygame.K_ESCAPE, pygame.K_q):
+                            self.running = False
+                        elif event.key == pygame.K_c:
+                            self.tracker.calibrate_center()
+                            self.set_message("Calibração concluída.")
+                        elif event.key == pygame.K_SPACE:
+                            # atalho manual: alterna zoom
+                            if self.current_hover is not None:
+                                self.zoomed_painting = self.current_hover
+                                self.set_message(f"Zoom manual em {self.current_hover.title}")
+                        elif event.key == pygame.K_BACKSPACE:
+                            self.zoomed_painting = None
+                            self.set_message("Zoom removido.")
+
+                tracker_state = self.tracker.get_state()
+                gaze_vec = self.tracker.get_screen_gaze()
+                self._update_focus(gaze_vec, dt)
+                self._handle_blinks()
+
+                if self.zoomed_painting is not None:
+                    self.zoom_anim = min(1.0, self.zoom_anim + dt * 3.0)
+                else:
+                    self.zoom_anim = max(0.0, self.zoom_anim - dt * 3.2)
+                    if self.zoom_anim <= 0.01:
+                        self.inspect_card_alpha = 0.0
+
+                self.renderer.render_room(
+                    self.screen,
+                    self.room,
+                    self.cam_pos,
+                    self.cam_rot,
+                    self.current_hover,
+                    self.hover_strength,
+                )
+
+                self._draw_cursor(self.screen)
+
+                if self.current_hover is not None and self.zoomed_painting is None:
+                    self._draw_info_panel(self.screen, self.current_hover)
+
+                if self.zoom_anim > 0.01 and self.zoomed_painting is not None:
+                    self._draw_zoom_card(self.screen, self.zoomed_painting)
+
+                self._draw_hud(self.screen, tracker_state)
+                pygame.display.flip()
+
+                self.report.set_background_frame(self.screen)
+
+        finally:
+            self.tracker.stop()
+            out_pdf = os.path.abspath("relatorio_mapa_calor.pdf")
+            self.report.save_pdf(
+                out_pdf,
+                blink_count=self.tracker.total_blinks,
+                double_blinks=self.tracker.total_double_blinks,
+            )
+            print(f"Relatório salvo em: {out_pdf}")
+            pygame.quit()
+
+
+# =============================================================================
+# Entrada principal
+# =============================================================================
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Sala 3D com rastreamento ocular e relatório PDF")
+    parser.add_argument("--camera", type=int, default=0, help="Índice da câmera do olho")
+    parser.add_argument("--preview", action="store_true", help="Exibe preview OpenCV do rastreamento")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    app = EyeGazeGalleryApp(camera_index=args.camera, preview=args.preview)
+    app.run()
+
+
+if __name__ == "__main__":
+    main()
