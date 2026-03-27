@@ -1,9 +1,8 @@
-streamlit>=1.44
-streamlit-webrtc>=0.64.5
-opencv-python-headless>=4.13.0.92
-mediapipe>=0.10.33
-numpy>=1.26
-matplotlib>=3.9
-Pillow>=10.4
-reportlab>=4.2
-av>=14.0.0
+streamlit==1.44.1
+streamlit-webrtc==0.64.5
+mediapipe==0.10.30
+numpy==1.26.4
+matplotlib==3.9.4
+Pillow==10.4.0
+reportlab==4.4.10
+av==17.0.0
