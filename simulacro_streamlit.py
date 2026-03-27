@@ -1,1094 +1,659 @@
-
-"""
-Iris tracker for Streamlit Cloud
-- webcam via streamlit-webrtc
-- MediaPipe Face Mesh with robust imports across versions
-- no tkinter / no cv2.imshow
-- safe for headless deployment with opencv-python-headless
-"""
-
-from __future__ import annotations
-
-import io
 import math
-import os
-import time
-import queue
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, List, Optional, Tuple
-from collections import deque
+from typing import List, Optional, Tuple
 
 import av
 import cv2
+import mediapipe as mp
 import numpy as np
-import pandas as pd
 import streamlit as st
-from PIL import Image
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.utils import ImageReader
-from reportlab.pdfgen import canvas
-from streamlit_webrtc import WebRtcMode, VideoProcessorBase, webrtc_streamer
+from streamlit_webrtc import WebRtcMode, webrtc_streamer
 
-# =============================================================================
-# Streamlit page config
-# =============================================================================
 
+# ============================================================
+# CONFIG
+# ============================================================
 st.set_page_config(
-    page_title="Rastreamento de Íris - Streamlit",
-    page_icon="👁️",
+    page_title="Rastreamento de Pupila/Íris 3D",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# =============================================================================
-# Robust MediaPipe import helpers
-# =============================================================================
-
-def load_mediapipe_face_mesh():
+st.markdown(
     """
-    Load a Face Mesh module in a way that works across multiple MediaPipe layouts.
+    <style>
+    .small-note {font-size: 0.92rem; opacity: 0.9;}
+    .metric-box {
+        background: rgba(255,255,255,0.05);
+        border: 1px solid rgba(255,255,255,0.12);
+        border-radius: 16px;
+        padding: 12px 14px;
+        margin-bottom: 8px;
+    }
+    .target-wrap {
+        width: 100%;
+        aspect-ratio: 16/9;
+        border-radius: 20px;
+        border: 1px solid rgba(255,255,255,0.15);
+        background:
+            linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.02)),
+            radial-gradient(circle at 50% 50%, rgba(255,255,255,0.06), rgba(0,0,0,0.12));
+        position: relative;
+        overflow: hidden;
+    }
+    .target-dot {
+        position: absolute;
+        width: 18px;
+        height: 18px;
+        border-radius: 50%;
+        background: #ff3b30;
+        box-shadow: 0 0 0 8px rgba(255,59,48,0.12), 0 0 22px rgba(255,59,48,0.55);
+        transform: translate(-50%, -50%);
+    }
+    .gaze-dot {
+        position: absolute;
+        width: 16px;
+        height: 16px;
+        border-radius: 50%;
+        background: #00e0ff;
+        box-shadow: 0 0 0 8px rgba(0,224,255,0.12), 0 0 20px rgba(0,224,255,0.55);
+        transform: translate(-50%, -50%);
+    }
+    .guide-grid {
+        position: absolute;
+        inset: 0;
+        background-image:
+            linear-gradient(rgba(255,255,255,0.06) 1px, transparent 1px),
+            linear-gradient(90deg, rgba(255,255,255,0.06) 1px, transparent 1px);
+        background-size: 12.5% 12.5%;
+        pointer-events: none;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-    Older code commonly uses:
-        import mediapipe as mp
-        mp_face_mesh = mp.solutions.face_mesh
 
-    But reports from late 2025 onward indicate that top-level `mp.solutions`
-    may no longer be exposed in some releases. We therefore try both the
-    traditional top-level path and the direct python submodule path before
-    failing with a clear message.
-    """
-    import mediapipe as mp
+# ============================================================
+# LANDMARK SETS
+# ============================================================
+RIGHT_IRIS = [469, 470, 471, 472]
+LEFT_IRIS = [474, 475, 476, 477]
+RIGHT_EYE_RING = [33, 133, 159, 145, 153, 154, 155, 173]
+LEFT_EYE_RING = [362, 263, 386, 374, 380, 381, 382, 398]
+RIGHT_EYE_CORNERS = (33, 133)
+LEFT_EYE_CORNERS = (362, 263)
+RIGHT_EYE_UP_DOWN = (159, 145)
+LEFT_EYE_UP_DOWN = (386, 374)
 
-    # path 1: classic
-    if hasattr(mp, "solutions") and hasattr(mp.solutions, "face_mesh"):
-        return mp, mp.solutions.face_mesh
+HEAD_POSE_INDICES = [1, 152, 33, 263, 61, 291]
+MODEL_POINTS_3D = np.array(
+    [
+        [0.0, 0.0, 0.0],          # nose tip
+        [0.0, -63.6, -12.5],      # chin
+        [-43.3, 32.7, -26.0],     # left eye outer corner
+        [43.3, 32.7, -26.0],      # right eye outer corner
+        [-28.9, -28.9, -24.1],    # left mouth corner
+        [28.9, -28.9, -24.1],     # right mouth corner
+    ],
+    dtype=np.float64,
+)
 
-    # path 2: direct import from python.solutions
-    try:
-        from mediapipe.python.solutions import face_mesh as mp_face_mesh  # type: ignore
-        return mp, mp_face_mesh
-    except Exception as exc:
-        raise RuntimeError(
-            "Não foi possível carregar o Face Mesh do MediaPipe. "
-            "Use mediapipe==0.10.21 ou outra versão compatível com Face Mesh."
-        ) from exc
+# Approximate eyeball centers in the canonical head model (millimeters).
+LEFT_EYEBALL_CENTER_CANON = np.array([-29.0, 33.0, -34.0], dtype=np.float64)
+RIGHT_EYEBALL_CENTER_CANON = np.array([29.0, 33.0, -34.0], dtype=np.float64)
+
+CALIBRATION_POINTS = [
+    (0.1, 0.1), (0.5, 0.1), (0.9, 0.1),
+    (0.1, 0.5), (0.5, 0.5), (0.9, 0.5),
+    (0.1, 0.9), (0.5, 0.9), (0.9, 0.9),
+]
 
 
-MP, MP_FACE_MESH = load_mediapipe_face_mesh()
-
-# drawing utils are optional for this app
-try:
-    MP_DRAWING = MP.solutions.drawing_utils if hasattr(MP, "solutions") else None
-except Exception:
-    MP_DRAWING = None
+# ============================================================
+# MATH HELPERS
+# ============================================================
+def clamp(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
+    return max(lo, min(hi, float(v)))
 
 
-# =============================================================================
-# Constants and landmark groups
-# =============================================================================
+def normalize(v: np.ndarray) -> np.ndarray:
+    n = np.linalg.norm(v)
+    if n < 1e-9:
+        return v.copy()
+    return v / n
 
-LEFT_IRIS_IDX = [474, 475, 476, 477]
-RIGHT_IRIS_IDX = [469, 470, 471, 472]
 
-LEFT_EYE_OUTER = 33
-LEFT_EYE_INNER = 133
-LEFT_EYE_TOP = 159
-LEFT_EYE_BOTTOM = 145
+def mean_points(points: np.ndarray, idxs: List[int]) -> np.ndarray:
+    return np.mean(points[idxs], axis=0)
 
-RIGHT_EYE_OUTER = 362
-RIGHT_EYE_INNER = 263
-RIGHT_EYE_TOP = 386
-RIGHT_EYE_BOTTOM = 374
 
-LEFT_EYE_RING = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
-RIGHT_EYE_RING = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
+def project_points(points_3d: np.ndarray, rvec: np.ndarray, tvec: np.ndarray, camera_matrix: np.ndarray) -> np.ndarray:
+    pts2d, _ = cv2.projectPoints(points_3d, rvec, tvec, camera_matrix, np.zeros((4, 1), dtype=np.float64))
+    return pts2d.reshape(-1, 2)
 
-DEFAULT_RTC_CONFIGURATION = {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 
-# =============================================================================
-# Data classes
-# =============================================================================
+def rotation_matrix_from_rvec(rvec: np.ndarray) -> np.ndarray:
+    R, _ = cv2.Rodrigues(rvec)
+    return R
 
+
+def yaw_pitch_from_rotation(R: np.ndarray) -> Tuple[float, float]:
+    forward = R @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    yaw = math.atan2(forward[0], max(1e-6, forward[2]))
+    pitch = -math.atan2(forward[1], max(1e-6, math.sqrt(forward[0] ** 2 + forward[2] ** 2)))
+    return yaw, pitch
+
+
+def intersect_ray_with_plane(ray_origin: np.ndarray, ray_dir: np.ndarray, plane_z: float) -> Optional[np.ndarray]:
+    dz = float(ray_dir[2])
+    if abs(dz) < 1e-6:
+        return None
+    t = (plane_z - float(ray_origin[2])) / dz
+    if t <= 0:
+        return None
+    return ray_origin + t * ray_dir
+
+
+def eye_geometry(points_2d: np.ndarray, iris_idxs: List[int], ring_idxs: List[int], corner_idxs: Tuple[int, int], up_down_idxs: Tuple[int, int]):
+    iris_center = mean_points(points_2d, iris_idxs)
+    ring_center = mean_points(points_2d, ring_idxs)
+    eye_width = float(np.linalg.norm(points_2d[corner_idxs[0]] - points_2d[corner_idxs[1]]))
+    eye_height = float(np.linalg.norm(points_2d[up_down_idxs[0]] - points_2d[up_down_idxs[1]]))
+    return iris_center, ring_center, eye_width, eye_height
+
+
+def make_camera_matrix(width: int, height: int, focal_scale: float = 1.15) -> np.ndarray:
+    focal = width * focal_scale
+    return np.array(
+        [
+            [focal, 0.0, width / 2.0],
+            [0.0, focal, height / 2.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+
+def fit_linear_calibration(samples: List[Tuple[np.ndarray, np.ndarray]]) -> Optional[np.ndarray]:
+    if len(samples) < 5:
+        return None
+    X = np.array([s[0] for s in samples], dtype=np.float64)
+    Y = np.array([s[1] for s in samples], dtype=np.float64)
+    # Least-squares affine-like mapping with pose terms.
+    coef, _, _, _ = np.linalg.lstsq(X, Y, rcond=None)
+    return coef
+
+
+def apply_linear_calibration(feature_vec: np.ndarray, coef: Optional[np.ndarray]) -> np.ndarray:
+    if coef is None:
+        return feature_vec[:2].copy()
+    out = feature_vec @ coef
+    return np.array([clamp(out[0]), clamp(out[1])], dtype=np.float64)
+
+
+def raw_feature_vector(raw_xy: np.ndarray, head_yaw: float, head_pitch: float) -> np.ndarray:
+    return np.array([raw_xy[0], raw_xy[1], head_yaw, head_pitch, 1.0], dtype=np.float64)
+
+
+def draw_pose_cube(frame: np.ndarray, rvec: np.ndarray, tvec: np.ndarray, camera_matrix: np.ndarray):
+    cube = np.array(
+        [
+            [-40, -40, 60],
+            [40, -40, 60],
+            [40, 40, 60],
+            [-40, 40, 60],
+            [-40, -40, 140],
+            [40, -40, 140],
+            [40, 40, 140],
+            [-40, 40, 140],
+        ],
+        dtype=np.float64,
+    )
+    pts = project_points(cube, rvec, tvec, camera_matrix).astype(int)
+    edges = [
+        (0, 1), (1, 2), (2, 3), (3, 0),
+        (4, 5), (5, 6), (6, 7), (7, 4),
+        (0, 4), (1, 5), (2, 6), (3, 7),
+    ]
+    for a, b in edges:
+        cv2.line(frame, tuple(pts[a]), tuple(pts[b]), (60, 255, 220), 2, cv2.LINE_AA)
+
+
+def draw_crosshair(frame: np.ndarray, pt: Tuple[int, int], color=(0, 224, 255), size: int = 10):
+    x, y = int(pt[0]), int(pt[1])
+    cv2.line(frame, (x - size, y), (x + size, y), color, 2, cv2.LINE_AA)
+    cv2.line(frame, (x, y - size), (x, y + size), color, 2, cv2.LINE_AA)
+
+
+# ============================================================
+# SHARED STATE
+# ============================================================
 @dataclass
-class IrisDetection:
-    timestamp: float = 0.0
-    frame_w: int = 0
-    frame_h: int = 0
-    left_center: Optional[Tuple[int, int]] = None
-    right_center: Optional[Tuple[int, int]] = None
-    gaze_point: Optional[Tuple[int, int]] = None
-    left_ratio_x: Optional[float] = None
-    right_ratio_x: Optional[float] = None
-    left_ratio_y: Optional[float] = None
-    right_ratio_y: Optional[float] = None
-    blink_ratio: Optional[float] = None
-    blink_state: str = "open"
-    fps: Optional[float] = None
-    success: bool = False
-    status: str = "idle"
-
-
-@dataclass
-class CalibPoint:
-    name: str
-    x: float
-    y: float
-
-
-@dataclass
-class TrackerConfig:
-    max_faces: int = 1
-    refine_landmarks: bool = True
-    min_detection_confidence: float = 0.5
-    min_tracking_confidence: float = 0.5
-    blink_threshold: float = 0.21
-    blink_cooldown_sec: float = 0.22
-    smoothing_alpha: float = 0.35
-    heatmap_decay: float = 0.995
-    show_mesh: bool = False
-    show_eye_ring: bool = True
-    show_iris: bool = True
-    show_info: bool = True
-    debug_text: bool = True
-    draw_crosshair: bool = True
-    gaze_gain_x: float = 1.6
-    gaze_gain_y: float = 1.4
-
-
-@dataclass
-class SharedRuntime:
-    metrics_queue: "queue.Queue[Dict[str, Any]]" = field(default_factory=queue.Queue)
-    csv_rows: List[Dict[str, Any]] = field(default_factory=list)
-    heatmap: Optional[np.ndarray] = None
-    latest_frame_bgr: Optional[np.ndarray] = None
+class SharedGazeState:
     lock: threading.Lock = field(default_factory=threading.Lock)
-    calibrated: bool = False
-    calibration_map: Dict[str, Tuple[float, float]] = field(default_factory=dict)
-    last_click_label: Optional[str] = None
-    start_time: float = field(default_factory=time.time)
-
-
-# =============================================================================
-# Session state helpers
-# =============================================================================
-
-def init_state():
-    if "tracker_config" not in st.session_state:
-        st.session_state.tracker_config = TrackerConfig()
-    if "runtime" not in st.session_state:
-        st.session_state.runtime = SharedRuntime()
-    if "processor_alive" not in st.session_state:
-        st.session_state.processor_alive = False
-    if "latest_metrics" not in st.session_state:
-        st.session_state.latest_metrics = {}
-    if "calibration_targets" not in st.session_state:
-        st.session_state.calibration_targets = [
-            CalibPoint("top_left", 0.12, 0.15),
-            CalibPoint("top_right", 0.88, 0.15),
-            CalibPoint("center", 0.50, 0.50),
-            CalibPoint("bottom_left", 0.12, 0.85),
-            CalibPoint("bottom_right", 0.88, 0.85),
-        ]
-    if "selected_calibration_target" not in st.session_state:
-        st.session_state.selected_calibration_target = "center"
-
-
-init_state()
-
-# =============================================================================
-# Geometry helpers
-# =============================================================================
-
-def clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
-
-
-def as_int_point(x: float, y: float) -> Tuple[int, int]:
-    return int(round(x)), int(round(y))
-
-
-def euclidean(p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
-    return float(math.hypot(p1[0] - p2[0], p1[1] - p2[1]))
-
-
-def safe_mean(points: List[Tuple[float, float]]) -> Optional[Tuple[float, float]]:
-    if not points:
-        return None
-    arr = np.array(points, dtype=np.float32)
-    return float(arr[:, 0].mean()), float(arr[:, 1].mean())
-
-
-def lerp(a: float, b: float, alpha: float) -> float:
-    return (1.0 - alpha) * a + alpha * b
-
-
-def smooth_point(prev: Optional[Tuple[float, float]], cur: Optional[Tuple[float, float]], alpha: float) -> Optional[Tuple[float, float]]:
-    if cur is None:
-        return prev
-    if prev is None:
-        return cur
-    return (
-        lerp(prev[0], cur[0], alpha),
-        lerp(prev[1], cur[1], alpha),
-    )
-
-
-# =============================================================================
-# Landmark helpers
-# =============================================================================
-
-def landmark_xy(landmarks, index: int, w: int, h: int) -> Tuple[float, float]:
-    lm = landmarks[index]
-    return lm.x * w, lm.y * h
-
-
-def points_from_indices(landmarks, indices: List[int], w: int, h: int) -> List[Tuple[float, float]]:
-    return [landmark_xy(landmarks, idx, w, h) for idx in indices]
-
-
-def iris_center_from_landmarks(landmarks, iris_indices: List[int], w: int, h: int) -> Optional[Tuple[float, float]]:
-    pts = points_from_indices(landmarks, iris_indices, w, h)
-    return safe_mean(pts)
-
-
-def blink_ratio_from_landmarks(landmarks, w: int, h: int) -> float:
-    l_top = landmark_xy(landmarks, LEFT_EYE_TOP, w, h)
-    l_bottom = landmark_xy(landmarks, LEFT_EYE_BOTTOM, w, h)
-    l_outer = landmark_xy(landmarks, LEFT_EYE_OUTER, w, h)
-    l_inner = landmark_xy(landmarks, LEFT_EYE_INNER, w, h)
-
-    r_top = landmark_xy(landmarks, RIGHT_EYE_TOP, w, h)
-    r_bottom = landmark_xy(landmarks, RIGHT_EYE_BOTTOM, w, h)
-    r_outer = landmark_xy(landmarks, RIGHT_EYE_OUTER, w, h)
-    r_inner = landmark_xy(landmarks, RIGHT_EYE_INNER, w, h)
-
-    l_h = euclidean(l_outer, l_inner) + 1e-6
-    r_h = euclidean(r_outer, r_inner) + 1e-6
-    l_v = euclidean(l_top, l_bottom)
-    r_v = euclidean(r_top, r_bottom)
-
-    l_ratio = l_v / l_h
-    r_ratio = r_v / r_h
-    return float((l_ratio + r_ratio) / 2.0)
-
-
-def eye_box_and_ratios(
-    landmarks,
-    iris_center: Optional[Tuple[float, float]],
-    outer_idx: int,
-    inner_idx: int,
-    top_idx: int,
-    bottom_idx: int,
-    w: int,
-    h: int,
-) -> Tuple[Optional[Tuple[int, int, int, int]], Optional[float], Optional[float]]:
-    if iris_center is None:
-        return None, None, None
-
-    p_outer = landmark_xy(landmarks, outer_idx, w, h)
-    p_inner = landmark_xy(landmarks, inner_idx, w, h)
-    p_top = landmark_xy(landmarks, top_idx, w, h)
-    p_bottom = landmark_xy(landmarks, bottom_idx, w, h)
-
-    xs = [p_outer[0], p_inner[0], iris_center[0]]
-    ys = [p_top[1], p_bottom[1], iris_center[1]]
-
-    x_min, x_max = min(p_outer[0], p_inner[0]), max(p_outer[0], p_inner[0])
-    y_min, y_max = min(p_top[1], p_bottom[1]), max(p_top[1], p_bottom[1])
-
-    width = max(1.0, x_max - x_min)
-    height = max(1.0, y_max - y_min)
-
-    ratio_x = clamp((iris_center[0] - x_min) / width, 0.0, 1.0)
-    ratio_y = clamp((iris_center[1] - y_min) / height, 0.0, 1.0)
-
-    box = (
-        int(round(min(xs) - 8)),
-        int(round(min(ys) - 8)),
-        int(round(max(xs) + 8)),
-        int(round(max(ys) + 8)),
-    )
-    return box, ratio_x, ratio_y
-
-
-# =============================================================================
-# Gaze mapping
-# =============================================================================
-
-def normalized_gaze_from_eye_ratios(
-    left_rx: Optional[float],
-    right_rx: Optional[float],
-    left_ry: Optional[float],
-    right_ry: Optional[float],
-) -> Optional[Tuple[float, float]]:
-    valid_x = [v for v in [left_rx, right_rx] if v is not None]
-    valid_y = [v for v in [left_ry, right_ry] if v is not None]
-    if not valid_x or not valid_y:
-        return None
-
-    avg_x = float(np.mean(valid_x))
-    avg_y = float(np.mean(valid_y))
-
-    # center around 0
-    norm_x = (avg_x - 0.5) * 2.0
-    norm_y = (avg_y - 0.5) * 2.0
-    return clamp(norm_x, -1.0, 1.0), clamp(norm_y, -1.0, 1.0)
-
-
-def apply_gain(norm_xy: Optional[Tuple[float, float]], gain_x: float, gain_y: float) -> Optional[Tuple[float, float]]:
-    if norm_xy is None:
-        return None
-    x, y = norm_xy
-    return clamp(x * gain_x, -1.2, 1.2), clamp(y * gain_y, -1.2, 1.2)
-
-
-def apply_calibration(
-    norm_xy: Optional[Tuple[float, float]],
-    calibration_map: Dict[str, Tuple[float, float]],
-) -> Optional[Tuple[float, float]]:
-    """
-    Simple affine-like correction using center and axis anchors when present.
-    """
-    if norm_xy is None:
-        return None
-    x, y = norm_xy
-
-    if "center" not in calibration_map:
-        return x, y
-
-    cx, cy = calibration_map["center"]
-    x -= cx
-    y -= cy
-
-    # Horizontal scaling
-    if "top_left" in calibration_map and "top_right" in calibration_map:
-        lx = calibration_map["top_left"][0] - cx
-        rx = calibration_map["top_right"][0] - cx
-        left_scale = abs(lx) if abs(lx) > 1e-6 else 1.0
-        right_scale = abs(rx) if abs(rx) > 1e-6 else 1.0
-        x = x / (right_scale if x >= 0 else left_scale)
-
-    # Vertical scaling
-    if "top_left" in calibration_map and "bottom_left" in calibration_map:
-        ty = calibration_map["top_left"][1] - cy
-        by = calibration_map["bottom_left"][1] - cy
-        top_scale = abs(ty) if abs(ty) > 1e-6 else 1.0
-        bottom_scale = abs(by) if abs(by) > 1e-6 else 1.0
-        y = y / (bottom_scale if y >= 0 else top_scale)
-
-    return clamp(x, -1.0, 1.0), clamp(y, -1.0, 1.0)
-
-
-def gaze_point_from_normalized(norm_xy: Optional[Tuple[float, float]], w: int, h: int) -> Optional[Tuple[int, int]]:
-    if norm_xy is None:
-        return None
-    x, y = norm_xy
-    px = int(round((x + 1.0) * 0.5 * (w - 1)))
-    py = int(round((y + 1.0) * 0.5 * (h - 1)))
-    return max(0, min(w - 1, px)), max(0, min(h - 1, py))
-
-
-# =============================================================================
-# Heatmap helpers
-# =============================================================================
-
-def init_heatmap_if_needed(runtime: SharedRuntime, h: int, w: int):
-    with runtime.lock:
-        if runtime.heatmap is None or runtime.heatmap.shape[:2] != (h, w):
-            runtime.heatmap = np.zeros((h, w), dtype=np.float32)
-
-
-def update_heatmap(runtime: SharedRuntime, gaze_point: Optional[Tuple[int, int]], sigma: int = 25):
-    if gaze_point is None:
-        return
-    with runtime.lock:
-        if runtime.heatmap is None:
-            return
-        runtime.heatmap *= st.session_state.tracker_config.heatmap_decay
-        x, y = gaze_point
-        h, w = runtime.heatmap.shape
-        x0 = max(0, x - sigma * 3)
-        y0 = max(0, y - sigma * 3)
-        x1 = min(w, x + sigma * 3 + 1)
-        y1 = min(h, y + sigma * 3 + 1)
-
-        xs = np.arange(x0, x1, dtype=np.float32)
-        ys = np.arange(y0, y1, dtype=np.float32)
-        xx, yy = np.meshgrid(xs, ys)
-        blob = np.exp(-(((xx - x) ** 2) + ((yy - y) ** 2)) / (2.0 * sigma * sigma))
-        runtime.heatmap[y0:y1, x0:x1] += blob.astype(np.float32)
-
-
-def heatmap_to_color(heatmap: np.ndarray) -> np.ndarray:
-    if heatmap.size == 0:
-        return np.zeros((1, 1, 3), dtype=np.uint8)
-    normalized = heatmap.copy()
-    max_val = float(normalized.max())
-    if max_val > 0:
-        normalized = normalized / max_val
-    normalized_u8 = np.uint8(np.clip(normalized * 255.0, 0, 255))
-    return cv2.applyColorMap(normalized_u8, cv2.COLORMAP_JET)
-
-
-def overlay_heatmap_on_frame(frame_bgr: np.ndarray, heatmap: np.ndarray, alpha: float = 0.35) -> np.ndarray:
-    heat_color = heatmap_to_color(heatmap)
-    if heat_color.shape[:2] != frame_bgr.shape[:2]:
-        heat_color = cv2.resize(heat_color, (frame_bgr.shape[1], frame_bgr.shape[0]))
-    return cv2.addWeighted(frame_bgr, 1.0 - alpha, heat_color, alpha, 0.0)
-
-
-# =============================================================================
-# Export helpers
-# =============================================================================
-
-def dataframe_from_rows(rows: List[Dict[str, Any]]) -> pd.DataFrame:
-    if not rows:
-        return pd.DataFrame(columns=[
-            "timestamp", "elapsed_sec", "gaze_x", "gaze_y",
-            "left_ratio_x", "right_ratio_x", "left_ratio_y", "right_ratio_y",
-            "blink_ratio", "blink_state", "fps", "status"
-        ])
-    return pd.DataFrame(rows)
-
-
-def image_to_png_bytes(image_bgr: np.ndarray) -> bytes:
-    ok, buf = cv2.imencode(".png", image_bgr)
-    if not ok:
-        raise RuntimeError("Falha ao converter imagem para PNG.")
-    return bytes(buf.tobytes())
-
-
-def build_pdf_report(runtime: SharedRuntime) -> bytes:
-    buffer = io.BytesIO()
-    pdf = canvas.Canvas(buffer, pagesize=A4)
-    W, H = A4
-    margin = 36
-
-    rows = dataframe_from_rows(runtime.csv_rows)
-    duration = time.time() - runtime.start_time
-    total_frames = len(rows)
-    blink_count = int((rows["blink_state"] == "blink").sum()) if not rows.empty and "blink_state" in rows.columns else 0
-
-    pdf.setTitle("Relatório de Rastreamento de Íris")
-    pdf.setFont("Helvetica-Bold", 16)
-    pdf.drawString(margin, H - margin, "Relatório de Rastreamento de Íris")
-
-    pdf.setFont("Helvetica", 11)
-    pdf.drawString(margin, H - margin - 24, f"Duração da sessão: {duration:.2f} s")
-    pdf.drawString(margin, H - margin - 40, f"Frames/leituras salvas: {total_frames}")
-    pdf.drawString(margin, H - margin - 56, f"Piscadas detectadas: {blink_count}")
-
-    y_cursor = H - margin - 90
-
-    with runtime.lock:
-        latest_frame = runtime.latest_frame_bgr.copy() if runtime.latest_frame_bgr is not None else None
-        heatmap = runtime.heatmap.copy() if runtime.heatmap is not None else None
-
-    if latest_frame is not None:
-        frame_rgb = cv2.cvtColor(latest_frame, cv2.COLOR_BGR2RGB)
-        pil_frame = Image.fromarray(frame_rgb)
-        frame_reader = ImageReader(pil_frame)
-        img_w = 240
-        img_h = int(img_w * pil_frame.height / pil_frame.width)
-        pdf.drawString(margin, y_cursor, "Último frame:")
-        pdf.drawImage(frame_reader, margin, y_cursor - img_h - 8, width=img_w, height=img_h, preserveAspectRatio=True, mask='auto')
-
-    if heatmap is not None and latest_frame is not None:
-        over = overlay_heatmap_on_frame(latest_frame, heatmap, alpha=0.4)
-        over_rgb = cv2.cvtColor(over, cv2.COLOR_BGR2RGB)
-        pil_over = Image.fromarray(over_rgb)
-        over_reader = ImageReader(pil_over)
-        img_w2 = 240
-        img_h2 = int(img_w2 * pil_over.height / pil_over.width)
-        x2 = margin + 260
-        pdf.drawString(x2, y_cursor, "Mapa de calor:")
-        pdf.drawImage(over_reader, x2, y_cursor - img_h2 - 8, width=img_w2, height=img_h2, preserveAspectRatio=True, mask='auto')
-        y_cursor = y_cursor - max(img_h2, img_h) - 28 if latest_frame is not None else y_cursor - img_h2 - 28
-    elif latest_frame is not None:
-        y_cursor = y_cursor - img_h - 28
-
-    pdf.setFont("Helvetica-Bold", 12)
-    pdf.drawString(margin, y_cursor, "Resumo")
-    pdf.setFont("Helvetica", 10)
-
-    summary_lines = [
-        "Este relatório foi gerado pelo app Streamlit de rastreamento de íris.",
-        "O ponto de gaze é uma estimativa derivada da posição relativa das íris nos olhos.",
-        "A precisão depende de iluminação, resolução da webcam, estabilidade do rosto e calibração.",
-        "Este resultado não substitui eye trackers dedicados por infravermelho.",
-    ]
-    yy = y_cursor - 18
-    for line in summary_lines:
-        pdf.drawString(margin, yy, line)
-        yy -= 14
-
-    if not rows.empty:
-        yy -= 8
-        pdf.setFont("Helvetica-Bold", 12)
-        pdf.drawString(margin, yy, "Métricas")
-        pdf.setFont("Helvetica", 10)
-        yy -= 18
-
-        metrics = [
-            ("FPS médio", f"{rows['fps'].dropna().mean():.2f}" if "fps" in rows and rows["fps"].dropna().size else "N/A"),
-            ("Razão de blink média", f"{rows['blink_ratio'].dropna().mean():.4f}" if "blink_ratio" in rows and rows["blink_ratio"].dropna().size else "N/A"),
-            ("Gaze X médio", f"{rows['gaze_x'].dropna().mean():.1f}" if "gaze_x" in rows and rows["gaze_x"].dropna().size else "N/A"),
-            ("Gaze Y médio", f"{rows['gaze_y'].dropna().mean():.1f}" if "gaze_y" in rows and rows["gaze_y"].dropna().size else "N/A"),
-        ]
-        for k, v in metrics:
-            pdf.drawString(margin, yy, f"{k}: {v}")
-            yy -= 14
-
-    pdf.showPage()
-    pdf.save()
-    buffer.seek(0)
-    return buffer.read()
-
-
-# =============================================================================
-# Drawing helpers
-# =============================================================================
-
-def draw_point(frame: np.ndarray, pt: Optional[Tuple[float, float]], color: Tuple[int, int, int], radius: int = 3):
-    if pt is None:
-        return
-    cv2.circle(frame, as_int_point(pt[0], pt[1]), radius, color, -1, lineType=cv2.LINE_AA)
-
-
-def draw_crosshair(frame: np.ndarray, pt: Optional[Tuple[int, int]], color: Tuple[int, int, int] = (0, 255, 255), size: int = 12, thickness: int = 1):
-    if pt is None:
-        return
-    x, y = pt
-    cv2.line(frame, (x - size, y), (x + size, y), color, thickness, lineType=cv2.LINE_AA)
-    cv2.line(frame, (x, y - size), (x, y + size), color, thickness, lineType=cv2.LINE_AA)
-    cv2.circle(frame, (x, y), max(2, size // 3), color, thickness, lineType=cv2.LINE_AA)
-
-
-def draw_eye_ring(frame: np.ndarray, landmarks, indices: List[int], w: int, h: int, color: Tuple[int, int, int]):
-    pts = points_from_indices(landmarks, indices, w, h)
-    for p in pts:
-        cv2.circle(frame, as_int_point(p[0], p[1]), 1, color, -1, lineType=cv2.LINE_AA)
-
-
-def draw_box(frame: np.ndarray, box: Optional[Tuple[int, int, int, int]], color: Tuple[int, int, int]):
-    if box is None:
-        return
-    x0, y0, x1, y1 = box
-    cv2.rectangle(frame, (x0, y0), (x1, y1), color, 1, lineType=cv2.LINE_AA)
-
-
-def draw_info_panel(frame: np.ndarray, det: IrisDetection):
-    lines = [
-        f"status: {det.status}",
-        f"blink: {det.blink_state}",
-        f"blink_ratio: {det.blink_ratio:.3f}" if det.blink_ratio is not None else "blink_ratio: N/A",
-        f"left_rx: {det.left_ratio_x:.3f}" if det.left_ratio_x is not None else "left_rx: N/A",
-        f"right_rx: {det.right_ratio_x:.3f}" if det.right_ratio_x is not None else "right_rx: N/A",
-        f"left_ry: {det.left_ratio_y:.3f}" if det.left_ratio_y is not None else "left_ry: N/A",
-        f"right_ry: {det.right_ratio_y:.3f}" if det.right_ratio_y is not None else "right_ry: N/A",
-        f"fps: {det.fps:.1f}" if det.fps is not None else "fps: N/A",
-    ]
-    pad = 8
-    line_h = 16
-    x0, y0 = 10, 10
-    w = 250
-    h = pad * 2 + line_h * len(lines)
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (x0, y0), (x0 + w, y0 + h), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.45, frame, 0.55, 0, frame)
-    y = y0 + 18
-    for line in lines:
-        cv2.putText(frame, line, (x0 + pad, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
-        y += line_h
-
-
-# =============================================================================
-# Processor
-# =============================================================================
-
-class StreamlitIrisProcessor(VideoProcessorBase):
+    screen_width_cm: float = 53.0
+    screen_height_cm: float = 30.0
+    screen_distance_cm: float = 60.0
+    screen_res_w: int = 1920
+    screen_res_h: int = 1080
+
+    face_found: bool = False
+    raw_hit_xy: np.ndarray = field(default_factory=lambda: np.array([0.5, 0.5], dtype=np.float64))
+    centered_raw_xy: np.ndarray = field(default_factory=lambda: np.array([0.5, 0.5], dtype=np.float64))
+    calibrated_xy: np.ndarray = field(default_factory=lambda: np.array([0.5, 0.5], dtype=np.float64))
+    latest_feature_vec: np.ndarray = field(default_factory=lambda: np.array([0.5, 0.5, 0.0, 0.0, 1.0], dtype=np.float64))
+    head_yaw: float = 0.0
+    head_pitch: float = 0.0
+    last_status: str = "Aguardando vídeo"
+
+    left_eye_center_3d: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float64))
+    right_eye_center_3d: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float64))
+    left_iris_center_2d: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=np.float64))
+    right_iris_center_2d: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=np.float64))
+    rotation_matrix: np.ndarray = field(default_factory=lambda: np.eye(3, dtype=np.float64))
+
+    center_bias: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=np.float64))
+    calibration_samples: List[Tuple[np.ndarray, np.ndarray]] = field(default_factory=list)
+    calibration_coef: Optional[np.ndarray] = None
+
+    def set_screen(self, width_cm: float, height_cm: float, distance_cm: float, res_w: int, res_h: int):
+        with self.lock:
+            self.screen_width_cm = float(width_cm)
+            self.screen_height_cm = float(height_cm)
+            self.screen_distance_cm = float(distance_cm)
+            self.screen_res_w = int(res_w)
+            self.screen_res_h = int(res_h)
+
+    def get_screen_mm(self) -> Tuple[float, float, float]:
+        return self.screen_width_cm * 10.0, self.screen_height_cm * 10.0, self.screen_distance_cm * 10.0
+
+    def capture_center(self):
+        with self.lock:
+            self.center_bias = self.raw_hit_xy - np.array([0.5, 0.5], dtype=np.float64)
+            self.last_status = "Centro bruto capturado"
+
+    def clear_center(self):
+        with self.lock:
+            self.center_bias = np.zeros(2, dtype=np.float64)
+            self.last_status = "Centro bruto resetado"
+
+    def capture_calibration(self, target_xy: Tuple[float, float]):
+        with self.lock:
+            target = np.array(target_xy, dtype=np.float64)
+            self.calibration_samples.append((self.latest_feature_vec.copy(), target))
+            self.last_status = f"Ponto de calibração capturado: {len(self.calibration_samples)}"
+            coef = fit_linear_calibration(self.calibration_samples)
+            if coef is not None:
+                self.calibration_coef = coef
+                self.last_status = f"Calibração ajustada com {len(self.calibration_samples)} ponto(s)"
+
+    def reset_calibration(self):
+        with self.lock:
+            self.calibration_samples = []
+            self.calibration_coef = None
+            self.last_status = "Calibração resetada"
+
+    def snapshot(self):
+        with self.lock:
+            return {
+                "screen_width_cm": self.screen_width_cm,
+                "screen_height_cm": self.screen_height_cm,
+                "screen_distance_cm": self.screen_distance_cm,
+                "screen_res_w": self.screen_res_w,
+                "screen_res_h": self.screen_res_h,
+                "face_found": self.face_found,
+                "raw_hit_xy": self.raw_hit_xy.copy(),
+                "centered_raw_xy": self.centered_raw_xy.copy(),
+                "calibrated_xy": self.calibrated_xy.copy(),
+                "head_yaw": self.head_yaw,
+                "head_pitch": self.head_pitch,
+                "center_bias": self.center_bias.copy(),
+                "calibration_n": len(self.calibration_samples),
+                "last_status": self.last_status,
+                "rotation_matrix": self.rotation_matrix.copy(),
+            }
+
+
+STATE = SharedGazeState()
+
+
+# ============================================================
+# VIDEO PROCESSOR
+# ============================================================
+class GazeVideoProcessor:
     def __init__(self):
-        self.cfg = st.session_state.tracker_config
-        self.runtime = st.session_state.runtime
-        self.face_mesh = MP_FACE_MESH.FaceMesh(
+        self.face_mesh = mp.solutions.face_mesh.FaceMesh(
             static_image_mode=False,
-            max_num_faces=self.cfg.max_faces,
-            refine_landmarks=self.cfg.refine_landmarks,
-            min_detection_confidence=self.cfg.min_detection_confidence,
-            min_tracking_confidence=self.cfg.min_tracking_confidence,
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
         )
-        self.prev_gaze_norm: Optional[Tuple[float, float]] = None
-        self.prev_gaze_px: Optional[Tuple[float, float]] = None
-        self.prev_t = time.time()
-        self.prev_blink = False
-        self.last_blink_event_ts = 0.0
-        st.session_state.processor_alive = True
+
+    def _estimate_head_pose(self, pts2d: np.ndarray, width: int, height: int):
+        image_points = np.array([pts2d[i] for i in HEAD_POSE_INDICES], dtype=np.float64)
+        cam = make_camera_matrix(width, height)
+        ok, rvec, tvec = cv2.solvePnP(
+            MODEL_POINTS_3D,
+            image_points,
+            cam,
+            np.zeros((4, 1), dtype=np.float64),
+            flags=cv2.SOLVEPNP_ITERATIVE,
+        )
+        if not ok:
+            return None, None, cam
+        return rvec, tvec, cam
+
+    def _eye_ray(self, iris_center: np.ndarray, eye_center_2d: np.ndarray, eye_width: float, eye_height: float, eyeball_center_3d: np.ndarray, R_head: np.ndarray):
+        eye_width = max(eye_width, 1.0)
+        eye_height = max(eye_height, 1.0)
+        dx = (iris_center[0] - eye_center_2d[0]) / (eye_width / 2.0)
+        dy = (iris_center[1] - eye_center_2d[1]) / (eye_height / 2.0)
+        dx = float(np.clip(dx, -1.2, 1.2))
+        dy = float(np.clip(dy, -1.2, 1.2))
+
+        max_yaw = math.radians(35.0)
+        max_pitch = math.radians(25.0)
+        eye_yaw = dx * max_yaw
+        eye_pitch = -dy * max_pitch
+
+        local_dir = normalize(
+            np.array(
+                [
+                    math.tan(eye_yaw),
+                    math.tan(eye_pitch),
+                    1.0,
+                ],
+                dtype=np.float64,
+            )
+        )
+        cam_dir = normalize(R_head @ local_dir)
+        return cam_dir, eye_yaw, eye_pitch
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         img = frame.to_ndarray(format="bgr24")
-        out = img.copy()
-        h, w = out.shape[:2]
-        init_heatmap_if_needed(self.runtime, h, w)
+        h, w = img.shape[:2]
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        results = self.face_mesh.process(rgb)
 
-        now = time.time()
-        dt = max(1e-6, now - self.prev_t)
-        fps = 1.0 / dt
-        self.prev_t = now
+        if not results.multi_face_landmarks:
+            with STATE.lock:
+                STATE.face_found = False
+                STATE.last_status = "Rosto não detectado"
+            cv2.putText(img, "Rosto nao detectado", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2, cv2.LINE_AA)
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-        det = IrisDetection(
-            timestamp=now,
-            frame_w=w,
-            frame_h=h,
-            fps=fps,
-            status="no_face",
+        face_landmarks = results.multi_face_landmarks[0].landmark
+        pts2d = np.array([[lm.x * w, lm.y * h] for lm in face_landmarks], dtype=np.float64)
+
+        rvec, tvec, cam = self._estimate_head_pose(pts2d, w, h)
+        if rvec is None:
+            with STATE.lock:
+                STATE.face_found = False
+                STATE.last_status = "Falha na pose da cabeca"
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+        R_head = rotation_matrix_from_rvec(rvec)
+        head_yaw, head_pitch = yaw_pitch_from_rotation(R_head)
+
+        left_iris_center, left_eye_center_2d, left_eye_width, left_eye_height = eye_geometry(
+            pts2d, LEFT_IRIS, LEFT_EYE_RING, LEFT_EYE_CORNERS, LEFT_EYE_UP_DOWN
+        )
+        right_iris_center, right_eye_center_2d, right_eye_width, right_eye_height = eye_geometry(
+            pts2d, RIGHT_IRIS, RIGHT_EYE_RING, RIGHT_EYE_CORNERS, RIGHT_EYE_UP_DOWN
         )
 
-        try:
-            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            results = self.face_mesh.process(rgb)
+        left_eye_center_3d = (R_head @ LEFT_EYEBALL_CENTER_CANON.reshape(3, 1) + tvec).reshape(3)
+        right_eye_center_3d = (R_head @ RIGHT_EYEBALL_CENTER_CANON.reshape(3, 1) + tvec).reshape(3)
 
-            if not results.multi_face_landmarks:
-                if self.cfg.show_info:
-                    draw_info_panel(out, det)
-                self._push_metrics(det)
-                with self.runtime.lock:
-                    self.runtime.latest_frame_bgr = out.copy()
-                return av.VideoFrame.from_ndarray(out, format="bgr24")
-
-            face_landmarks = results.multi_face_landmarks[0].landmark
-
-            left_center = iris_center_from_landmarks(face_landmarks, LEFT_IRIS_IDX, w, h)
-            right_center = iris_center_from_landmarks(face_landmarks, RIGHT_IRIS_IDX, w, h)
-
-            left_box, left_rx, left_ry = eye_box_and_ratios(
-                face_landmarks, left_center,
-                LEFT_EYE_OUTER, LEFT_EYE_INNER, LEFT_EYE_TOP, LEFT_EYE_BOTTOM, w, h
-            )
-            right_box, right_rx, right_ry = eye_box_and_ratios(
-                face_landmarks, right_center,
-                RIGHT_EYE_OUTER, RIGHT_EYE_INNER, RIGHT_EYE_TOP, RIGHT_EYE_BOTTOM, w, h
-            )
-
-            blink_ratio = blink_ratio_from_landmarks(face_landmarks, w, h)
-            is_blink = blink_ratio < self.cfg.blink_threshold
-
-            if is_blink and (now - self.last_blink_event_ts) > self.cfg.blink_cooldown_sec and not self.prev_blink:
-                blink_state = "blink"
-                self.last_blink_event_ts = now
-            else:
-                blink_state = "closed" if is_blink else "open"
-            self.prev_blink = is_blink
-
-            gaze_norm = normalized_gaze_from_eye_ratios(left_rx, right_rx, left_ry, right_ry)
-            gaze_norm = apply_gain(gaze_norm, self.cfg.gaze_gain_x, self.cfg.gaze_gain_y)
-            gaze_norm = apply_calibration(gaze_norm, self.runtime.calibration_map)
-            gaze_norm = smooth_point(self.prev_gaze_norm, gaze_norm, self.cfg.smoothing_alpha)
-            self.prev_gaze_norm = gaze_norm
-
-            gaze_point = gaze_point_from_normalized(gaze_norm, w, h)
-            gaze_point_f = smooth_point(self.prev_gaze_px, gaze_point, self.cfg.smoothing_alpha)
-            self.prev_gaze_px = gaze_point_f
-            gaze_point_i = as_int_point(*gaze_point_f) if gaze_point_f is not None else None
-
-            det.left_center = as_int_point(*left_center) if left_center else None
-            det.right_center = as_int_point(*right_center) if right_center else None
-            det.gaze_point = gaze_point_i
-            det.left_ratio_x = left_rx
-            det.right_ratio_x = right_rx
-            det.left_ratio_y = left_ry
-            det.right_ratio_y = right_ry
-            det.blink_ratio = blink_ratio
-            det.blink_state = blink_state
-            det.success = True
-            det.status = "tracking"
-
-            update_heatmap(self.runtime, gaze_point_i)
-
-            if self.cfg.show_eye_ring:
-                draw_eye_ring(out, face_landmarks, LEFT_EYE_RING, w, h, (255, 140, 0))
-                draw_eye_ring(out, face_landmarks, RIGHT_EYE_RING, w, h, (255, 140, 0))
-
-            if self.cfg.show_iris:
-                draw_point(out, left_center, (0, 255, 0), radius=4)
-                draw_point(out, right_center, (0, 255, 0), radius=4)
-                draw_box(out, left_box, (0, 200, 255))
-                draw_box(out, right_box, (0, 200, 255))
-
-            if self.cfg.draw_crosshair:
-                draw_crosshair(out, gaze_point_i, color=(0, 255, 255), size=12, thickness=1)
-
-            if self.cfg.show_info:
-                draw_info_panel(out, det)
-
-            self._push_metrics(det)
-            with self.runtime.lock:
-                self.runtime.latest_frame_bgr = out.copy()
-
-            return av.VideoFrame.from_ndarray(out, format="bgr24")
-
-        except Exception as exc:
-            det.status = f"error: {type(exc).__name__}"
-            if self.cfg.show_info:
-                draw_info_panel(out, det)
-            cv2.putText(
-                out,
-                f"Erro: {type(exc).__name__}",
-                (20, h - 20),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (0, 0, 255),
-                2,
-                cv2.LINE_AA,
-            )
-            self._push_metrics(det)
-            with self.runtime.lock:
-                self.runtime.latest_frame_bgr = out.copy()
-            return av.VideoFrame.from_ndarray(out, format="bgr24")
-
-    def _push_metrics(self, det: IrisDetection):
-        payload = {
-            "timestamp": det.timestamp,
-            "elapsed_sec": det.timestamp - self.runtime.start_time,
-            "frame_w": det.frame_w,
-            "frame_h": det.frame_h,
-            "gaze_x": det.gaze_point[0] if det.gaze_point else None,
-            "gaze_y": det.gaze_point[1] if det.gaze_point else None,
-            "left_ratio_x": det.left_ratio_x,
-            "right_ratio_x": det.right_ratio_x,
-            "left_ratio_y": det.left_ratio_y,
-            "right_ratio_y": det.right_ratio_y,
-            "blink_ratio": det.blink_ratio,
-            "blink_state": det.blink_state,
-            "fps": det.fps,
-            "status": det.status,
-        }
-        try:
-            self.runtime.metrics_queue.put_nowait(payload)
-        except queue.Full:
-            pass
-        with self.runtime.lock:
-            self.runtime.csv_rows.append(payload)
-
-
-# =============================================================================
-# Sidebar UI
-# =============================================================================
-
-def render_sidebar():
-    st.sidebar.title("Configurações")
-
-    cfg: TrackerConfig = st.session_state.tracker_config
-
-    cfg.max_faces = int(st.sidebar.selectbox("Máx. rostos", [1, 2], index=0))
-    cfg.refine_landmarks = st.sidebar.checkbox("Refinar landmarks (íris)", value=cfg.refine_landmarks)
-    cfg.min_detection_confidence = float(st.sidebar.slider("Confiança detecção", 0.1, 1.0, cfg.min_detection_confidence, 0.05))
-    cfg.min_tracking_confidence = float(st.sidebar.slider("Confiança tracking", 0.1, 1.0, cfg.min_tracking_confidence, 0.05))
-    cfg.blink_threshold = float(st.sidebar.slider("Limiar de piscada", 0.08, 0.40, cfg.blink_threshold, 0.01))
-    cfg.blink_cooldown_sec = float(st.sidebar.slider("Cooldown piscada (s)", 0.05, 1.00, cfg.blink_cooldown_sec, 0.01))
-    cfg.smoothing_alpha = float(st.sidebar.slider("Suavização", 0.01, 1.00, cfg.smoothing_alpha, 0.01))
-    cfg.gaze_gain_x = float(st.sidebar.slider("Ganho X", 0.5, 3.0, cfg.gaze_gain_x, 0.1))
-    cfg.gaze_gain_y = float(st.sidebar.slider("Ganho Y", 0.5, 3.0, cfg.gaze_gain_y, 0.1))
-    cfg.heatmap_decay = float(st.sidebar.slider("Decaimento heatmap", 0.90, 1.00, cfg.heatmap_decay, 0.001))
-
-    st.sidebar.markdown("---")
-    cfg.show_mesh = st.sidebar.checkbox("Mostrar malha facial", value=cfg.show_mesh)
-    cfg.show_eye_ring = st.sidebar.checkbox("Mostrar contorno dos olhos", value=cfg.show_eye_ring)
-    cfg.show_iris = st.sidebar.checkbox("Mostrar centro da íris", value=cfg.show_iris)
-    cfg.show_info = st.sidebar.checkbox("Mostrar painel info", value=cfg.show_info)
-    cfg.draw_crosshair = st.sidebar.checkbox("Mostrar mira do olhar", value=cfg.draw_crosshair)
-
-    st.sidebar.markdown("---")
-    if st.sidebar.button("Limpar heatmap", use_container_width=True):
-        runtime: SharedRuntime = st.session_state.runtime
-        with runtime.lock:
-            if runtime.heatmap is not None:
-                runtime.heatmap[:] = 0
-        st.sidebar.success("Mapa de calor limpo.")
-
-    if st.sidebar.button("Limpar CSV/métricas", use_container_width=True):
-        runtime: SharedRuntime = st.session_state.runtime
-        with runtime.lock:
-            runtime.csv_rows.clear()
-        st.sidebar.success("Métricas limpas.")
-
-    if st.sidebar.button("Resetar calibração", use_container_width=True):
-        runtime: SharedRuntime = st.session_state.runtime
-        runtime.calibration_map.clear()
-        runtime.calibrated = False
-        st.sidebar.success("Calibração resetada.")
-
-
-# =============================================================================
-# Calibration UI
-# =============================================================================
-
-def render_calibration_panel():
-    st.subheader("Calibração")
-    runtime: SharedRuntime = st.session_state.runtime
-    targets: List[CalibPoint] = st.session_state.calibration_targets
-    col1, col2 = st.columns([1.4, 1.2])
-
-    with col1:
-        st.write("1. Olhe para o alvo indicado.")
-        st.write("2. Espere o olho estabilizar.")
-        st.write("3. Clique em **Salvar leitura atual**.")
-        target_names = [t.name for t in targets]
-        selected = st.selectbox("Alvo atual", target_names, index=target_names.index(st.session_state.selected_calibration_target))
-        st.session_state.selected_calibration_target = selected
-
-        if st.button("Salvar leitura atual", use_container_width=True):
-            metrics = st.session_state.latest_metrics or {}
-            lx = metrics.get("left_ratio_x")
-            rx = metrics.get("right_ratio_x")
-            ly = metrics.get("left_ratio_y")
-            ry = metrics.get("right_ratio_y")
-            norm = normalized_gaze_from_eye_ratios(lx, rx, ly, ry)
-            if norm is None:
-                st.error("Sem leitura válida para calibrar.")
-            else:
-                runtime.calibration_map[selected] = norm
-                runtime.calibrated = "center" in runtime.calibration_map
-                st.success(f"Leitura salva para {selected}: ({norm[0]:.3f}, {norm[1]:.3f})")
-
-        st.json(runtime.calibration_map)
-
-    with col2:
-        # a fixed reference canvas for where the user should look
-        canvas_h = 280
-        canvas_w = 420
-        board = np.ones((canvas_h, canvas_w, 3), dtype=np.uint8) * 245
-        for t in targets:
-            px = int(round(t.x * (canvas_w - 1)))
-            py = int(round(t.y * (canvas_h - 1)))
-            is_sel = (t.name == st.session_state.selected_calibration_target)
-            color = (0, 0, 255) if is_sel else (60, 60, 60)
-            cv2.circle(board, (px, py), 10 if is_sel else 7, color, -1, lineType=cv2.LINE_AA)
-            cv2.putText(board, t.name, (px + 12, py + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (20, 20, 20), 1, cv2.LINE_AA)
-
-        st.image(cv2.cvtColor(board, cv2.COLOR_BGR2RGB), use_container_width=True)
-
-
-# =============================================================================
-# Metrics consumers
-# =============================================================================
-
-def drain_metrics_queue():
-    runtime: SharedRuntime = st.session_state.runtime
-    latest = None
-    while True:
-        try:
-            latest = runtime.metrics_queue.get_nowait()
-        except queue.Empty:
-            break
-    if latest is not None:
-        st.session_state.latest_metrics = latest
-
-
-def render_live_metrics():
-    drain_metrics_queue()
-    metrics = st.session_state.latest_metrics or {}
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Status", metrics.get("status", "N/A"))
-    c2.metric("Blink", metrics.get("blink_state", "N/A"))
-    fps = metrics.get("fps")
-    c3.metric("FPS", f"{fps:.1f}" if isinstance(fps, (int, float)) else "N/A")
-    br = metrics.get("blink_ratio")
-    c4.metric("Blink ratio", f"{br:.3f}" if isinstance(br, (int, float)) else "N/A")
-
-    c5, c6, c7, c8 = st.columns(4)
-    gx = metrics.get("gaze_x")
-    gy = metrics.get("gaze_y")
-    c5.metric("Gaze X", f"{gx}" if gx is not None else "N/A")
-    c6.metric("Gaze Y", f"{gy}" if gy is not None else "N/A")
-
-    lrx = metrics.get("left_ratio_x")
-    rrx = metrics.get("right_ratio_x")
-    c7.metric("L RX", f"{lrx:.3f}" if isinstance(lrx, (int, float)) else "N/A")
-    c8.metric("R RX", f"{rrx:.3f}" if isinstance(rrx, (int, float)) else "N/A")
-
-
-def render_tables_and_exports():
-    runtime: SharedRuntime = st.session_state.runtime
-    rows = dataframe_from_rows(runtime.csv_rows)
-
-    st.subheader("Métricas e Exportação")
-    st.dataframe(rows.tail(200), use_container_width=True, height=260)
-
-    col1, col2, col3 = st.columns(3)
-
-    csv_bytes = rows.to_csv(index=False).encode("utf-8")
-    col1.download_button(
-        "Baixar CSV",
-        data=csv_bytes,
-        file_name="iris_tracking_metrics.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-
-    with runtime.lock:
-        latest_frame = runtime.latest_frame_bgr.copy() if runtime.latest_frame_bgr is not None else None
-        heatmap = runtime.heatmap.copy() if runtime.heatmap is not None else None
-
-    if latest_frame is not None and heatmap is not None:
-        overlay = overlay_heatmap_on_frame(latest_frame, heatmap, alpha=0.4)
-        png_bytes = image_to_png_bytes(overlay)
-        col2.download_button(
-            "Baixar PNG do heatmap",
-            data=png_bytes,
-            file_name="iris_heatmap_overlay.png",
-            mime="image/png",
-            use_container_width=True,
+        left_ray_dir, _, _ = self._eye_ray(
+            left_iris_center, left_eye_center_2d, left_eye_width, left_eye_height, left_eye_center_3d, R_head
         )
-    else:
-        col2.write("PNG indisponível.")
+        right_ray_dir, _, _ = self._eye_ray(
+            right_iris_center, right_eye_center_2d, right_eye_width, right_eye_height, right_eye_center_3d, R_head
+        )
 
-    pdf_bytes = build_pdf_report(runtime)
-    col3.download_button(
-        "Baixar PDF",
-        data=pdf_bytes,
-        file_name="relatorio_iris_streamlit.pdf",
-        mime="application/pdf",
-        use_container_width=True,
+        screen_w_mm, screen_h_mm, screen_z_mm = STATE.get_screen_mm()
+        left_hit = intersect_ray_with_plane(left_eye_center_3d, left_ray_dir, screen_z_mm)
+        right_hit = intersect_ray_with_plane(right_eye_center_3d, right_ray_dir, screen_z_mm)
+
+        if left_hit is None and right_hit is None:
+            avg_hit = np.array([0.0, 0.0, screen_z_mm], dtype=np.float64)
+        elif left_hit is None:
+            avg_hit = right_hit
+        elif right_hit is None:
+            avg_hit = left_hit
+        else:
+            avg_hit = 0.5 * (left_hit + right_hit)
+
+        raw_x = ((avg_hit[0] / (screen_w_mm / 2.0)) + 1.0) / 2.0
+        raw_y = ((avg_hit[1] / (screen_h_mm / 2.0)) + 1.0) / 2.0
+        raw_xy = np.array([clamp(raw_x), clamp(raw_y)], dtype=np.float64)
+
+        with STATE.lock:
+            centered_raw = raw_xy - STATE.center_bias
+            centered_raw = np.array([clamp(centered_raw[0]), clamp(centered_raw[1])], dtype=np.float64)
+            feature_vec = raw_feature_vector(centered_raw, head_yaw, head_pitch)
+            calibrated_xy = apply_linear_calibration(feature_vec, STATE.calibration_coef)
+
+            STATE.face_found = True
+            STATE.raw_hit_xy = raw_xy
+            STATE.centered_raw_xy = centered_raw
+            STATE.calibrated_xy = calibrated_xy
+            STATE.latest_feature_vec = feature_vec
+            STATE.left_eye_center_3d = left_eye_center_3d
+            STATE.right_eye_center_3d = right_eye_center_3d
+            STATE.left_iris_center_2d = left_iris_center
+            STATE.right_iris_center_2d = right_iris_center
+            STATE.rotation_matrix = R_head
+            STATE.head_yaw = head_yaw
+            STATE.head_pitch = head_pitch
+            STATE.last_status = "Rastreamento ativo"
+
+        # OVERLAY -------------------------------------------------
+        draw_pose_cube(img, rvec, tvec, cam)
+
+        # Iris centers and eye centers on image
+        cv2.circle(img, tuple(np.int32(left_iris_center)), 5, (0, 255, 0), -1, cv2.LINE_AA)
+        cv2.circle(img, tuple(np.int32(right_iris_center)), 5, (0, 255, 0), -1, cv2.LINE_AA)
+        cv2.circle(img, tuple(np.int32(left_eye_center_2d)), 4, (255, 0, 255), -1, cv2.LINE_AA)
+        cv2.circle(img, tuple(np.int32(right_eye_center_2d)), 4, (255, 0, 255), -1, cv2.LINE_AA)
+
+        # Ray visualization from the 3D eye centers
+        ray_pts_3d = np.array(
+            [
+                left_eye_center_3d,
+                left_eye_center_3d + left_ray_dir * 180.0,
+                right_eye_center_3d,
+                right_eye_center_3d + right_ray_dir * 180.0,
+            ],
+            dtype=np.float64,
+        )
+        ray_pts_2d = project_points(ray_pts_3d, np.zeros((3, 1), dtype=np.float64), np.zeros((3, 1), dtype=np.float64), cam).astype(int)
+        cv2.line(img, tuple(ray_pts_2d[0]), tuple(ray_pts_2d[1]), (255, 180, 0), 2, cv2.LINE_AA)
+        cv2.line(img, tuple(ray_pts_2d[2]), tuple(ray_pts_2d[3]), (255, 180, 0), 2, cv2.LINE_AA)
+
+        # Crosshair on virtual-screen estimate for debugging text
+        with STATE.lock:
+            dbg_xy = STATE.calibrated_xy.copy()
+            dbg_raw = STATE.centered_raw_xy.copy()
+
+        text_lines = [
+            f"Raw centered: ({dbg_raw[0]:.3f}, {dbg_raw[1]:.3f})",
+            f"Calibrated: ({dbg_xy[0]:.3f}, {dbg_xy[1]:.3f})",
+            f"Head yaw/pitch: ({math.degrees(head_yaw):.1f} deg, {math.degrees(head_pitch):.1f} deg)",
+            "Cube = rotation matrix visualized on head pose",
+        ]
+        y0 = 28
+        for i, line in enumerate(text_lines):
+            cv2.putText(img, line, (16, y0 + 28 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (240, 240, 240), 2, cv2.LINE_AA)
+
+        draw_crosshair(img, (int(left_iris_center[0]), int(left_iris_center[1])), color=(0, 255, 0), size=8)
+        draw_crosshair(img, (int(right_iris_center[0]), int(right_iris_center[1])), color=(0, 255, 0), size=8)
+
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+
+# ============================================================
+# UI HELPERS
+# ============================================================
+def render_target_screen(target_xy: Optional[Tuple[float, float]], gaze_xy: Tuple[float, float]) -> str:
+    tx, ty = (target_xy if target_xy is not None else (None, None))
+    gx, gy = gaze_xy
+    target_html = ""
+    if tx is not None and ty is not None:
+        target_html = f'<div class="target-dot" style="left:{tx*100:.2f}%; top:{ty*100:.2f}%;"></div>'
+    gaze_html = f'<div class="gaze-dot" style="left:{gx*100:.2f}%; top:{gy*100:.2f}%;"></div>'
+    return f'''
+    <div class="target-wrap">
+        <div class="guide-grid"></div>
+        {target_html}
+        {gaze_html}
+    </div>
+    '''
+
+
+def matrix_to_html(R: np.ndarray) -> str:
+    rows = []
+    for r in R:
+        rows.append("[" + ", ".join(f"{v:+0.3f}" for v in r) + "]")
+    return "<br>".join(rows)
+
+
+# ============================================================
+# SIDEBAR / SETTINGS
+# ============================================================
+st.title("Rastreamento de Pupila/Íris 3D para Streamlit")
+st.caption(
+    "App completo com: 1) centros dos olhos, 2) centros da pupila/íris, 3) projeção de raios, 4) interseção com o plano da tela, 5) binding do monitor real para monitor virtual e 6) calibração multiponto."
+)
+
+with st.sidebar:
+    st.header("Tela / Monitor")
+    screen_width_cm = st.number_input("Largura física do monitor (cm)", min_value=20.0, max_value=120.0, value=53.0, step=0.5)
+    screen_height_cm = st.number_input("Altura física do monitor (cm)", min_value=12.0, max_value=80.0, value=30.0, step=0.5)
+    screen_distance_cm = st.number_input("Distância olhos -> tela (cm)", min_value=20.0, max_value=120.0, value=60.0, step=0.5)
+    screen_res_w = st.number_input("Resolução horizontal (px)", min_value=640, max_value=7680, value=1920, step=10)
+    screen_res_h = st.number_input("Resolução vertical (px)", min_value=360, max_value=4320, value=1080, step=10)
+    if st.button("Aplicar parâmetros da tela", use_container_width=True):
+        STATE.set_screen(screen_width_cm, screen_height_cm, screen_distance_cm, int(screen_res_w), int(screen_res_h))
+
+    st.divider()
+    st.markdown(
+        """
+        **Webcam recomendada**
+        - 720p ou 1080p
+        - 30 fps ou mais
+        - câmera na altura do rosto
+        - iluminação frontal estável
+        - sem contraluz
+        """
     )
 
+snapshot = STATE.snapshot()
 
-# =============================================================================
-# Visualization panels
-# =============================================================================
+col_a, col_b = st.columns([1.35, 1.0], gap="large")
 
-def render_heatmap_view():
-    runtime: SharedRuntime = st.session_state.runtime
-    st.subheader("Mapa de Calor")
-    with runtime.lock:
-        latest_frame = runtime.latest_frame_bgr.copy() if runtime.latest_frame_bgr is not None else None
-        heatmap = runtime.heatmap.copy() if runtime.heatmap is not None else None
-
-    if latest_frame is None or heatmap is None:
-        st.info("O mapa de calor aparecerá quando a webcam começar a enviar frames.")
-        return
-
-    overlay = overlay_heatmap_on_frame(latest_frame, heatmap, alpha=0.4)
-    st.image(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB), use_container_width=True)
-
-
-def render_debug_eye_view():
-    runtime: SharedRuntime = st.session_state.runtime
-    metrics = st.session_state.latest_metrics or {}
-
-    st.subheader("Debug")
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.json(metrics)
-
-    with col2:
-        with runtime.lock:
-            latest_frame = runtime.latest_frame_bgr.copy() if runtime.latest_frame_bgr is not None else None
-        if latest_frame is not None:
-            h, w = latest_frame.shape[:2]
-            gx = metrics.get("gaze_x")
-            gy = metrics.get("gaze_y")
-            if gx is not None and gy is not None:
-                crop_size = 140
-                x0 = max(0, gx - crop_size)
-                y0 = max(0, gy - crop_size)
-                x1 = min(w, gx + crop_size)
-                y1 = min(h, gy + crop_size)
-                crop = latest_frame[y0:y1, x0:x1]
-                if crop.size > 0:
-                    st.image(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB), caption="Recorte em torno do ponto de gaze", use_container_width=True)
-            else:
-                st.info("Sem ponto de gaze para o recorte.")
-
-
-# =============================================================================
-# Main app layout
-# =============================================================================
-
-def render_header():
-    st.title("Rastreamento de Íris com Webcam")
-    st.write(
-        "App completo para Streamlit com webcam, MediaPipe Face Mesh, "
-        "estimativa de ponto de olhar, calibração simples, mapa de calor e exportação."
-    )
-    st.caption(
-        "Feito para rodar em ambiente headless com streamlit-webrtc e opencv-python-headless."
-    )
-
-
-def render_webrtc():
-    st.subheader("Webcam")
-    st.warning(
-        "Permita acesso à webcam no navegador. "
-        "Deixe este componente fixo na página e evite tradução automática/extensões ao testar."
-    )
-
+with col_a:
+    st.subheader("Vídeo em tempo real")
     webrtc_streamer(
-        key="iris-tracker-main",
+        key="gaze-tracker",
         mode=WebRtcMode.SENDRECV,
-        rtc_configuration=DEFAULT_RTC_CONFIGURATION,
         media_stream_constraints={"video": True, "audio": False},
+        video_processor_factory=GazeVideoProcessor,
         async_processing=True,
-        video_processor_factory=StreamlitIrisProcessor,
+        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+    )
+    st.markdown(
+        "<div class='small-note'>Olhe para o ponto vermelho durante a calibração. O ponto azul representa a estimativa atual na tela virtual.</div>",
+        unsafe_allow_html=True,
     )
 
+with col_b:
+    st.subheader("Tela virtual")
 
-def render_install_block():
-    st.subheader("Arquivos do deploy")
-    st.code(
-        """requirements.txt
-streamlit>=1.41.0
-streamlit-webrtc>=0.62.4
-opencv-python-headless>=4.10.0.84
-mediapipe==0.10.21
-numpy>=1.26.4
-pandas>=2.2.2
-av>=12.3.0
-Pillow>=10.4.0
-reportlab>=4.2.2
+    if "cal_idx" not in st.session_state:
+        st.session_state.cal_idx = 0
 
-packages.txt
-libgl1
+    current_target = None
+    if 0 <= st.session_state.cal_idx < len(CALIBRATION_POINTS):
+        current_target = CALIBRATION_POINTS[st.session_state.cal_idx]
 
-runtime.txt
-python-3.11.9
-""",
-        language="text",
+    st.markdown(
+        render_target_screen(current_target, tuple(snapshot["calibrated_xy"])),
+        unsafe_allow_html=True,
     )
 
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Capturar centro bruto", use_container_width=True):
+            STATE.capture_center()
+        if st.button("Resetar centro bruto", use_container_width=True):
+            STATE.clear_center()
+    with c2:
+        if st.button("Capturar ponto atual", use_container_width=True):
+            if current_target is not None:
+                STATE.capture_calibration(current_target)
+                st.session_state.cal_idx = min(st.session_state.cal_idx + 1, len(CALIBRATION_POINTS))
+        if st.button("Resetar calibração", use_container_width=True):
+            STATE.reset_calibration()
+            st.session_state.cal_idx = 0
 
-def main():
-    render_sidebar()
-    render_header()
+    nav1, nav2 = st.columns(2)
+    with nav1:
+        if st.button("Voltar um ponto", use_container_width=True):
+            st.session_state.cal_idx = max(0, st.session_state.cal_idx - 1)
+    with nav2:
+        if st.button("Pular ponto", use_container_width=True):
+            st.session_state.cal_idx = min(len(CALIBRATION_POINTS), st.session_state.cal_idx + 1)
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "Tracking",
-        "Calibração",
-        "Heatmap",
-        "Debug",
-        "Deploy",
-    ])
+    st.markdown(f"**Próximo ponto:** {st.session_state.cal_idx + 1 if st.session_state.cal_idx < len(CALIBRATION_POINTS) else 'fim'} / {len(CALIBRATION_POINTS)}")
 
-    with tab1:
-        render_webrtc()
-        render_live_metrics()
-        render_tables_and_exports()
+    st.markdown("### Estado")
+    st.markdown(f"<div class='metric-box'><b>Status:</b> {snapshot['last_status']}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='metric-box'><b>Face detectada:</b> {'Sim' if snapshot['face_found'] else 'Não'}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='metric-box'><b>Amostras de calibração:</b> {snapshot['calibration_n']}</div>", unsafe_allow_html=True)
+    st.markdown(
+        f"<div class='metric-box'><b>Olhar bruto corrigido:</b> ({snapshot['centered_raw_xy'][0]:.3f}, {snapshot['centered_raw_xy'][1]:.3f})</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f"<div class='metric-box'><b>Olhar calibrado:</b> ({snapshot['calibrated_xy'][0]:.3f}, {snapshot['calibrated_xy'][1]:.3f})</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f"<div class='metric-box'><b>Pixel estimado:</b> ({int(snapshot['calibrated_xy'][0]*snapshot['screen_res_w'])}, {int(snapshot['calibrated_xy'][1]*snapshot['screen_res_h'])})</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f"<div class='metric-box'><b>Yaw/Pitch da cabeça:</b> ({math.degrees(snapshot['head_yaw']):.2f}°, {math.degrees(snapshot['head_pitch']):.2f}°)</div>",
+        unsafe_allow_html=True,
+    )
 
-    with tab2:
-        render_calibration_panel()
+st.divider()
 
-    with tab3:
-        render_heatmap_view()
+left_info, right_info = st.columns(2, gap="large")
+with left_info:
+    st.subheader("Matriz de rotação atual")
+    st.markdown(f"<div class='metric-box' style='font-family: monospace'>{matrix_to_html(snapshot['rotation_matrix'])}</div>", unsafe_allow_html=True)
 
-    with tab4:
-        render_debug_eye_view()
+with right_info:
+    st.subheader("Como o algoritmo funciona")
+    st.markdown(
+        """
+        1. Detecta landmarks faciais refinados da Face Mesh com íris.
+        2. Calcula o centro 2D de cada íris/pupila e o centro geométrico de cada olho.
+        3. Estima a pose da cabeça por `solvePnP`.
+        4. Usa centros 3D aproximados dos globos oculares no modelo canônico da face.
+        5. Projeta um raio de cada olho com base no desvio da íris dentro da abertura ocular.
+        6. Intersecta os dois raios com o plano do monitor virtual.
+        7. Corrige o centro bruto e depois ajusta a saída por calibração multiponto.
+        """
+    )
 
-    with tab5:
-        render_install_block()
-
-
-if __name__ == "__main__":
-    main()
-
+st.divider()
+st.subheader("Observações importantes")
+st.markdown(
+    """
