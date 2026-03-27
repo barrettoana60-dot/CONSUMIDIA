@@ -1,3 +1,4 @@
+# SEU CÓDIGO app_streamlit.py DEVE COMEÇAR DIRETAMENTE COM OS IMPORTS, ASSIM:
 
 import cv2
 import numpy as np
@@ -6,7 +7,7 @@ import time
 import math
 import random
 import tempfile
-import os # Adicionado para os.remove
+import os
 
 # ==========================================
 # GLOBALS
@@ -105,7 +106,7 @@ def mask_outside_square(image, center, size):
     top_left_y = max(0, y - half_size)
     bottom_right_x = min(image.shape[1], x + half_size)
     bottom_right_y = min(image.shape[0], y + half_size)
-    mask[top_left_y:bottom_right_y, top_left_x:bottom_right_x] = 255
+    mask[top_left_y:bottom_right_y, top_left_x:top_left_x + (bottom_right_x - top_left_x)] = 255 # Corrigido o fatiamento
     return cv2.bitwise_and(image, mask)
 
 
