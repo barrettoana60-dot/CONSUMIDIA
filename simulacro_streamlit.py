@@ -1,150 +1,194 @@
-import cv2
-import math
-import time
-import textwrap
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
 
+"""
+eye_gallery_3d.py
+
+Sala 3D com quadros interativos guiados por rastreamento ocular.
+- Detecção de pupila com elipse semelhante ao código-base enviado
+- Sala 3D com quadros clicáveis pelo olhar
+- Exibe informações do quadro quando o usuário fixa o olhar
+- 2 piscadas rápidas: zoom no quadro
+- 1 piscada: afasta o zoom
+- Gera relatório em PDF com mapa de calor do olhar
+- Salva CSV de eventos de gaze / piscadas / seleções
+
+Autor: OpenAI
+"""
+
+from __future__ import annotations
+
+import math
+import os
+import sys
+import time
+import csv
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple, Dict
+
+import cv2
 import numpy as np
+
+# Pygame + OpenGL
+import pygame
+from pygame.locals import DOUBLEBUF, OPENGL, QUIT, KEYDOWN, K_ESCAPE
+
+try:
+    from OpenGL.GL import (
+        glBegin, glEnd, glVertex3f, glColor3f, glColor4f, glEnable, glDisable,
+        glMatrixMode, glLoadIdentity, glTranslatef, glRotatef, glClear, glClearColor,
+        glPushMatrix, glPopMatrix, glTexCoord2f, glVertex2f, glViewport,
+        glBlendFunc, glGenTextures, glBindTexture, glTexParameteri, glTexImage2D,
+        glDeleteTextures, glWindowPos2d, glDrawPixels, GL_QUADS, GL_COLOR_BUFFER_BIT,
+        GL_DEPTH_BUFFER_BIT, GL_PROJECTION, GL_MODELVIEW, GL_DEPTH_TEST, GL_BLEND,
+        GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_TEXTURE_2D, GL_LINEAR, GL_RGBA,
+        GL_UNSIGNED_BYTE, GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER
+    )
+    from OpenGL.GLU import gluPerspective, gluLookAt
+    OPENGL_AVAILABLE = True
+except Exception:
+    OPENGL_AVAILABLE = False
+
+# Matplotlib / PDF
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 
+###############################################################################
+# CONFIGURAÇÕES
+###############################################################################
 
-# ============================================================
-# CONFIGURAÇÕES GERAIS
-# ============================================================
-EYE_W = 640
-EYE_H = 480
-ROOM_W = 1280
-ROOM_H = 720
-WINDOW_EYE = "Simulacro - Rastreio Ocular"
-WINDOW_ROOM = "Simulacro - Sala 3D"
+WINDOW_W = 1400
+WINDOW_H = 820
 
+EYE_FRAME_W = 640
+EYE_FRAME_H = 480
 
-# ============================================================
-# UTILITÁRIOS
-# ============================================================
-def clamp(value, vmin, vmax):
-    return max(vmin, min(vmax, value))
+HEATMAP_W = 1600
+HEATMAP_H = 900
 
+SELECTION_HOLD_SECONDS = 1.1
+DOUBLE_BLINK_MAX_GAP = 0.65
+SINGLE_BLINK_MIN_DURATION = 0.04
+SINGLE_BLINK_MAX_DURATION = 0.45
+BLINK_EAR_THRESHOLD = 0.20  # fallback se usar face mesh
+PUPIL_DARK_THRESHOLD_OFFSET = (5, 15, 25)
+USE_MEDIAPIPE_FOR_BLINK = False  # pode ativar se tiver mediapipe
 
-def now():
-    return time.perf_counter()
+REPORT_DIR = "relatorios"
+EXPORT_DIR = "exports"
+TEXTURE_DIR = "quadros"
 
+###############################################################################
+# UTILIDADES GERAIS
+###############################################################################
 
-def draw_text(img, text, org, scale=0.6, color=(255, 255, 255), thickness=1, bg=True):
-    x, y = org
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    if bg:
-        (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
-        cv2.rectangle(img, (x - 4, y - th - 6), (x + tw + 4, y + 4), (0, 0, 0), -1)
-    cv2.putText(img, text, org, font, scale, color, thickness, cv2.LINE_AA)
+def ensure_dirs() -> None:
+    for path in [REPORT_DIR, EXPORT_DIR, TEXTURE_DIR]:
+        os.makedirs(path, exist_ok=True)
 
+def now_str() -> str:
+    return time.strftime("%Y-%m-%d_%H-%M-%S")
 
-# ============================================================
-# MODELOS DE DADOS
-# ============================================================
+def clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+def lerp(a: float, b: float, t: float) -> float:
+    return a + (b - a) * t
+
+def vec_length(v: Tuple[float, float]) -> float:
+    return math.sqrt(v[0] ** 2 + v[1] ** 2)
+
+###############################################################################
+# DADOS DOS QUADROS
+###############################################################################
+
 @dataclass
-class Painting:
-    pid: str
+class PaintingInfo:
     title: str
-    author: str
+    artist: str
     year: str
     description: str
+    file_path: str
     wall: str
     center: Tuple[float, float, float]
-    size: Tuple[float, float]  # largura, altura em unidades 3D
-    color: Tuple[int, int, int]
-    attention_seconds: float = 0.0
-    hits: int = 0
-    last_seen_ts: float = 0.0
-
+    size: Tuple[float, float]
+    normal: Tuple[float, float, float]
 
 @dataclass
-class BlinkInterpreter:
-    double_window: float = 0.45
-    pending_single_ts: Optional[float] = None
-    blink_counter: int = 0
+class GazeEvent:
+    timestamp: float
+    wall_hit: Optional[str]
+    painting_title: Optional[str]
+    world_hit: Optional[Tuple[float, float, float]]
+    room_uv: Optional[Tuple[float, float]]
+    pupil_center: Optional[Tuple[int, int]]
+    eye_center: Optional[Tuple[int, int]]
+    blink_state: bool
+    action: Optional[str] = None
 
-    def register_blink(self) -> Optional[str]:
-        t = now()
-        if self.pending_single_ts is None:
-            self.pending_single_ts = t
-            self.blink_counter = 1
-            return None
+###############################################################################
+# PARTE 1 — RASTREAMENTO OCULAR BASEADO NA ELIPSE DO CÓDIGO ENVIADO
+###############################################################################
 
-        if t - self.pending_single_ts <= self.double_window:
-            self.pending_single_ts = None
-            self.blink_counter = 0
-            return "double"
+class EyeTrackerEllipse:
+    """
+    Rastreador ocular usando a mesma ideia do código enviado:
+    - busca a área mais escura
+    - testa thresholds
+    - extrai contorno
+    - ajusta elipse na pupila
+    - calcula centro do "olho/esfera" com interseção média
+    - produz vetor de olhar aproximado
+    """
 
-        self.pending_single_ts = t
-        self.blink_counter = 1
-        return None
-
-    def update(self) -> Optional[str]:
-        if self.pending_single_ts is None:
-            return None
-        if now() - self.pending_single_ts > self.double_window:
-            self.pending_single_ts = None
-            self.blink_counter = 0
-            return "single"
-        return None
-
-
-@dataclass
-class SessionStats:
-    start_time: float = field(default_factory=now)
-    total_frames: int = 0
-    tracked_frames: int = 0
-    blink_single: int = 0
-    blink_double: int = 0
-    zoom_changes: int = 0
-    report_path: str = "simulacro_relatorio.pdf"
-
-    def duration(self) -> float:
-        return max(0.0, now() - self.start_time)
-
-
-# ============================================================
-# RASTREADOR OCULAR
-# Baseado na lógica do código enviado: busca da região mais escura,
-# threshold adaptativo, contornos, ajuste de elipse e centro esférico.
-# ============================================================
-class EyeTracker:
-    def __init__(self, screen_w: int, screen_h: int):
-        self.screen_w = screen_w
-        self.screen_h = screen_h
-
-        self.ray_lines: List[Tuple] = []
+    def __init__(self) -> None:
+        self.ray_lines: List[Tuple[Tuple[float, float], Tuple[float, float], float]] = []
         self.model_centers: List[Tuple[int, int]] = []
         self.stored_intersections: List[Tuple[int, int]] = []
+        self.max_rays = 100
+        self.prev_model_center_avg = (EYE_FRAME_W // 2, EYE_FRAME_H // 2)
+        self.max_observed_distance = 180
+        self.last_pupil_center: Optional[Tuple[int, int]] = None
+        self.last_eye_center: Optional[Tuple[int, int]] = None
+        self.last_valid_ellipse = None
+        self.last_vector: Optional[np.ndarray] = None
+        self.last_world_yaw_pitch = (0.0, 0.0)
+        self.calibrated_center = None
+        self.center_locked = False
+        self.locked_center = self.prev_model_center_avg
 
-        self.max_rays = 120
-        self.prev_model_center_avg = (EYE_W // 2, EYE_H // 2)
-        self.gaze_pt = np.array([screen_w // 2, screen_h // 2], dtype=np.float32)
-        self.raw_gaze_pt = np.array([screen_w // 2, screen_h // 2], dtype=np.float32)
+        self.blink_closed = False
+        self.blink_start_ts = 0.0
+        self.last_blink_ts = 0.0
+        self.blink_count_window: List[float] = []
+        self.double_blink_flag = False
+        self.single_blink_flag = False
 
-        self.neutral_vector = np.array([0.0, 0.0], dtype=np.float32)
-        self.has_calibration = False
-        self.gain_x = 2.6
-        self.gain_y = 2.2
-        self.smooth_alpha = 0.24
+        self.closed_frame_counter = 0
+        self.open_frame_counter = 0
 
-        self.last_valid = False
-        self.closed_frames = 0
-        self.min_closed_frames = 2
-        self.max_closed_frames = 16
-        self.blinks_detected = 0
+        self.last_debug_frame = None
 
-        self.debug_last_ellipse = None
-        self.debug_pupil_center = None
-        self.debug_eye_center = None
-        self.debug_last_score = 0.0
+        self.face_mesh = None
+        if USE_MEDIAPIPE_FOR_BLINK:
+            try:
+                import mediapipe as mp
+                self.mp = mp
+                self.face_mesh = self.mp.solutions.face_mesh.FaceMesh(
+                    static_image_mode=False,
+                    max_num_faces=1,
+                    refine_landmarks=True,
+                    min_detection_confidence=0.5,
+                    min_tracking_confidence=0.5
+                )
+            except Exception:
+                self.face_mesh = None
 
-    # -------- Funções adaptadas do código-base --------
-    @staticmethod
-    def crop_to_aspect_ratio(image, width=EYE_W, height=EYE_H):
+    ###########################################################################
+    # Funções adaptadas do código base
+    ###########################################################################
+
+    def crop_to_aspect_ratio(self, image: np.ndarray, width: int = EYE_FRAME_W, height: int = EYE_FRAME_H) -> np.ndarray:
         current_height, current_width = image.shape[:2]
         desired_ratio = width / height
         current_ratio = current_width / current_height
@@ -160,14 +204,12 @@ class EyeTracker:
 
         return cv2.resize(cropped_img, (width, height))
 
-    @staticmethod
-    def apply_binary_threshold(image, darkest_pixel_value, added_threshold):
-        threshold = darkest_pixel_value + added_threshold
+    def apply_binary_threshold(self, image: np.ndarray, darkest_pixel_value: int, added_threshold: int) -> np.ndarray:
+        threshold = int(darkest_pixel_value) + int(added_threshold)
         _, thresholded_image = cv2.threshold(image, threshold, 255, cv2.THRESH_BINARY_INV)
         return thresholded_image
 
-    @staticmethod
-    def get_darkest_area(image):
+    def get_darkest_area(self, image: np.ndarray) -> Optional[Tuple[int, int]]:
         ignore_bounds = 20
         image_skip_size = 10
         search_area = 20
@@ -175,30 +217,32 @@ class EyeTracker:
 
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         min_sum = float("inf")
-        darkest_point = (gray.shape[1] // 2, gray.shape[0] // 2)
+        darkest_point = None
 
         for y in range(ignore_bounds, gray.shape[0] - ignore_bounds, image_skip_size):
             for x in range(ignore_bounds, gray.shape[1] - ignore_bounds, image_skip_size):
                 current_sum = 0
                 num_pixels = 0
+
                 for dy in range(0, search_area, internal_skip_size):
                     if y + dy >= gray.shape[0]:
                         break
                     for dx in range(0, search_area, internal_skip_size):
                         if x + dx >= gray.shape[1]:
                             break
-                        current_sum += int(gray[y + dy, x + dx])
+                        current_sum += int(gray[y + dy][x + dx])
                         num_pixels += 1
+
                 if num_pixels > 0 and current_sum < min_sum:
                     min_sum = current_sum
                     darkest_point = (x + search_area // 2, y + search_area // 2)
 
         return darkest_point
 
-    @staticmethod
-    def mask_outside_square(image, center, size):
+    def mask_outside_square(self, image: np.ndarray, center: Tuple[int, int], size: int) -> np.ndarray:
         x, y = center
         half_size = size // 2
+
         mask = np.zeros_like(image)
         top_left_x = max(0, x - half_size)
         top_left_y = max(0, y - half_size)
@@ -207,10 +251,12 @@ class EyeTracker:
         mask[top_left_y:bottom_right_y, top_left_x:bottom_right_x] = 255
         return cv2.bitwise_and(image, mask)
 
-    @staticmethod
-    def filter_contours_by_area_and_return_largest(contours, pixel_thresh, ratio_thresh):
+    def filter_contours_by_area_and_return_largest(
+        self, contours: List[np.ndarray], pixel_thresh: int, ratio_thresh: float
+    ) -> List[np.ndarray]:
         max_area = 0
         largest_contour = None
+
         for contour in contours:
             area = cv2.contourArea(contour)
             if area >= pixel_thresh:
@@ -218,87 +264,116 @@ class EyeTracker:
                 if h == 0 or w == 0:
                     continue
                 length_to_width_ratio = max(w / h, h / w)
-                if length_to_width_ratio <= ratio_thresh and area > max_area:
-                    max_area = area
-                    largest_contour = contour
+                if length_to_width_ratio <= ratio_thresh:
+                    if area > max_area:
+                        max_area = area
+                        largest_contour = contour
+
         return [largest_contour] if largest_contour is not None else []
 
-    @staticmethod
-    def optimize_contours_by_angle(contours, image):
-        if len(contours) < 1 or contours[0] is None or len(contours[0]) < 6:
-            return contours[0] if contours else np.array([], dtype=np.int32)
+    def optimize_contours_by_angle(self, contours: List[np.ndarray], image: np.ndarray) -> np.ndarray:
+        if len(contours) < 1 or contours[0] is None:
+            return np.array([], dtype=np.int32).reshape((-1, 1, 2))
 
         all_contours = np.concatenate(contours[0], axis=0)
+        if len(all_contours) < 10:
+            return contours[0]
+
         spacing = max(1, int(len(all_contours) / 25))
         filtered_points = []
         centroid = np.mean(all_contours, axis=0)
 
-        for i in range(len(all_contours)):
+        for i in range(0, len(all_contours)):
             current_point = all_contours[i]
             prev_point = all_contours[i - spacing] if i - spacing >= 0 else all_contours[-spacing]
             next_point = all_contours[i + spacing] if i + spacing < len(all_contours) else all_contours[spacing]
 
             vec1 = prev_point - current_point
             vec2 = next_point - current_point
+
             denom = (np.linalg.norm(vec1) * np.linalg.norm(vec2))
-            if denom < 1e-6:
+            if denom == 0:
                 continue
-            cosang = np.dot(vec1, vec2) / denom
-            cosang = np.clip(cosang, -1.0, 1.0)
-            _ = np.arccos(cosang)
+
+            with np.errstate(invalid="ignore"):
+                _angle = np.arccos(np.clip(np.dot(vec1, vec2) / denom, -1.0, 1.0))
+
             vec_to_centroid = centroid - current_point
             cos_threshold = np.cos(np.radians(60))
-            direction = (vec1 + vec2) / 2.0
-            if np.dot(vec_to_centroid, direction) >= cos_threshold:
+
+            avg_vec = (vec1 + vec2) / 2.0
+            if np.linalg.norm(avg_vec) == 0:
+                continue
+
+            if np.dot(vec_to_centroid, avg_vec) >= cos_threshold:
                 filtered_points.append(current_point)
 
         if not filtered_points:
             return contours[0]
+
         return np.array(filtered_points, dtype=np.int32).reshape((-1, 1, 2))
 
-    @staticmethod
-    def check_contour_pixels(contour, image_shape):
+    def check_contour_pixels(self, contour: np.ndarray, image_shape: Tuple[int, int], debug_mode_on: bool = False):
         if contour is None or len(contour) < 5:
-            return [0, 0.0, None]
+            return [0, 0, np.zeros(image_shape, dtype=np.uint8)]
 
         contour_mask = np.zeros(image_shape, dtype=np.uint8)
         cv2.drawContours(contour_mask, [contour], -1, 255, 1)
 
         ellipse_mask_thick = np.zeros(image_shape, dtype=np.uint8)
         ellipse_mask_thin = np.zeros(image_shape, dtype=np.uint8)
+
         ellipse = cv2.fitEllipse(contour)
         cv2.ellipse(ellipse_mask_thick, ellipse, 255, 10)
         cv2.ellipse(ellipse_mask_thin, ellipse, 255, 4)
 
         overlap_thick = cv2.bitwise_and(contour_mask, ellipse_mask_thick)
         overlap_thin = cv2.bitwise_and(contour_mask, ellipse_mask_thin)
+
         absolute_pixel_total_thick = int(np.sum(overlap_thick > 0))
         absolute_pixel_total_thin = int(np.sum(overlap_thin > 0))
         total_border_pixels = int(np.sum(contour_mask > 0))
-        ratio_under_ellipse = absolute_pixel_total_thin / total_border_pixels if total_border_pixels > 0 else 0.0
+        ratio_under_ellipse = absolute_pixel_total_thin / total_border_pixels if total_border_pixels > 0 else 0
 
         return [absolute_pixel_total_thick, ratio_under_ellipse, overlap_thin]
 
-    @staticmethod
-    def check_ellipse_goodness(binary_image, contour):
+    def check_ellipse_goodness(self, binary_image: np.ndarray, contour: np.ndarray, debug_mode_on: bool = False):
+        ellipse_goodness = [0, 0, 0]
         if contour is None or len(contour) < 5:
-            return [0.0, 0.0, 0.0]
+            return ellipse_goodness
 
         ellipse = cv2.fitEllipse(contour)
+
         mask = np.zeros_like(binary_image)
         cv2.ellipse(mask, ellipse, 255, -1)
+
         ellipse_area = int(np.sum(mask == 255))
         covered_pixels = int(np.sum((binary_image == 255) & (mask == 255)))
+
         if ellipse_area == 0:
-            return [0.0, 0.0, 0.0]
+            return ellipse_goodness
 
-        goodness = covered_pixels / float(ellipse_area)
-        axis1, axis2 = ellipse[1]
-        skew = min(axis2 / axis1, axis1 / axis2) if axis1 > 1e-6 and axis2 > 1e-6 else 0.0
-        return [goodness, 0.0, skew]
+        ellipse_goodness[0] = covered_pixels / ellipse_area
+        a0, a1 = ellipse[1]
+        if a0 == 0 or a1 == 0:
+            ellipse_goodness[2] = 0
+        else:
+            ellipse_goodness[2] = min(a1 / a0, a0 / a1)
+        return ellipse_goodness
 
-    @staticmethod
-    def find_line_intersection(ellipse1, ellipse2):
+    def update_and_average_point(self, point_list: List[Tuple[int, int]], new_point: Tuple[int, int], n: int):
+        point_list.append(new_point)
+        if len(point_list) > n:
+            point_list.pop(0)
+
+        if not point_list:
+            return None
+
+        avg_x = int(np.mean([p[0] for p in point_list]))
+        avg_y = int(np.mean([p[1] for p in point_list]))
+        return (avg_x, avg_y)
+
+    def find_line_intersection(self, ellipse1, ellipse2):
         (cx1, cy1), (_, minor_axis1), angle1 = ellipse1
         (cx2, cy2), (_, minor_axis2), angle2 = ellipse2
 
@@ -308,808 +383,1356 @@ class EyeTracker:
         dx1, dy1 = (minor_axis1 / 2) * np.cos(angle1_rad), (minor_axis1 / 2) * np.sin(angle1_rad)
         dx2, dy2 = (minor_axis2 / 2) * np.cos(angle2_rad), (minor_axis2 / 2) * np.sin(angle2_rad)
 
-        A = np.array([[dx1, -dx2], [dy1, -dy2]], dtype=np.float32)
-        B = np.array([cx2 - cx1, cy2 - cy1], dtype=np.float32)
+        A = np.array([[dx1, -dx2], [dy1, -dy2]], dtype=np.float64)
+        B = np.array([cx2 - cx1, cy2 - cy1], dtype=np.float64)
 
-        if abs(np.linalg.det(A)) < 1e-6:
+        det = np.linalg.det(A)
+        if abs(det) < 1e-8:
             return None
 
-        t1, _ = np.linalg.solve(A, B)
+        t1, t2 = np.linalg.solve(A, B)
         intersection_x = cx1 + t1 * dx1
         intersection_y = cy1 + t1 * dy1
         return (int(intersection_x), int(intersection_y))
 
-    def prune_intersections(self, maximum_intersections):
-        if len(self.stored_intersections) <= maximum_intersections:
-            return
-        self.stored_intersections = self.stored_intersections[-maximum_intersections:]
+    def prune_intersections(self, intersections: List[Tuple[int, int]], maximum_intersections: int):
+        if len(intersections) <= maximum_intersections:
+            return intersections
+        return intersections[-maximum_intersections:]
 
-    def update_and_average_point(self, point_list, new_point, N):
-        point_list.append(new_point)
-        if len(point_list) > N:
-            point_list.pop(0)
-        avg_x = int(np.mean([p[0] for p in point_list]))
-        avg_y = int(np.mean([p[1] for p in point_list]))
-        return (avg_x, avg_y)
-
-    def compute_average_intersection(self, frame, ray_lines, N=6, M=1500):
-        if len(ray_lines) < 2 or N < 2:
+    def compute_average_intersection(self, frame: np.ndarray, ray_lines, n: int, m: int, spacing: int):
+        if len(ray_lines) < 2 or n < 2:
             return None
 
         height, width = frame.shape[:2]
-        count = min(N, len(ray_lines))
-        idx = np.random.choice(len(ray_lines), size=count, replace=False)
-        selected_lines = [ray_lines[i] for i in idx]
+        selected_lines = list(ray_lines)[-min(n, len(ray_lines)):]
         intersections = []
 
         for i in range(len(selected_lines) - 1):
             line1 = selected_lines[i]
             line2 = selected_lines[i + 1]
+
             angle1 = line1[2]
             angle2 = line2[2]
-            if abs(angle1 - angle2) < 2:
-                continue
-            inter = self.find_line_intersection(line1, line2)
-            if inter and 0 <= inter[0] < width and 0 <= inter[1] < height:
-                intersections.append(inter)
-                self.stored_intersections.append(inter)
 
-        if len(self.stored_intersections) > M:
-            self.prune_intersections(M)
+            if abs(angle1 - angle2) >= 2:
+                intersection = self.find_line_intersection(line1, line2)
+                if intersection and (0 <= intersection[0] < width) and (0 <= intersection[1] < height):
+                    intersections.append(intersection)
+                    self.stored_intersections.append(intersection)
+
+        if len(self.stored_intersections) > m:
+            self.stored_intersections = self.prune_intersections(self.stored_intersections, m)
 
         if not self.stored_intersections:
             return None
 
         avg_x = np.mean([pt[0] for pt in self.stored_intersections])
         avg_y = np.mean([pt[1] for pt in self.stored_intersections])
+
         return (int(avg_x), int(avg_y))
 
-    # -------- Rastreamento de um frame --------
-    def process_frame(self, frame):
-        frame = self.crop_to_aspect_ratio(frame, EYE_W, EYE_H)
-        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    ###########################################################################
+    # Blink detection
+    ###########################################################################
+
+    def _compute_eye_aspect_ratio_mediapipe(self, frame_bgr: np.ndarray) -> Optional[float]:
+        if self.face_mesh is None:
+            return None
+
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        result = self.face_mesh.process(rgb)
+        if not result.multi_face_landmarks:
+            return None
+
+        lm = result.multi_face_landmarks[0].landmark
+        h, w = frame_bgr.shape[:2]
+
+        # Right eye approximate points
+        idx = {
+            "p1": 33, "p4": 133,
+            "p2": 160, "p6": 144,
+            "p3": 158, "p5": 153,
+        }
+
+        pts = {}
+        for k, i in idx.items():
+            pts[k] = np.array([lm[i].x * w, lm[i].y * h], dtype=np.float32)
+
+        horiz = np.linalg.norm(pts["p1"] - pts["p4"])
+        vert1 = np.linalg.norm(pts["p2"] - pts["p6"])
+        vert2 = np.linalg.norm(pts["p3"] - pts["p5"])
+
+        if horiz == 0:
+            return None
+        ear = (vert1 + vert2) / (2.0 * horiz)
+        return float(ear)
+
+    def _compute_darkness_closure_signal(self, gray_frame: np.ndarray) -> float:
+        """
+        Fallback simples: mede quanta textura escura/contraste existe na região central.
+        Quando o olho fecha, a região da pupila some e o sinal muda abruptamente.
+        """
+        h, w = gray_frame.shape[:2]
+        x1, x2 = int(w * 0.25), int(w * 0.75)
+        y1, y2 = int(h * 0.25), int(h * 0.75)
+        roi = gray_frame[y1:y2, x1:x2]
+        if roi.size == 0:
+            return 0.0
+
+        dark_pixels = np.sum(roi < 60)
+        grad_x = cv2.Sobel(roi, cv2.CV_32F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(roi, cv2.CV_32F, 0, 1, ksize=3)
+        mag = np.mean(np.sqrt(grad_x ** 2 + grad_y ** 2))
+        signal = float(dark_pixels / max(1, roi.size) + mag / 255.0)
+        return signal
+
+    def update_blink_state(self, frame_bgr: np.ndarray, ts: float) -> bool:
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        blink_now = False
+
+        ear = self._compute_eye_aspect_ratio_mediapipe(frame_bgr)
+        if ear is not None:
+            closed = ear < BLINK_EAR_THRESHOLD
+        else:
+            closure_signal = self._compute_darkness_closure_signal(gray)
+            # Heurística: se não há pupila detectada por vários frames, trata como fechamento
+            no_pupil = self.last_pupil_center is None
+            closed = no_pupil and closure_signal < 0.25
+
+        if closed:
+            self.closed_frame_counter += 1
+            self.open_frame_counter = 0
+        else:
+            self.open_frame_counter += 1
+            self.closed_frame_counter = 0
+
+        if not self.blink_closed and self.closed_frame_counter >= 2:
+            self.blink_closed = True
+            self.blink_start_ts = ts
+
+        if self.blink_closed and self.open_frame_counter >= 2:
+            duration = ts - self.blink_start_ts
+            self.blink_closed = False
+
+            if SINGLE_BLINK_MIN_DURATION <= duration <= SINGLE_BLINK_MAX_DURATION:
+                self.blink_count_window.append(ts)
+                self.blink_count_window = [b for b in self.blink_count_window if ts - b <= DOUBLE_BLINK_MAX_GAP]
+
+                if len(self.blink_count_window) >= 2:
+                    self.double_blink_flag = True
+                    self.single_blink_flag = False
+                    self.blink_count_window.clear()
+                else:
+                    self.single_blink_flag = True
+                blink_now = True
+
+        return blink_now
+
+    def consume_blink_actions(self) -> Tuple[bool, bool]:
+        dbl = self.double_blink_flag
+        sgl = self.single_blink_flag
+        self.double_blink_flag = False
+        self.single_blink_flag = False
+        return dbl, sgl
+
+    ###########################################################################
+    # Vetor de olhar
+    ###########################################################################
+
+    def compute_gaze_vector(
+        self, x: int, y: int, center_x: int, center_y: int,
+        screen_width: int = EYE_FRAME_W, screen_height: int = EYE_FRAME_H
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        viewport_width = screen_width
+        viewport_height = screen_height
+
+        fov_y_deg = 45.0
+        aspect_ratio = viewport_width / viewport_height
+        far_clip = 100.0
+        camera_position = np.array([0.0, 0.0, 3.0], dtype=np.float32)
+
+        fov_y_rad = np.radians(fov_y_deg)
+        half_height_far = np.tan(fov_y_rad / 2) * far_clip
+        half_width_far = half_height_far * aspect_ratio
+
+        ndc_x = (2.0 * x) / viewport_width - 1.0
+        ndc_y = 1.0 - (2.0 * y) / viewport_height
+
+        far_x = ndc_x * half_width_far
+        far_y = ndc_y * half_height_far
+        far_z = camera_position[2] - far_clip
+        far_point = np.array([far_x, far_y, far_z], dtype=np.float32)
+
+        ray_origin = camera_position
+        ray_direction = far_point - camera_position
+        norm = np.linalg.norm(ray_direction)
+        if norm == 0:
+            return None, None
+        ray_direction /= norm
+        ray_direction = -ray_direction
+
+        inner_radius = 1.0 / 1.05
+        sphere_offset_x = (center_x / screen_width) * 2.0 - 1.0
+        sphere_offset_y = 1.0 - (center_y / screen_height) * 2.0
+        sphere_center = np.array([sphere_offset_x * 1.5, sphere_offset_y * 1.5, 0.0], dtype=np.float32)
+
+        origin = ray_origin
+        direction = -ray_direction
+        L = origin - sphere_center
+
+        a = np.dot(direction, direction)
+        b = 2 * np.dot(direction, L)
+        c = np.dot(L, L) - inner_radius ** 2
+
+        discriminant = b ** 2 - 4 * a * c
+        if discriminant < 0:
+            return sphere_center, None
+
+        sqrt_disc = np.sqrt(discriminant)
+        t1 = (-b - sqrt_disc) / (2 * a)
+        t2 = (-b + sqrt_disc) / (2 * a)
+
+        t = None
+        if t1 > 0 and t2 > 0:
+            t = min(t1, t2)
+        elif t1 > 0:
+            t = t1
+        elif t2 > 0:
+            t = t2
+
+        if t is None:
+            return sphere_center, None
+
+        intersection_point = origin + t * direction
+        intersection_local = intersection_point - sphere_center
+        norm_local = np.linalg.norm(intersection_local)
+        if norm_local == 0:
+            return sphere_center, None
+        target_direction = intersection_local / norm_local
+        return sphere_center, target_direction
+
+    ###########################################################################
+    # Frame principal
+    ###########################################################################
+
+    def process_frame(self, frame_bgr: np.ndarray) -> Dict[str, object]:
+        """
+        Retorna:
+        {
+            'frame_debug': ...,
+            'pupil_center': (x,y) | None,
+            'eye_center': (x,y) | None,
+            'gaze_yaw_pitch': (yaw,pitch),
+            'blink_detected': bool,
+            'ellipse': ellipse | None,
+        }
+        """
+        ts = time.time()
+
+        frame = self.crop_to_aspect_ratio(frame_bgr, EYE_FRAME_W, EYE_FRAME_H)
+        frame = cv2.flip(frame, 0)
 
         darkest_point = self.get_darkest_area(frame)
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        blink_now = self.update_blink_state(frame, ts)
+
+        if darkest_point is None:
+            self.last_pupil_center = None
+            self.last_debug_frame = frame
+            return {
+                "frame_debug": frame,
+                "pupil_center": None,
+                "eye_center": self.last_eye_center,
+                "gaze_yaw_pitch": self.last_world_yaw_pitch,
+                "blink_detected": blink_now,
+                "ellipse": None,
+            }
+
         darkest_pixel_value = int(gray_frame[darkest_point[1], darkest_point[0]])
 
-        thresholded_strict = self.apply_binary_threshold(gray_frame, darkest_pixel_value, 5)
-        thresholded_strict = self.mask_outside_square(thresholded_strict, darkest_point, 250)
+        strict = self.apply_binary_threshold(gray_frame, darkest_pixel_value, PUPIL_DARK_THRESHOLD_OFFSET[0])
+        medium = self.apply_binary_threshold(gray_frame, darkest_pixel_value, PUPIL_DARK_THRESHOLD_OFFSET[1])
+        relaxed = self.apply_binary_threshold(gray_frame, darkest_pixel_value, PUPIL_DARK_THRESHOLD_OFFSET[2])
 
-        thresholded_medium = self.apply_binary_threshold(gray_frame, darkest_pixel_value, 15)
-        thresholded_medium = self.mask_outside_square(thresholded_medium, darkest_point, 250)
-
-        thresholded_relaxed = self.apply_binary_threshold(gray_frame, darkest_pixel_value, 25)
-        thresholded_relaxed = self.mask_outside_square(thresholded_relaxed, darkest_point, 250)
-
-        thresholds = [thresholded_relaxed, thresholded_medium, thresholded_strict]
-        best_score = 0.0
-        best_ellipse = None
-        best_contour = None
+        strict = self.mask_outside_square(strict, darkest_point, 250)
+        medium = self.mask_outside_square(medium, darkest_point, 250)
+        relaxed = self.mask_outside_square(relaxed, darkest_point, 250)
 
         kernel = np.ones((5, 5), np.uint8)
-        for th in thresholds:
-            dilated = cv2.dilate(th, kernel, iterations=2)
+        image_array = [relaxed, medium, strict]
+
+        final_image = None
+        final_contours = []
+        best_score = -1.0
+        best_ellipse = None
+        pupil_center = None
+
+        for img in image_array:
+            dilated = cv2.dilate(img, kernel, iterations=2)
             contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             reduced = self.filter_contours_by_area_and_return_largest(contours, 1000, 3)
-            if not reduced or reduced[0] is None or len(reduced[0]) < 5:
+
+            if not reduced or reduced[0] is None or len(reduced[0]) <= 5:
                 continue
 
-            contour = reduced[0]
-            ellipse_goodness = self.check_ellipse_goodness(dilated, contour)
-            contour_pixels = self.check_contour_pixels(contour, dilated.shape)
-            score = ellipse_goodness[0] * (contour_pixels[0] ** 2) * max(contour_pixels[1], 1e-6)
+            current_goodness = self.check_ellipse_goodness(dilated, reduced[0])
+            total_pixels = self.check_contour_pixels(reduced[0], dilated.shape[:2])
+
+            if len(total_pixels) < 3:
+                continue
+
+            score = current_goodness[0] * (total_pixels[0] ** 2) * max(1e-6, total_pixels[1])
 
             if score > best_score:
                 best_score = score
-                best_ellipse = cv2.fitEllipse(contour)
-                best_contour = contour
+                optimized = self.optimize_contours_by_angle(reduced, gray_frame)
+                if optimized is not None and len(optimized) >= 5:
+                    try:
+                        ellipse = cv2.fitEllipse(optimized)
+                    except cv2.error:
+                        ellipse = None
+                else:
+                    ellipse = None
 
-        debug = frame.copy()
-        pupil_valid = False
-        pupil_center = None
-        eye_center = self.prev_model_center_avg
+                if ellipse is not None:
+                    best_ellipse = ellipse
+                    final_contours = [optimized]
+                    final_image = dilated
+                    pupil_center = (int(ellipse[0][0]), int(ellipse[0][1]))
 
-        if best_contour is not None and len(best_contour) >= 5:
-            optimized = self.optimize_contours_by_angle([best_contour], gray_frame)
-            if optimized is not None and len(optimized) >= 5:
-                best_ellipse = cv2.fitEllipse(optimized)
-                self.ray_lines.append(best_ellipse)
-                if len(self.ray_lines) > self.max_rays:
-                    self.ray_lines = self.ray_lines[-self.max_rays:]
+        debug_frame = frame.copy()
+        eye_center = self.last_eye_center
 
-                model_center = self.compute_average_intersection(frame, self.ray_lines, N=6, M=1800)
+        if best_ellipse is not None and pupil_center is not None:
+            self.last_valid_ellipse = best_ellipse
+            self.ray_lines.append(best_ellipse)
+            if len(self.ray_lines) > self.max_rays:
+                self.ray_lines = self.ray_lines[-self.max_rays:]
+
+            model_center = self.compute_average_intersection(debug_frame, self.ray_lines, 5, 1500, 5)
+
+            if not self.center_locked:
                 if model_center is not None:
                     eye_center = self.update_and_average_point(self.model_centers, model_center, 200)
-                    self.prev_model_center_avg = eye_center
                 else:
                     eye_center = self.prev_model_center_avg
 
-                cx, cy = map(int, best_ellipse[0])
-                pupil_center = (cx, cy)
-                pupil_valid = True
+                if eye_center is not None and eye_center[0] != 0:
+                    self.prev_model_center_avg = eye_center
+                    self.locked_center = eye_center
+            else:
+                eye_center = self.locked_center
 
-                cv2.ellipse(debug, best_ellipse, (30, 255, 120), 2)
-                cv2.circle(debug, pupil_center, 4, (0, 255, 255), -1)
-                cv2.circle(debug, eye_center, 5, (255, 255, 0), -1)
-                cv2.line(debug, eye_center, pupil_center, (0, 200, 255), 2)
-                radius = int(max(20, min(220, np.linalg.norm(np.array(pupil_center) - np.array(eye_center)) * 2.2)))
-                cv2.circle(debug, eye_center, radius, (255, 80, 80), 1)
+            if eye_center is None:
+                eye_center = self.prev_model_center_avg
 
-        blink_event = self._update_blink_state(pupil_valid)
-        gaze_info = self._compute_gaze(pupil_center, eye_center, pupil_valid)
+            self.last_eye_center = eye_center
+            self.last_pupil_center = pupil_center
 
-        self.debug_last_ellipse = best_ellipse
-        self.debug_pupil_center = pupil_center
-        self.debug_eye_center = eye_center
-        self.debug_last_score = best_score
+            distance = math.sqrt((pupil_center[0] - eye_center[0]) ** 2 + (pupil_center[1] - eye_center[1]) ** 2)
+            self.max_observed_distance = max(self.max_observed_distance, min(230, distance))
 
-        self._draw_debug(debug, darkest_point, gaze_info, pupil_valid)
+            cv2.circle(debug_frame, eye_center, int(self.max_observed_distance), (255, 50, 50), 2)
+            cv2.circle(debug_frame, eye_center, 8, (255, 255, 0), -1)
+            cv2.line(debug_frame, eye_center, pupil_center, (255, 150, 50), 2)
+            cv2.ellipse(debug_frame, best_ellipse, (20, 255, 255), 2)
 
+            dx = pupil_center[0] - eye_center[0]
+            dy = pupil_center[1] - eye_center[1]
+            extended_x = int(eye_center[0] + 2 * dx)
+            extended_y = int(eye_center[1] + 2 * dy)
+            cv2.line(debug_frame, pupil_center, (extended_x, extended_y), (200, 255, 0), 3)
+
+            sphere_center, direction = self.compute_gaze_vector(
+                pupil_center[0], pupil_center[1], eye_center[0], eye_center[1]
+            )
+
+            if direction is not None:
+                self.last_vector = direction
+                yaw = float(np.degrees(np.arctan2(direction[0], max(1e-6, direction[2]))))
+                pitch = float(np.degrees(np.arctan2(direction[1], max(1e-6, direction[2]))))
+                self.last_world_yaw_pitch = (yaw, pitch)
+
+                cv2.putText(
+                    debug_frame,
+                    f"Yaw: {yaw:+.2f}  Pitch: {pitch:+.2f}",
+                    (10, EYE_FRAME_H - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 0),
+                    2
+                )
+        else:
+            self.last_pupil_center = None
+
+        if darkest_point is not None:
+            cv2.circle(debug_frame, darkest_point, 4, (255, 0, 255), -1)
+
+        self.last_debug_frame = debug_frame
         return {
-            "eye_frame": debug,
-            "pupil_valid": pupil_valid,
-            "pupil_center": pupil_center,
-            "eye_center": eye_center,
-            "screen_gaze": tuple(self.gaze_pt.astype(int)),
-            "raw_screen_gaze": tuple(self.raw_gaze_pt.astype(int)),
-            "blink_event": blink_event,
-            "score": best_score,
-            "darkest_point": darkest_point,
+            "frame_debug": debug_frame,
+            "pupil_center": self.last_pupil_center,
+            "eye_center": self.last_eye_center,
+            "gaze_yaw_pitch": self.last_world_yaw_pitch,
+            "blink_detected": blink_now,
+            "ellipse": best_ellipse,
         }
 
-    def _compute_gaze(self, pupil_center, eye_center, pupil_valid):
-        if not pupil_valid or pupil_center is None:
-            return {
-                "vector": np.array([0.0, 0.0], dtype=np.float32),
-                "relative": np.array([0.0, 0.0], dtype=np.float32),
-            }
+###############################################################################
+# PARTE 2 — SALA 3D
+###############################################################################
 
-        vec = np.array([
-            float(pupil_center[0] - eye_center[0]),
-            float(pupil_center[1] - eye_center[1]),
+class TextureManager:
+    def __init__(self) -> None:
+        self.textures: Dict[str, int] = {}
+
+    def load_texture(self, path: str) -> int:
+        if path in self.textures:
+            return self.textures[path]
+
+        if not os.path.exists(path):
+            surf = pygame.Surface((512, 512), pygame.SRCALPHA)
+            surf.fill((200, 200, 200, 255))
+            pygame.draw.rect(surf, (50, 50, 50), surf.get_rect(), 8)
+            pygame.font.init()
+            font = pygame.font.SysFont("Arial", 28)
+            txt = font.render("Imagem ausente", True, (30, 30, 30))
+            surf.blit(txt, (120, 235))
+        else:
+            surf = pygame.image.load(path).convert_alpha()
+
+        img_data = pygame.image.tostring(surf, "RGBA", True)
+        width, height = surf.get_width(), surf.get_height()
+
+        tex_id = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D, tex_id)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, img_data)
+        glBindTexture(GL_TEXTURE_2D, 0)
+
+        self.textures[path] = tex_id
+        return tex_id
+
+    def cleanup(self) -> None:
+        for tex in self.textures.values():
+            try:
+                glDeleteTextures([tex])
+            except Exception:
+                pass
+        self.textures.clear()
+
+class Camera3D:
+    def __init__(self) -> None:
+        self.base_pos = np.array([0.0, 1.5, 8.0], dtype=np.float32)
+        self.pos = self.base_pos.copy()
+        self.yaw = 0.0
+        self.pitch = 0.0
+        self.zoom_target = None
+        self.zoom_factor = 0.0
+        self.default_look = np.array([0.0, 1.5, 0.0], dtype=np.float32)
+
+    def update_from_gaze(self, gaze_yaw_pitch: Tuple[float, float]) -> None:
+        gaze_yaw, gaze_pitch = gaze_yaw_pitch
+
+        self.yaw = lerp(self.yaw, clamp(gaze_yaw * 1.6, -45, 45), 0.12)
+        self.pitch = lerp(self.pitch, clamp(-gaze_pitch * 1.2, -25, 20), 0.12)
+
+        if self.zoom_target is None:
+            self.zoom_factor = lerp(self.zoom_factor, 0.0, 0.1)
+
+    def set_zoom_target(self, point: Tuple[float, float, float]) -> None:
+        self.zoom_target = np.array(point, dtype=np.float32)
+
+    def zoom_in(self) -> None:
+        self.zoom_factor = clamp(self.zoom_factor + 0.20, 0.0, 1.0)
+
+    def zoom_out(self) -> None:
+        self.zoom_factor = clamp(self.zoom_factor - 0.22, 0.0, 1.0)
+        if self.zoom_factor <= 0.02:
+            self.zoom_target = None
+            self.zoom_factor = 0.0
+
+    def apply_view(self) -> None:
+        glMatrixMode(GL_MODELVIEW)
+        glLoadIdentity()
+
+        rad_yaw = math.radians(self.yaw)
+        rad_pitch = math.radians(self.pitch)
+
+        forward = np.array([
+            math.sin(rad_yaw) * math.cos(rad_pitch),
+            math.sin(rad_pitch),
+            -math.cos(rad_yaw) * math.cos(rad_pitch)
         ], dtype=np.float32)
 
-        if not self.has_calibration:
-            self.neutral_vector = vec.copy()
-            self.has_calibration = True
+        base_look = self.pos + forward * 5.0
 
-        relative = vec - self.neutral_vector
-        norm_x = relative[0] / 70.0
-        norm_y = relative[1] / 55.0
+        if self.zoom_target is not None:
+            target_cam = self.zoom_target - forward * 1.8 + np.array([0.0, 0.1, 0.0], dtype=np.float32)
+            self.pos = self.pos * (1.0 - 0.08 * (0.3 + self.zoom_factor)) + target_cam * (0.08 * (0.3 + self.zoom_factor))
+            look_at = self.zoom_target
+        else:
+            self.pos = self.pos * 0.92 + self.base_pos * 0.08
+            look_at = base_look
 
-        sx = self.screen_w * 0.5 + (norm_x * self.gain_x) * (self.screen_w * 0.5)
-        sy = self.screen_h * 0.5 + (norm_y * self.gain_y) * (self.screen_h * 0.45)
+        gluLookAt(
+            float(self.pos[0]), float(self.pos[1]), float(self.pos[2]),
+            float(look_at[0]), float(look_at[1]), float(look_at[2]),
+            0, 1, 0
+        )
 
-        sx = clamp(sx, 0, self.screen_w - 1)
-        sy = clamp(sy, 0, self.screen_h - 1)
+class GalleryRoom:
+    def __init__(self, paintings: List[PaintingInfo]) -> None:
+        self.paintings = paintings
+        self.texture_manager = TextureManager()
+        self.active_painting: Optional[PaintingInfo] = None
+        self.hover_painting: Optional[PaintingInfo] = None
+        self.hover_start: float = 0.0
+        self.selection_progress: float = 0.0
 
-        self.raw_gaze_pt = np.array([sx, sy], dtype=np.float32)
-        self.gaze_pt = (1.0 - self.smooth_alpha) * self.gaze_pt + self.smooth_alpha * self.raw_gaze_pt
-
-        return {
-            "vector": vec,
-            "relative": relative,
+        self.room_bounds = {
+            "xmin": -7.0, "xmax": 7.0,
+            "ymin": 0.0, "ymax": 4.2,
+            "zmin": -7.0, "zmax": 7.0,
         }
 
-    def _update_blink_state(self, pupil_valid):
-        event = None
-        if pupil_valid:
-            if self.closed_frames >= self.min_closed_frames and self.closed_frames <= self.max_closed_frames:
-                self.blinks_detected += 1
-                event = "blink"
-            self.closed_frames = 0
-            self.last_valid = True
-        else:
-            self.closed_frames += 1
-            self.last_valid = False
-        return event
+    def _draw_textured_quad_centered(self, center, size, texture_id, normal):
+        cx, cy, cz = center
+        w, h = size
+        hw, hh = w / 2.0, h / 2.0
+        nx, ny, nz = normal
 
-    def calibrate_center(self):
-        if self.debug_pupil_center is not None and self.debug_eye_center is not None:
-            vec = np.array([
-                float(self.debug_pupil_center[0] - self.debug_eye_center[0]),
-                float(self.debug_pupil_center[1] - self.debug_eye_center[1]),
-            ], dtype=np.float32)
-            self.neutral_vector = vec.copy()
-            self.has_calibration = True
+        glEnable(GL_TEXTURE_2D)
+        glBindTexture(GL_TEXTURE_2D, texture_id)
+        glColor3f(1.0, 1.0, 1.0)
+        glBegin(GL_QUADS)
 
-    def _draw_debug(self, debug, darkest_point, gaze_info, pupil_valid):
-        cv2.circle(debug, darkest_point, 6, (255, 80, 255), 1)
-        draw_text(debug, "C = calibrar centro", (10, 26), 0.62)
-        draw_text(debug, "Q = sair | R = gerar PDF", (10, 52), 0.62)
-        draw_text(debug, "1 piscada = afastar | 2 piscadas = zoom", (10, 78), 0.62)
-        draw_text(debug, f"Rastreio: {'OK' if pupil_valid else 'SEM PUPILA'}", (10, 104), 0.62, (60, 255, 60) if pupil_valid else (60, 60, 255))
-        draw_text(debug, f"Score elipse: {self.debug_last_score:.1f}", (10, 130), 0.62)
-        draw_text(debug, f"Olhar em tela: {int(self.gaze_pt[0])}, {int(self.gaze_pt[1])}", (10, 156), 0.62)
-        draw_text(debug, f"Vec relativo: {gaze_info['relative'][0]:.1f}, {gaze_info['relative'][1]:.1f}", (10, 182), 0.62)
+        if abs(nx) > 0.5:  # parede esquerda/direita
+            x = cx
+            glTexCoord2f(0, 0); glVertex3f(x, cy - hh, cz - hw)
+            glTexCoord2f(1, 0); glVertex3f(x, cy - hh, cz + hw)
+            glTexCoord2f(1, 1); glVertex3f(x, cy + hh, cz + hw)
+            glTexCoord2f(0, 1); glVertex3f(x, cy + hh, cz - hw)
+        else:  # parede frontal/fundo
+            z = cz
+            glTexCoord2f(0, 0); glVertex3f(cx - hw, cy - hh, z)
+            glTexCoord2f(1, 0); glVertex3f(cx + hw, cy - hh, z)
+            glTexCoord2f(1, 1); glVertex3f(cx + hw, cy + hh, z)
+            glTexCoord2f(0, 1); glVertex3f(cx - hw, cy + hh, z)
 
+        glEnd()
+        glBindTexture(GL_TEXTURE_2D, 0)
+        glDisable(GL_TEXTURE_2D)
 
-# ============================================================
-# SALA 3D
-# ============================================================
-class GalleryRoom:
-    def __init__(self, width=ROOM_W, height=ROOM_H):
-        self.width = width
-        self.height = height
-        self.cx = width / 2.0
-        self.cy = height / 2.0
-        self.focal_base = 720.0
-        self.zoom = 1.0
-        self.camera_offset = np.array([0.0, 0.0], dtype=np.float32)
-        self.target_camera_offset = np.array([0.0, 0.0], dtype=np.float32)
-        self.focus_pid: Optional[str] = None
-        self.focus_hold: float = 0.0
-        self.last_frame_time = now()
+    def draw_room(self) -> None:
+        # Chão
+        glColor3f(0.28, 0.28, 0.30)
+        glBegin(GL_QUADS)
+        glVertex3f(-7, 0, -7)
+        glVertex3f(7, 0, -7)
+        glVertex3f(7, 0, 7)
+        glVertex3f(-7, 0, 7)
+        glEnd()
 
-        self.paintings = self._build_paintings()
-        self.last_projected: Dict[str, np.ndarray] = {}
+        # Teto
+        glColor3f(0.18, 0.18, 0.20)
+        glBegin(GL_QUADS)
+        glVertex3f(-7, 4.2, -7)
+        glVertex3f(-7, 4.2, 7)
+        glVertex3f(7, 4.2, 7)
+        glVertex3f(7, 4.2, -7)
+        glEnd()
 
-    def _build_paintings(self):
-        return [
-            Painting(
-                pid="Q1",
-                title="Memória em Camadas",
-                author="Acervo Simulacro",
-                year="2026",
-                description="Composição digital sobre documentação museológica, textura, profundidade e preservação.",
-                wall="back",
-                center=(-2.4, 0.8, 10.8),
-                size=(2.1, 1.4),
-                color=(205, 120, 80),
-            ),
-            Painting(
-                pid="Q2",
-                title="Cartografia do Olhar",
-                author="Acervo Simulacro",
-                year="2026",
-                description="Quadro focado na ideia de visão guiada, campo de atenção e interação sem toque.",
-                wall="back",
-                center=(0.0, 0.6, 10.8),
-                size=(2.3, 1.5),
-                color=(90, 180, 220),
-            ),
-            Painting(
-                pid="Q3",
-                title="Profundidade e Vestígio",
-                author="Acervo Simulacro",
-                year="2026",
-                description="Experimento visual que simula leitura material, sombra e volume sobre o acervo.",
-                wall="back",
-                center=(2.5, 0.9, 10.8),
-                size=(2.0, 1.3),
-                color=(130, 90, 200),
-            ),
-            Painting(
-                pid="Q4",
-                title="Atlas do Patrimônio",
-                author="Acervo Simulacro",
-                year="2026",
-                description="Mapa visual de circulação de informação, autoria e conexão entre objetos culturais.",
-                wall="left",
-                center=(-5.4, 0.5, 7.5),
-                size=(2.2, 1.4),
-                color=(95, 155, 90),
-            ),
-            Painting(
-                pid="Q5",
-                title="Núcleo da Obra",
-                author="Acervo Simulacro",
-                year="2026",
-                description="Investigação sobre camadas documentais, ficha, imagem e análise em uma só visualização.",
-                wall="right",
-                center=(5.4, 0.4, 7.1),
-                size=(2.1, 1.4),
-                color=(220, 170, 70),
-            ),
-            Painting(
-                pid="Q6",
-                title="Arquivo Vivo",
-                author="Acervo Simulacro",
-                year="2026",
-                description="Quadro conceitual sobre reuso de dados, participação pública e inteligência de interface.",
-                wall="left",
-                center=(-5.4, -0.8, 9.3),
-                size=(2.0, 1.3),
-                color=(70, 180, 170),
-            ),
+        # Paredes
+        walls = [
+            ((-7, 0, -7), (-7, 4.2, -7), (-7, 4.2, 7), (-7, 0, 7), (0.52, 0.52, 0.56)),  # esquerda
+            ((7, 0, -7), (7, 0, 7), (7, 4.2, 7), (7, 4.2, -7), (0.50, 0.50, 0.54)),        # direita
+            ((-7, 0, -7), (7, 0, -7), (7, 4.2, -7), (-7, 4.2, -7), (0.58, 0.58, 0.62)),    # fundo
+            ((-7, 0, 7), (-7, 4.2, 7), (7, 4.2, 7), (7, 0, 7), (0.60, 0.60, 0.64)),         # frente
         ]
+        for p1, p2, p3, p4, color in walls:
+            glColor3f(*color)
+            glBegin(GL_QUADS)
+            glVertex3f(*p1)
+            glVertex3f(*p2)
+            glVertex3f(*p3)
+            glVertex3f(*p4)
+            glEnd()
 
-    def set_focus(self, pid: Optional[str]):
-        self.focus_pid = pid
-        if pid is None:
-            self.target_camera_offset[:] = 0.0
-            return
+    def draw_paintings(self) -> None:
+        for painting in self.paintings:
+            tex_id = self.texture_manager.load_texture(painting.file_path)
+            self._draw_textured_quad_centered(painting.center, painting.size, tex_id, painting.normal)
 
-        p = next((x for x in self.paintings if x.pid == pid), None)
-        if p is None:
-            self.target_camera_offset[:] = 0.0
-            return
+            # moldura
+            cx, cy, cz = painting.center
+            w, h = painting.size
+            border = 0.10
+            glColor3f(0.20, 0.12, 0.02)
+            self._draw_frame_border(cx, cy, cz, w + border, h + border, painting.normal)
 
-        # Move a câmera suavemente em direção ao quadro focado.
-        tx = -p.center[0] * 0.22
-        ty = -p.center[1] * 0.18
-        self.target_camera_offset = np.array([tx, ty], dtype=np.float32)
+            # destaque do hover
+            if self.hover_painting and self.hover_painting.title == painting.title:
+                glColor4f(1.0, 0.9, 0.2, 0.35)
+                self._draw_frame_border(cx, cy, cz, w + border + 0.05, h + border + 0.05, painting.normal)
 
-    def zoom_in(self):
-        self.zoom = min(2.3, self.zoom + 0.22)
+    def _draw_frame_border(self, cx, cy, cz, w, h, normal) -> None:
+        hw, hh = w / 2.0, h / 2.0
+        nx, ny, nz = normal
 
-    def zoom_out(self):
-        self.zoom = max(1.0, self.zoom - 0.20)
-        if self.zoom <= 1.02:
-            self.focus_pid = None
-            self.target_camera_offset[:] = 0.0
+        if abs(nx) > 0.5:
+            x = cx + (0.01 if nx > 0 else -0.01)
+            glBegin(GL_QUADS)
+            # topo
+            glVertex3f(x, cy + hh, cz - hw)
+            glVertex3f(x, cy + hh - 0.08, cz - hw)
+            glVertex3f(x, cy + hh - 0.08, cz + hw)
+            glVertex3f(x, cy + hh, cz + hw)
+            # base
+            glVertex3f(x, cy - hh + 0.08, cz - hw)
+            glVertex3f(x, cy - hh, cz - hw)
+            glVertex3f(x, cy - hh, cz + hw)
+            glVertex3f(x, cy - hh + 0.08, cz + hw)
+            # esquerda
+            glVertex3f(x, cy - hh, cz - hw)
+            glVertex3f(x, cy + hh, cz - hw)
+            glVertex3f(x, cy + hh, cz - hw + 0.08)
+            glVertex3f(x, cy - hh, cz - hw + 0.08)
+            # direita
+            glVertex3f(x, cy - hh, cz + hw - 0.08)
+            glVertex3f(x, cy + hh, cz + hw - 0.08)
+            glVertex3f(x, cy + hh, cz + hw)
+            glVertex3f(x, cy - hh, cz + hw)
+            glEnd()
+        else:
+            z = cz + (0.01 if nz > 0 else -0.01)
+            glBegin(GL_QUADS)
+            # topo
+            glVertex3f(cx - hw, cy + hh, z)
+            glVertex3f(cx - hw, cy + hh - 0.08, z)
+            glVertex3f(cx + hw, cy + hh - 0.08, z)
+            glVertex3f(cx + hw, cy + hh, z)
+            # base
+            glVertex3f(cx - hw, cy - hh + 0.08, z)
+            glVertex3f(cx - hw, cy - hh, z)
+            glVertex3f(cx + hw, cy - hh, z)
+            glVertex3f(cx + hw, cy - hh + 0.08, z)
+            # esquerda
+            glVertex3f(cx - hw, cy - hh, z)
+            glVertex3f(cx - hw, cy + hh, z)
+            glVertex3f(cx - hw + 0.08, cy + hh, z)
+            glVertex3f(cx - hw + 0.08, cy - hh, z)
+            # direita
+            glVertex3f(cx + hw - 0.08, cy - hh, z)
+            glVertex3f(cx + hw - 0.08, cy + hh, z)
+            glVertex3f(cx + hw, cy + hh, z)
+            glVertex3f(cx + hw, cy - hh, z)
+            glEnd()
 
-    def _project(self, point3d):
-        x, y, z = point3d
-        z = max(0.7, z)
-        f = self.focal_base * self.zoom
-        x = x + float(self.camera_offset[0])
-        y = y + float(self.camera_offset[1])
-        sx = self.cx + f * (x / z)
-        sy = self.cy - f * (y / z)
-        return np.array([sx, sy], dtype=np.float32)
+    def intersect_ray_with_room(self, ray_origin: np.ndarray, ray_dir: np.ndarray):
+        """
+        Retorna:
+        {
+            'point': np.ndarray,
+            'wall': 'left'|'right'|'front'|'back'|None
+        }
+        """
+        hits = []
 
-    def _quad_points(self, p: Painting, inset=0.0):
-        w, h = p.size
-        w = max(0.1, w - inset * 2)
-        h = max(0.1, h - inset * 2)
-        cx, cy, cz = p.center
+        # left x=-7
+        if abs(ray_dir[0]) > 1e-6:
+            t = (-7 - ray_origin[0]) / ray_dir[0]
+            if t > 0:
+                p = ray_origin + t * ray_dir
+                if 0 <= p[1] <= 4.2 and -7 <= p[2] <= 7:
+                    hits.append((t, p, "left"))
 
-        if p.wall == "back":
-            pts = [
-                (cx - w / 2, cy + h / 2, cz),
-                (cx + w / 2, cy + h / 2, cz),
-                (cx + w / 2, cy - h / 2, cz),
-                (cx - w / 2, cy - h / 2, cz),
-            ]
-        elif p.wall == "left":
-            pts = [
-                (cx, cy + h / 2, cz - w / 2),
-                (cx, cy + h / 2, cz + w / 2),
-                (cx, cy - h / 2, cz + w / 2),
-                (cx, cy - h / 2, cz - w / 2),
-            ]
-        else:  # right
-            pts = [
-                (cx, cy + h / 2, cz + w / 2),
-                (cx, cy + h / 2, cz - w / 2),
-                (cx, cy - h / 2, cz - w / 2),
-                (cx, cy - h / 2, cz + w / 2),
-            ]
-        return np.array([self._project(pt) for pt in pts], dtype=np.int32)
+            t = (7 - ray_origin[0]) / ray_dir[0]
+            if t > 0:
+                p = ray_origin + t * ray_dir
+                if 0 <= p[1] <= 4.2 and -7 <= p[2] <= 7:
+                    hits.append((t, p, "right"))
 
-    def _draw_room_shell(self, img):
-        back = np.array([
-            self._project((-6.0, 3.0, 12.0)),
-            self._project((6.0, 3.0, 12.0)),
-            self._project((6.0, -3.0, 12.0)),
-            self._project((-6.0, -3.0, 12.0)),
-        ], dtype=np.int32)
-        left = np.array([
-            self._project((-6.0, 3.0, 4.0)),
-            self._project((-6.0, 3.0, 12.0)),
-            self._project((-6.0, -3.0, 12.0)),
-            self._project((-6.0, -3.0, 4.0)),
-        ], dtype=np.int32)
-        right = np.array([
-            self._project((6.0, 3.0, 12.0)),
-            self._project((6.0, 3.0, 4.0)),
-            self._project((6.0, -3.0, 4.0)),
-            self._project((6.0, -3.0, 12.0)),
-        ], dtype=np.int32)
-        floor = np.array([
-            self._project((-6.0, -3.0, 4.0)),
-            self._project((6.0, -3.0, 4.0)),
-            self._project((6.0, -3.0, 12.0)),
-            self._project((-6.0, -3.0, 12.0)),
-        ], dtype=np.int32)
-        ceiling = np.array([
-            self._project((-6.0, 3.0, 12.0)),
-            self._project((6.0, 3.0, 12.0)),
-            self._project((6.0, 3.0, 4.0)),
-            self._project((-6.0, 3.0, 4.0)),
-        ], dtype=np.int32)
+        if abs(ray_dir[2]) > 1e-6:
+            t = (-7 - ray_origin[2]) / ray_dir[2]
+            if t > 0:
+                p = ray_origin + t * ray_dir
+                if -7 <= p[0] <= 7 and 0 <= p[1] <= 4.2:
+                    hits.append((t, p, "back"))
 
-        cv2.fillConvexPoly(img, left, (44, 44, 62))
-        cv2.fillConvexPoly(img, right, (38, 38, 54))
-        cv2.fillConvexPoly(img, back, (55, 55, 74))
-        cv2.fillConvexPoly(img, floor, (28, 26, 36))
-        cv2.fillConvexPoly(img, ceiling, (22, 22, 32))
+            t = (7 - ray_origin[2]) / ray_dir[2]
+            if t > 0:
+                p = ray_origin + t * ray_dir
+                if -7 <= p[0] <= 7 and 0 <= p[1] <= 4.2:
+                    hits.append((t, p, "front"))
 
-        # guias de perspectiva no chão
-        for gx in np.linspace(-5.0, 5.0, 9):
-            p1 = tuple(self._project((gx, -3.0, 4.0)).astype(int))
-            p2 = tuple(self._project((gx, -3.0, 12.0)).astype(int))
-            cv2.line(img, p1, p2, (52, 50, 70), 1, cv2.LINE_AA)
-        for gz in np.linspace(4.0, 12.0, 9):
-            p1 = tuple(self._project((-6.0, -3.0, gz)).astype(int))
-            p2 = tuple(self._project((6.0, -3.0, gz)).astype(int))
-            cv2.line(img, p1, p2, (52, 50, 70), 1, cv2.LINE_AA)
+        if not hits:
+            return {"point": None, "wall": None}
 
-    def _draw_painting(self, img, p: Painting, active=False, focused=False):
-        outer = self._quad_points(p, inset=0.0)
-        inner = self._quad_points(p, inset=0.10)
-        self.last_projected[p.pid] = inner.copy()
+        hits.sort(key=lambda x: x[0])
+        return {"point": hits[0][1], "wall": hits[0][2]}
 
-        border_color = (235, 235, 235) if active else (190, 190, 200)
-        if focused:
-            border_color = (50, 220, 255)
+    def ray_to_world(self, camera: Camera3D) -> Tuple[np.ndarray, np.ndarray]:
+        # gera um raio central da câmera
+        rad_yaw = math.radians(camera.yaw)
+        rad_pitch = math.radians(camera.pitch)
+        forward = np.array([
+            math.sin(rad_yaw) * math.cos(rad_pitch),
+            math.sin(rad_pitch),
+            -math.cos(rad_yaw) * math.cos(rad_pitch)
+        ], dtype=np.float32)
+        norm = np.linalg.norm(forward)
+        if norm == 0:
+            forward = np.array([0, 0, -1], dtype=np.float32)
+        else:
+            forward /= norm
+        return camera.pos.copy(), forward
 
-        cv2.fillConvexPoly(img, outer, (38, 30, 20))
-        cv2.fillConvexPoly(img, inner, p.color)
-        cv2.polylines(img, [outer], True, border_color, 3, cv2.LINE_AA)
-        cv2.polylines(img, [inner], True, (245, 245, 245), 1, cv2.LINE_AA)
+    def pick_painting(self, world_hit_point: Optional[np.ndarray], wall: Optional[str]) -> Optional[PaintingInfo]:
+        if world_hit_point is None or wall is None:
+            return None
 
-        center2d = np.mean(inner, axis=0).astype(int)
-        label_scale = max(0.4, min(0.72, 0.9 * self.zoom / max(1.0, p.center[2] / 8.0)))
-        draw_text(img, p.title[:22], (center2d[0] - 80, center2d[1]), label_scale, (255, 255, 255), 1, bg=False)
+        x, y, z = float(world_hit_point[0]), float(world_hit_point[1]), float(world_hit_point[2])
 
-        # brilho simples
-        gloss = inner.copy().astype(np.int32)
-        gloss[:, 0] = gloss[:, 0] - 10
-        gloss[:, 1] = gloss[:, 1] - 6
-        gloss[:, 0] = np.clip(gloss[:, 0], 0, self.width - 1)
-        gloss[:, 1] = np.clip(gloss[:, 1], 0, self.height - 1)
-        overlay = img.copy()
-        cv2.fillConvexPoly(overlay, gloss, (255, 255, 255))
-        cv2.addWeighted(overlay, 0.06, img, 0.94, 0, img)
-
-    def painting_under_gaze(self, gaze_pt: Tuple[int, int]) -> Optional[str]:
-        x, y = gaze_pt
-        for p in self.paintings:
-            quad = self.last_projected.get(p.pid)
-            if quad is None or len(quad) < 4:
+        for painting in self.paintings:
+            if painting.wall != wall:
                 continue
-            if cv2.pointPolygonTest(quad.astype(np.float32), (float(x), float(y)), False) >= 0:
-                return p.pid
+
+            cx, cy, cz = painting.center
+            w, h = painting.size
+
+            if wall in ("front", "back"):
+                if (cx - w/2) <= x <= (cx + w/2) and (cy - h/2) <= y <= (cy + h/2):
+                    return painting
+            elif wall in ("left", "right"):
+                if (cz - w/2) <= z <= (cz + w/2) and (cy - h/2) <= y <= (cy + h/2):
+                    return painting
         return None
 
-    def update_attention(self, active_pid: Optional[str], dt: float):
-        for p in self.paintings:
-            if p.pid == active_pid:
-                p.attention_seconds += dt
-                if now() - p.last_seen_ts > 0.25:
-                    p.hits += 1
-                p.last_seen_ts = now()
+    def update_gaze_selection(self, painting: Optional[PaintingInfo], now_ts: float) -> Optional[PaintingInfo]:
+        self.hover_painting = painting
 
-    def draw(self, gaze_pt: Tuple[int, int], info_pid: Optional[str], dwell_ratio: float):
-        current_time = now()
-        dt = current_time - self.last_frame_time
-        self.last_frame_time = current_time
+        if painting is None:
+            self.hover_start = 0.0
+            self.selection_progress = 0.0
+            return None
 
-        self.camera_offset = self.camera_offset * 0.88 + self.target_camera_offset * 0.12
+        if self.active_painting and painting.title == self.active_painting.title:
+            self.selection_progress = 1.0
+            return self.active_painting
 
-        img = np.zeros((self.height, self.width, 3), dtype=np.uint8)
-        self._draw_room_shell(img)
+        if self.hover_start == 0.0 or (self.hover_painting and self.active_painting and self.hover_painting.title != painting.title):
+            self.hover_start = now_ts
 
-        info_painting = None
-        active_painting = self.painting_under_gaze(gaze_pt)
-        if info_pid is not None:
-            info_painting = next((p for p in self.paintings if p.pid == info_pid), None)
-        if active_painting is None and self.focus_pid is not None:
-            active_painting = self.focus_pid
+        elapsed = now_ts - self.hover_start
+        self.selection_progress = clamp(elapsed / SELECTION_HOLD_SECONDS, 0.0, 1.0)
 
-        draw_order = sorted(self.paintings, key=lambda p: p.center[2], reverse=True)
-        for p in draw_order:
-            self._draw_painting(img, p, active=(p.pid == active_painting), focused=(p.pid == self.focus_pid))
+        if elapsed >= SELECTION_HOLD_SECONDS:
+            self.active_painting = painting
+            return painting
+        return None
 
-        self.update_attention(active_painting, dt)
+###############################################################################
+# PARTE 3 — HEATMAP E RELATÓRIO PDF
+###############################################################################
 
-        # cursor do olhar
-        gx, gy = gaze_pt
-        cv2.circle(img, (gx, gy), 12, (0, 0, 0), 2)
-        cv2.circle(img, (gx, gy), 8, (50, 220, 255), 2)
-        cv2.line(img, (gx - 18, gy), (gx + 18, gy), (50, 220, 255), 1)
-        cv2.line(img, (gx, gy - 18), (gx, gy + 18), (50, 220, 255), 1)
-
-        draw_text(img, "Olhe para um quadro para ver detalhes", (26, 32), 0.72)
-        draw_text(img, f"Zoom: {self.zoom:.2f}x", (26, 60), 0.72)
-
-        if active_painting is not None and dwell_ratio < 1.0:
-            draw_text(img, f"Fixando olhar... {int(dwell_ratio * 100)}%", (26, 90), 0.72, (255, 210, 80))
-
-        if info_painting is not None:
-            self._draw_info_panel(img, info_painting)
-
-        return img
-
-    def _draw_info_panel(self, img, p: Painting):
-        overlay = img.copy()
-        x1, y1 = self.width - 420, 40
-        x2, y2 = self.width - 30, 280
-        cv2.rectangle(overlay, (x1, y1), (x2, y2), (8, 8, 15), -1)
-        cv2.addWeighted(overlay, 0.82, img, 0.18, 0, img)
-        cv2.rectangle(img, (x1, y1), (x2, y2), (80, 220, 255), 2)
-
-        draw_text(img, p.title, (x1 + 16, y1 + 34), 0.82, (255, 255, 255), 2, bg=False)
-        draw_text(img, f"Autor: {p.author}", (x1 + 16, y1 + 68), 0.66, (220, 220, 220), 1, bg=False)
-        draw_text(img, f"Ano: {p.year}", (x1 + 16, y1 + 96), 0.66, (220, 220, 220), 1, bg=False)
-        draw_text(img, f"Parede: {p.wall}", (x1 + 16, y1 + 124), 0.66, (220, 220, 220), 1, bg=False)
-
-        lines = textwrap.wrap(p.description, width=43)
-        yy = y1 + 160
-        for line in lines[:4]:
-            draw_text(img, line, (x1 + 16, yy), 0.62, (235, 235, 235), 1, bg=False)
-            yy += 28
-
-
-# ============================================================
-# RELATÓRIO PDF
-# ============================================================
-class HeatmapReport:
-    def __init__(self, width=ROOM_W, height=ROOM_H):
+class HeatmapRecorder:
+    def __init__(self, width: int = HEATMAP_W, height: int = HEATMAP_H) -> None:
         self.width = width
         self.height = height
         self.map = np.zeros((height, width), dtype=np.float32)
-        self.last_room_frame = np.zeros((height, width, 3), dtype=np.uint8)
-        self.gaze_samples = 0
+        self.events: List[GazeEvent] = []
 
-    def add_gaze(self, gaze_pt: Tuple[int, int], valid=True):
-        if not valid:
+    def _wall_to_uv(self, wall: str, point: np.ndarray) -> Tuple[float, float]:
+        x, y, z = float(point[0]), float(point[1]), float(point[2])
+
+        if wall == "front":
+            u = (x + 7.0) / 14.0
+            v = 1.0 - (y / 4.2)
+            return u * 0.25 + 0.75, v * 0.5
+        if wall == "back":
+            u = (x + 7.0) / 14.0
+            v = 1.0 - (y / 4.2)
+            return u * 0.25 + 0.25, v * 0.5
+        if wall == "left":
+            u = (z + 7.0) / 14.0
+            v = 1.0 - (y / 4.2)
+            return u * 0.25 + 0.0, v * 0.5
+        if wall == "right":
+            u = (z + 7.0) / 14.0
+            v = 1.0 - (y / 4.2)
+            return u * 0.25 + 0.5, v * 0.5
+        return 0.5, 0.5
+
+    def add(self, event: GazeEvent) -> None:
+        self.events.append(event)
+        if event.wall_hit is None or event.world_hit is None:
             return
-        x, y = gaze_pt
-        if not (0 <= x < self.width and 0 <= y < self.height):
-            return
 
-        radius = 28
-        xs = max(0, x - radius)
-        xe = min(self.width, x + radius + 1)
-        ys = max(0, y - radius)
-        ye = min(self.height, y + radius + 1)
+        point = np.array(event.world_hit, dtype=np.float32)
+        u, v = self._wall_to_uv(event.wall_hit, point)
+        px = int(clamp(u, 0.0, 0.9999) * self.width)
+        py = int(clamp(v, 0.0, 0.9999) * self.height)
 
-        yy, xx = np.mgrid[ys:ye, xs:xe]
-        sigma = radius / 2.2
-        gauss = np.exp(-(((xx - x) ** 2 + (yy - y) ** 2) / (2 * sigma ** 2)))
-        self.map[ys:ye, xs:xe] += gauss.astype(np.float32)
-        self.gaze_samples += 1
+        self._draw_gaussian(px, py, radius=22, strength=1.2)
 
-    def update_room_frame(self, frame):
-        self.last_room_frame = frame.copy()
+    def _draw_gaussian(self, x: int, y: int, radius: int = 24, strength: float = 1.0) -> None:
+        xmin = max(0, x - radius)
+        xmax = min(self.width, x + radius + 1)
+        ymin = max(0, y - radius)
+        ymax = min(self.height, y + radius + 1)
 
-    def save_pdf(self, pdf_path: str, paintings: List[Painting], stats: SessionStats):
-        heat = self.map.copy()
-        if np.max(heat) > 0:
-            heat = heat / np.max(heat)
+        xs = np.arange(xmin, xmax) - x
+        ys = np.arange(ymin, ymax) - y
+        xx, yy = np.meshgrid(xs, ys)
+        kernel = np.exp(-(xx**2 + yy**2) / (2 * (radius / 2.2) ** 2)) * strength
+        self.map[ymin:ymax, xmin:xmax] += kernel.astype(np.float32)
 
-        rgb_room = cv2.cvtColor(self.last_room_frame, cv2.COLOR_BGR2RGB)
+    def save_csv(self, csv_path: str) -> None:
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "timestamp", "wall_hit", "painting_title",
+                "world_hit_x", "world_hit_y", "world_hit_z",
+                "room_u", "room_v",
+                "pupil_x", "pupil_y",
+                "eye_x", "eye_y",
+                "blink_state", "action"
+            ])
+            for e in self.events:
+                wx, wy, wz = (e.world_hit if e.world_hit else (None, None, None))
+                ru, rv = (e.room_uv if e.room_uv else (None, None))
+                px, py = (e.pupil_center if e.pupil_center else (None, None))
+                ex, ey = (e.eye_center if e.eye_center else (None, None))
+                writer.writerow([
+                    e.timestamp, e.wall_hit, e.painting_title,
+                    wx, wy, wz, ru, rv, px, py, ex, ey, int(e.blink_state), e.action
+                ])
+
+    def generate_report(self, pdf_path: str, screenshots: List[np.ndarray], paintings: List[PaintingInfo]) -> None:
+        total_fixations = len([e for e in self.events if e.painting_title])
+        unique_paintings = sorted({e.painting_title for e in self.events if e.painting_title})
+        action_counts = {}
+        for e in self.events:
+            if e.action:
+                action_counts[e.action] = action_counts.get(e.action, 0) + 1
 
         with PdfPages(pdf_path) as pdf:
-            # Página 1: resumo
+            # Página 1 - Resumo
             fig = plt.figure(figsize=(11.69, 8.27))
-            fig.patch.set_facecolor("white")
-            plt.axis("off")
-            plt.text(0.03, 0.92, "Relatório de Mapa de Calor - Simulacro", fontsize=22, weight="bold")
-            plt.text(0.03, 0.86, f"Duração da sessão: {stats.duration():.1f} s", fontsize=13)
-            plt.text(0.03, 0.82, f"Frames totais: {stats.total_frames}", fontsize=13)
-            plt.text(0.03, 0.78, f"Frames com pupila rastreada: {stats.tracked_frames}", fontsize=13)
-            plt.text(0.03, 0.74, f"Piscadas simples (afastar): {stats.blink_single}", fontsize=13)
-            plt.text(0.03, 0.70, f"Piscadas duplas (zoom): {stats.blink_double}", fontsize=13)
-            plt.text(0.03, 0.66, f"Mudanças de zoom: {stats.zoom_changes}", fontsize=13)
-            plt.text(0.03, 0.60, f"Amostras de olhar acumuladas: {self.gaze_samples}", fontsize=13)
-            plt.text(
-                0.03,
-                0.51,
-                "O relatório mostra onde o olhar permaneceu com maior intensidade na sala 3D e\n"
-                "quanto tempo cada quadro recebeu de atenção. Áreas em vermelho representam\n"
-                "maior concentração do olhar.",
-                fontsize=13,
+            fig.suptitle("Relatório de Rastreamento Ocular - Sala 3D", fontsize=18, fontweight="bold")
+            ax = fig.add_axes([0.06, 0.10, 0.88, 0.80])
+            ax.axis("off")
+
+            summary_text = (
+                f"Data/Hora: {now_str()}\n\n"
+                f"Eventos registrados: {len(self.events)}\n"
+                f"Fixações em quadros: {total_fixations}\n"
+                f"Quadros observados: {len(unique_paintings)}\n"
+                f"Quadros distintos: {', '.join(unique_paintings) if unique_paintings else 'Nenhum'}\n\n"
+                f"Ações:\n"
+                f"- zoom_in: {action_counts.get('zoom_in', 0)}\n"
+                f"- zoom_out: {action_counts.get('zoom_out', 0)}\n"
+                f"- info_select: {action_counts.get('info_select', 0)}\n"
             )
-            pdf.savefig(fig, bbox_inches="tight")
+            ax.text(0.02, 0.95, summary_text, va="top", fontsize=13)
+            pdf.savefig(fig, dpi=180)
             plt.close(fig)
 
-            # Página 2: heatmap sobre a sala
-            fig = plt.figure(figsize=(13, 7.3))
-            plt.imshow(rgb_room)
-            plt.imshow(heat, cmap="jet", alpha=np.clip(heat * 0.85, 0, 0.85))
-            plt.title("Mapa de calor do olhar sobre a sala 3D", fontsize=18)
-            plt.axis("off")
-            pdf.savefig(fig, bbox_inches="tight")
+            # Página 2 - Heatmap
+            fig = plt.figure(figsize=(11.69, 8.27))
+            fig.suptitle("Mapa de Calor do Olhar", fontsize=18, fontweight="bold")
+            ax = fig.add_axes([0.05, 0.08, 0.90, 0.80])
+            heat = self.map.copy()
+            if np.max(heat) > 0:
+                heat = heat / np.max(heat)
+
+            ax.imshow(heat, cmap="inferno")
+            ax.set_title("Distribuição espacial das fixações")
+            ax.set_axis_off()
+            pdf.savefig(fig, dpi=180)
             plt.close(fig)
 
-            # Página 3: barras por quadro
-            titles = [p.title for p in paintings]
-            attention = [p.attention_seconds for p in paintings]
-            hits = [p.hits for p in paintings]
+            # Página 3 - Top quadros
+            counts = {}
+            for e in self.events:
+                if e.painting_title:
+                    counts[e.painting_title] = counts.get(e.painting_title, 0) + 1
 
-            fig = plt.figure(figsize=(12, 8))
-            ax1 = fig.add_subplot(211)
-            ax1.bar(titles, attention)
-            ax1.set_title("Tempo de atenção por quadro (segundos)")
-            ax1.set_ylabel("segundos")
-            ax1.tick_params(axis="x", rotation=25)
+            titles = list(counts.keys())
+            values = list(counts.values())
 
-            ax2 = fig.add_subplot(212)
-            ax2.bar(titles, hits)
-            ax2.set_title("Número de ativações por quadro")
-            ax2.set_ylabel("ativações")
-            ax2.tick_params(axis="x", rotation=25)
-            plt.tight_layout()
-            pdf.savefig(fig, bbox_inches="tight")
+            fig = plt.figure(figsize=(11.69, 8.27))
+            fig.suptitle("Quadros Mais Observados", fontsize=18, fontweight="bold")
+            ax = fig.add_axes([0.08, 0.13, 0.84, 0.72])
+            if titles:
+                ax.bar(titles, values)
+                ax.set_ylabel("Eventos/fixações")
+                ax.tick_params(axis="x", rotation=25)
+            else:
+                ax.text(0.5, 0.5, "Sem dados suficientes", ha="center", va="center", fontsize=16)
+                ax.set_axis_off()
+            pdf.savefig(fig, dpi=180)
             plt.close(fig)
 
-            # Página 4: tabela-resumo
-            fig = plt.figure(figsize=(12, 8))
-            plt.axis("off")
-            rows = [[p.pid, p.title, p.author, p.year, f"{p.attention_seconds:.1f}", p.hits] for p in paintings]
-            table = plt.table(
-                cellText=rows,
-                colLabels=["ID", "Quadro", "Autor", "Ano", "Tempo (s)", "Ativações"],
-                cellLoc="left",
-                loc="center",
+            # Páginas com screenshots
+            for idx, shot in enumerate(screenshots[:6], start=1):
+                fig = plt.figure(figsize=(11.69, 8.27))
+                fig.suptitle(f"Captura da Sessão #{idx}", fontsize=18, fontweight="bold")
+                ax = fig.add_axes([0.04, 0.05, 0.92, 0.84])
+                ax.imshow(cv2.cvtColor(shot, cv2.COLOR_BGR2RGB))
+                ax.set_axis_off()
+                pdf.savefig(fig, dpi=180)
+                plt.close(fig)
+
+            # Páginas com metadados dos quadros
+            for painting in paintings:
+                fig = plt.figure(figsize=(11.69, 8.27))
+                fig.suptitle(f"Ficha do Quadro - {painting.title}", fontsize=18, fontweight="bold")
+                ax = fig.add_axes([0.05, 0.08, 0.90, 0.80])
+                ax.axis("off")
+
+                text = (
+                    f"Título: {painting.title}\n"
+                    f"Artista: {painting.artist}\n"
+                    f"Ano: {painting.year}\n"
+                    f"Parede: {painting.wall}\n"
+                    f"Centro 3D: {painting.center}\n\n"
+                    f"Descrição:\n{painting.description}\n"
+                )
+                ax.text(0.03, 0.95, text, va="top", fontsize=13)
+                pdf.savefig(fig, dpi=180)
+                plt.close(fig)
+
+###############################################################################
+# PARTE 4 — HUD / OVERLAY
+###############################################################################
+
+def draw_cv_overlay(frame: np.ndarray, texts: List[str], x: int = 10, y: int = 25) -> np.ndarray:
+    out = frame.copy()
+    yy = y
+    for txt in texts:
+        cv2.putText(out, txt, (x+1, yy+1), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 3)
+        cv2.putText(out, txt, (x, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+        yy += 28
+    return out
+
+def build_info_card_surface(painting: Optional[PaintingInfo], progress: float, zoom_factor: float) -> pygame.Surface:
+    width, height = 520, 240
+    surf = pygame.Surface((width, height), pygame.SRCALPHA)
+    surf.fill((18, 18, 22, 220))
+    pygame.draw.rect(surf, (240, 240, 240, 180), (0, 0, width-1, height-1), 2, border_radius=14)
+
+    pygame.font.init()
+    title_font = pygame.font.SysFont("Arial", 28, bold=True)
+    font = pygame.font.SysFont("Arial", 22)
+    small = pygame.font.SysFont("Arial", 18)
+
+    if painting is None:
+        title = title_font.render("Olhe para um quadro", True, (255, 255, 255))
+        surf.blit(title, (22, 18))
+        lines = [
+            "Fixe o olhar para abrir as informações.",
+            "Duas piscadas rápidas: zoom.",
+            "Uma piscada: afasta o zoom.",
+            f"Progresso de seleção: {int(progress * 100)}%",
+            f"Zoom atual: {zoom_factor:.2f}",
+        ]
+        yy = 68
+        for line in lines:
+            t = font.render(line, True, (220, 220, 220))
+            surf.blit(t, (22, yy))
+            yy += 32
+        return surf
+
+    title = title_font.render(painting.title, True, (255, 255, 255))
+    meta = font.render(f"{painting.artist} • {painting.year}", True, (225, 225, 225))
+    desc_lines = wrap_text(painting.description, 56)
+
+    surf.blit(title, (22, 18))
+    surf.blit(meta, (22, 58))
+
+    yy = 96
+    for line in desc_lines[:4]:
+        t = small.render(line, True, (210, 210, 210))
+        surf.blit(t, (22, yy))
+        yy += 24
+
+    footer = small.render(
+        f"Parede: {painting.wall} | Progresso: {int(progress * 100)}% | Zoom: {zoom_factor:.2f}",
+        True,
+        (255, 220, 120),
+    )
+    surf.blit(footer, (22, height - 34))
+    return surf
+
+def wrap_text(text: str, max_chars: int) -> List[str]:
+    words = text.split()
+    lines = []
+    current = []
+    current_len = 0
+
+    for word in words:
+        extra = len(word) + (1 if current else 0)
+        if current_len + extra <= max_chars:
+            current.append(word)
+            current_len += extra
+        else:
+            lines.append(" ".join(current))
+            current = [word]
+            current_len = len(word)
+
+    if current:
+        lines.append(" ".join(current))
+    return lines
+
+def draw_pygame_surface_as_overlay(surface: pygame.Surface, x: int, y: int) -> None:
+    data = pygame.image.tostring(surface, "RGBA", True)
+    glDisable(GL_DEPTH_TEST)
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    glWindowPos2d(x, y)
+    glDrawPixels(surface.get_width(), surface.get_height(), GL_RGBA, GL_UNSIGNED_BYTE, data)
+    glDisable(GL_BLEND)
+    glEnable(GL_DEPTH_TEST)
+
+###############################################################################
+# PARTE 5 — APP PRINCIPAL
+###############################################################################
+
+class EyeGallery3DApp:
+    def __init__(self) -> None:
+        ensure_dirs()
+
+        self.paintings = self._build_default_paintings()
+        self.gallery = GalleryRoom(self.paintings)
+        self.eye_tracker = EyeTrackerEllipse()
+        self.heatmap = HeatmapRecorder()
+        self.camera = Camera3D()
+
+        self.eye_cap = None
+        self.running = True
+        self.screenshots: List[np.ndarray] = []
+        self.last_shot_ts = 0.0
+
+        self.csv_path = os.path.join(EXPORT_DIR, f"gaze_events_{now_str()}.csv")
+        self.pdf_path = os.path.join(REPORT_DIR, f"relatorio_heatmap_{now_str()}.pdf")
+
+        self.info_card_surface = None
+        self.status_text = "Iniciando..."
+        self.last_selected_title = None
+
+    def _build_default_paintings(self) -> List[PaintingInfo]:
+        """
+        Você pode trocar os caminhos pelos seus arquivos reais.
+        """
+        return [
+            PaintingInfo(
+                title="Abstração Vermelha",
+                artist="Coleção Digital",
+                year="2026",
+                description="Composição abstrata com ênfase em movimento, calor cromático e ritmo visual.",
+                file_path=os.path.join(TEXTURE_DIR, "quadro_01.jpg"),
+                wall="back",
+                center=(-4.0, 2.0, -6.96),
+                size=(2.3, 1.5),
+                normal=(0.0, 0.0, 1.0),
+            ),
+            PaintingInfo(
+                title="Geometria Azul",
+                artist="Coleção Digital",
+                year="2026",
+                description="Estudo geométrico com contraste entre planos frios, profundidade e simetria estrutural.",
+                file_path=os.path.join(TEXTURE_DIR, "quadro_02.jpg"),
+                wall="back",
+                center=(0.0, 2.0, -6.96),
+                size=(2.3, 1.5),
+                normal=(0.0, 0.0, 1.0),
+            ),
+            PaintingInfo(
+                title="Paisagem Sintética",
+                artist="Coleção Digital",
+                year="2026",
+                description="Paisagem generativa que mistura horizonte digital, névoa volumétrica e relevo artificial.",
+                file_path=os.path.join(TEXTURE_DIR, "quadro_03.jpg"),
+                wall="back",
+                center=(4.0, 2.0, -6.96),
+                size=(2.3, 1.5),
+                normal=(0.0, 0.0, 1.0),
+            ),
+            PaintingInfo(
+                title="Ritmo Urbano",
+                artist="Coleção Digital",
+                year="2026",
+                description="Cena urbana fragmentada em módulos visuais, com leitura dinâmica e pulsação arquitetônica.",
+                file_path=os.path.join(TEXTURE_DIR, "quadro_04.jpg"),
+                wall="left",
+                center=(-6.96, 2.0, -2.8),
+                size=(2.0, 1.4),
+                normal=(1.0, 0.0, 0.0),
+            ),
+            PaintingInfo(
+                title="Figura e Luz",
+                artist="Coleção Digital",
+                year="2026",
+                description="Estudo figurativo com foco em sombras suaves, presença corporal e contraste dramático.",
+                file_path=os.path.join(TEXTURE_DIR, "quadro_05.jpg"),
+                wall="left",
+                center=(-6.96, 2.0, 2.8),
+                size=(2.0, 1.4),
+                normal=(1.0, 0.0, 0.0),
+            ),
+            PaintingInfo(
+                title="Memória Verde",
+                artist="Coleção Digital",
+                year="2026",
+                description="Campo cromático orgânico com textura respirável, evocando natureza, tempo e sedimentação.",
+                file_path=os.path.join(TEXTURE_DIR, "quadro_06.jpg"),
+                wall="right",
+                center=(6.96, 2.0, -2.8),
+                size=(2.0, 1.4),
+                normal=(-1.0, 0.0, 0.0),
+            ),
+            PaintingInfo(
+                title="Topologia Dourada",
+                artist="Coleção Digital",
+                year="2026",
+                description="Estruturas douradas em fluxo contínuo, explorando materialidade, brilho e organização espacial.",
+                file_path=os.path.join(TEXTURE_DIR, "quadro_07.jpg"),
+                wall="right",
+                center=(6.96, 2.0, 2.8),
+                size=(2.0, 1.4),
+                normal=(-1.0, 0.0, 0.0),
+            ),
+            PaintingInfo(
+                title="Vórtice de Dados",
+                artist="Coleção Digital",
+                year="2026",
+                description="Visualização poética de dados em espiral, sugerindo densidade, aceleração e análise informacional.",
+                file_path=os.path.join(TEXTURE_DIR, "quadro_08.jpg"),
+                wall="front",
+                center=(0.0, 2.0, 6.96),
+                size=(2.5, 1.6),
+                normal=(0.0, 0.0, -1.0),
+            ),
+        ]
+
+    def init_cameras(self, eye_index: int = 0) -> None:
+        self.eye_cap = cv2.VideoCapture(eye_index)
+        self.eye_cap.set(cv2.CAP_PROP_FRAME_WIDTH, EYE_FRAME_W)
+        self.eye_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, EYE_FRAME_H)
+
+        if not self.eye_cap.isOpened():
+            raise RuntimeError(
+                "Não foi possível abrir a câmera do olho. "
+                "Troque o índice em init_cameras() ou conecte a câmera correta."
             )
-            table.auto_set_font_size(False)
-            table.set_fontsize(10)
-            table.scale(1, 1.7)
-            plt.title("Resumo por quadro", fontsize=18, pad=20)
-            pdf.savefig(fig, bbox_inches="tight")
-            plt.close(fig)
 
+    def init_opengl(self) -> None:
+        if not OPENGL_AVAILABLE:
+            raise RuntimeError("PyOpenGL não está instalado ou não está disponível no ambiente.")
 
-# ============================================================
-# APLICAÇÃO PRINCIPAL
-# ============================================================
-class SimulacroApp:
-    def __init__(self, camera_index=0):
-        self.camera_index = camera_index
-        self.eye_tracker = EyeTracker(ROOM_W, ROOM_H)
-        self.gallery = GalleryRoom(ROOM_W, ROOM_H)
-        self.report = HeatmapReport(ROOM_W, ROOM_H)
-        self.blink_interpreter = BlinkInterpreter(double_window=0.43)
-        self.stats = SessionStats()
+        pygame.init()
+        pygame.display.set_mode((WINDOW_W, WINDOW_H), DOUBLEBUF | OPENGL)
+        pygame.display.set_caption("Sala 3D com Rastreamento Ocular")
+        glViewport(0, 0, WINDOW_W, WINDOW_H)
+        glMatrixMode(GL_PROJECTION)
+        glLoadIdentity()
+        gluPerspective(60.0, WINDOW_W / WINDOW_H, 0.1, 100.0)
+        glMatrixMode(GL_MODELVIEW)
 
-        self.last_pid: Optional[str] = None
-        self.pid_hold_start: Optional[float] = None
-        self.info_pid: Optional[str] = None
-        self.dwell_time = 0.75
-        self.last_report_message = ""
-        self.manual_help = True
+        glEnable(GL_DEPTH_TEST)
+        glClearColor(0.05, 0.05, 0.07, 1.0)
 
-    def open_camera(self):
-        cap = cv2.VideoCapture(self.camera_index, cv2.CAP_MSMF)
-        if not cap.isOpened():
-            cap = cv2.VideoCapture(self.camera_index)
-        return cap
+    def process_eye_camera(self) -> Dict[str, object]:
+        ret, frame = self.eye_cap.read()
+        if not ret:
+            return {
+                "frame_debug": np.zeros((EYE_FRAME_H, EYE_FRAME_W, 3), dtype=np.uint8),
+                "pupil_center": None,
+                "eye_center": None,
+                "gaze_yaw_pitch": (0.0, 0.0),
+                "blink_detected": False,
+                "ellipse": None,
+            }
 
-    def generate_report(self):
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        pdf_path = f"simulacro_relatorio_{ts}.pdf"
-        self.report.save_pdf(pdf_path, self.gallery.paintings, self.stats)
-        self.stats.report_path = pdf_path
-        self.last_report_message = f"PDF salvo em: {pdf_path}"
-        return pdf_path
+        result = self.eye_tracker.process_frame(frame)
+        return result
 
-    def _handle_blink_logic(self, blink_event, active_pid):
-        if blink_event == "blink":
-            result = self.blink_interpreter.register_blink()
-            if result == "double":
-                self.gallery.zoom_in()
-                self.stats.zoom_changes += 1
-                self.stats.blink_double += 1
-                if active_pid is not None:
-                    self.gallery.set_focus(active_pid)
-            return
+    def update_logic(self, eye_result: Dict[str, object]) -> None:
+        gaze_yaw_pitch = eye_result["gaze_yaw_pitch"]
+        pupil_center = eye_result["pupil_center"]
+        eye_center = eye_result["eye_center"]
+        blink_state = bool(self.eye_tracker.blink_closed)
 
-        pending = self.blink_interpreter.update()
-        if pending == "single":
-            self.gallery.zoom_out()
-            self.stats.zoom_changes += 1
-            self.stats.blink_single += 1
-            if self.gallery.zoom <= 1.05:
-                self.gallery.set_focus(None)
+        self.camera.update_from_gaze(gaze_yaw_pitch)
 
-    def _update_dwell(self, active_pid: Optional[str]):
-        t = now()
-        dwell_ratio = 0.0
-        if active_pid is None:
-            self.last_pid = None
-            self.pid_hold_start = None
-            self.info_pid = None if self.gallery.zoom <= 1.03 else self.gallery.focus_pid
-            return dwell_ratio
+        ray_origin, ray_dir = self.gallery.ray_to_world(self.camera)
+        hit = self.gallery.intersect_ray_with_room(ray_origin, ray_dir)
+        hit_point = hit["point"]
+        hit_wall = hit["wall"]
 
-        if self.last_pid != active_pid:
-            self.last_pid = active_pid
-            self.pid_hold_start = t
-            self.info_pid = None
-            return 0.0
+        hovered = self.gallery.pick_painting(hit_point, hit_wall)
+        selected = self.gallery.update_gaze_selection(hovered, time.time())
 
-        if self.pid_hold_start is None:
-            self.pid_hold_start = t
-            return 0.0
+        action = None
+        if selected is not None and self.last_selected_title != selected.title:
+            self.last_selected_title = selected.title
+            action = "info_select"
+            self.camera.set_zoom_target(selected.center)
+            self.status_text = f"Quadro selecionado: {selected.title}"
+        elif selected is None and hovered is None:
+            self.last_selected_title = None
 
-        elapsed = t - self.pid_hold_start
-        dwell_ratio = min(1.0, elapsed / self.dwell_time)
-        if elapsed >= self.dwell_time:
-            self.info_pid = active_pid
-        return dwell_ratio
+        dbl, sgl = self.eye_tracker.consume_blink_actions()
 
-    def _draw_status_overlay(self, room_frame):
-        y = ROOM_H - 88
-        draw_text(room_frame, "Comandos: C calibrar | R gerar PDF | Q sair", (24, y), 0.66)
-        draw_text(room_frame, "Olhe fixamente para um quadro para abrir as informações", (24, y + 28), 0.66)
-        if self.last_report_message:
-            draw_text(room_frame, self.last_report_message, (24, y - 28), 0.66, (80, 255, 120))
+        if dbl and self.gallery.active_painting is not None:
+            self.camera.set_zoom_target(self.gallery.active_painting.center)
+            self.camera.zoom_in()
+            self.status_text = f"Zoom in: {self.gallery.active_painting.title}"
+            action = "zoom_in"
 
-    def run(self):
-        cap = self.open_camera()
-        if not cap.isOpened():
-            raise RuntimeError("Não foi possível abrir a câmera. Verifique o índice ou o dispositivo.")
+        if sgl:
+            self.camera.zoom_out()
+            self.status_text = "Zoom out"
+            action = "zoom_out"
 
-        cv2.namedWindow(WINDOW_EYE, cv2.WINDOW_NORMAL)
-        cv2.namedWindow(WINDOW_ROOM, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(WINDOW_EYE, 920, 690)
-        cv2.resizeWindow(WINDOW_ROOM, 1280, 720)
+        room_uv = None
+        if hit_point is not None and hit_wall is not None:
+            room_uv = self.heatmap._wall_to_uv(hit_wall, hit_point)
 
-        prev_time = now()
+        event = GazeEvent(
+            timestamp=time.time(),
+            wall_hit=hit_wall,
+            painting_title=(hovered.title if hovered else None),
+            world_hit=(tuple(map(float, hit_point)) if hit_point is not None else None),
+            room_uv=room_uv,
+            pupil_center=pupil_center,
+            eye_center=eye_center,
+            blink_state=blink_state,
+            action=action,
+        )
+        self.heatmap.add(event)
 
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
+        if time.time() - self.last_shot_ts > 6.0:
+            shot = eye_result["frame_debug"]
+            if isinstance(shot, np.ndarray):
+                self.screenshots.append(shot.copy())
+            self.last_shot_ts = time.time()
 
-            self.stats.total_frames += 1
+        # Preview auxiliar com mira
+        debug = eye_result["frame_debug"].copy()
+        texts = [
+            f"Status: {self.status_text}",
+            f"Quadro em foco: {hovered.title if hovered else 'nenhum'}",
+            f"Selecionado: {self.gallery.active_painting.title if self.gallery.active_painting else 'nenhum'}",
+            f"Progresso: {int(self.gallery.selection_progress * 100)}%",
+            "2 piscadas = zoom | 1 piscada = afastar | ESC = sair e gerar PDF",
+        ]
+        debug = draw_cv_overlay(debug, texts)
+        cv2.imshow("Eye Tracking Debug", debug)
 
-            eye_result = self.eye_tracker.process_frame(frame)
-            pupil_valid = eye_result["pupil_valid"]
-            if pupil_valid:
-                self.stats.tracked_frames += 1
+    def render(self) -> None:
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        self.camera.apply_view()
+        self.gallery.draw_room()
+        self.gallery.draw_paintings()
 
-            gaze_pt = eye_result["screen_gaze"]
-            active_pid = self.gallery.painting_under_gaze(gaze_pt)
-            dwell_ratio = self._update_dwell(active_pid)
+        info_surface = build_info_card_surface(
+            self.gallery.active_painting if self.gallery.active_painting else self.gallery.hover_painting,
+            self.gallery.selection_progress,
+            self.camera.zoom_factor,
+        )
+        draw_pygame_surface_as_overlay(info_surface, 30, 30)
+        pygame.display.flip()
 
-            self._handle_blink_logic(eye_result["blink_event"], active_pid)
+    def run(self) -> None:
+        self.init_opengl()
+        self.init_cameras(0)
 
-            room_frame = self.gallery.draw(gaze_pt, self.info_pid, dwell_ratio)
-            self._draw_status_overlay(room_frame)
+        clock = pygame.time.Clock()
 
-            # heatmap
-            self.report.add_gaze(gaze_pt, valid=pupil_valid)
-            self.report.update_room_frame(room_frame)
+        while self.running:
+            for event in pygame.event.get():
+                if event.type == QUIT:
+                    self.running = False
+                if event.type == KEYDOWN and event.key == K_ESCAPE:
+                    self.running = False
 
-            # feedback visual das piscadas
-            if eye_result["blink_event"] == "blink":
-                draw_text(room_frame, "Piscada detectada", (ROOM_W - 260, ROOM_H - 32), 0.72, (255, 230, 80))
+            eye_result = self.process_eye_camera()
+            self.update_logic(eye_result)
+            self.render()
 
-            cv2.imshow(WINDOW_EYE, eye_result["eye_frame"])
-            cv2.imshow(WINDOW_ROOM, room_frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                self.running = False
 
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
-                break
-            elif key == ord("c"):
-                self.eye_tracker.calibrate_center()
-                self.last_report_message = "Centro do olhar recalibrado."
-            elif key == ord("r"):
-                path = self.generate_report()
-                self.last_report_message = f"PDF gerado: {path}"
-            elif key == ord("z"):
-                self.gallery.zoom_in()
-            elif key == ord("x"):
-                self.gallery.zoom_out()
+            clock.tick(60)
 
-            # pequeno limitador para estabilidade
-            current = now()
-            elapsed = current - prev_time
-            prev_time = current
-            _ = elapsed
+        self.shutdown()
 
-        cap.release()
+    def shutdown(self) -> None:
+        try:
+            self.heatmap.save_csv(self.csv_path)
+            self.heatmap.generate_report(self.pdf_path, self.screenshots, self.paintings)
+        except Exception as e:
+            print(f"Erro ao gerar exportações: {e}")
+
+        if self.eye_cap is not None:
+            self.eye_cap.release()
+        self.gallery.texture_manager.cleanup()
         cv2.destroyAllWindows()
+        pygame.quit()
 
-        # Gera relatório automático ao encerrar, se ainda não existir um nesta sessão.
-        if not self.stats.report_path or not self.stats.report_path.endswith(".pdf"):
-            self.generate_report()
-        elif self.stats.report_path == "simulacro_relatorio.pdf":
-            self.generate_report()
+        print(f"\nCSV salvo em: {self.csv_path}")
+        print(f"PDF salvo em: {self.pdf_path}")
 
+###############################################################################
+# PARTE 6 — GERAÇÃO DE IMAGENS DE EXEMPLO DOS QUADROS
+###############################################################################
+
+def maybe_generate_placeholder_images() -> None:
+    ensure_dirs()
+    targets = [
+        ("quadro_01.jpg", (180, 50, 50), "Abstração\nVermelha"),
+        ("quadro_02.jpg", (40, 90, 180), "Geometria\nAzul"),
+        ("quadro_03.jpg", (130, 160, 180), "Paisagem\nSintética"),
+        ("quadro_04.jpg", (70, 70, 70), "Ritmo\nUrbano"),
+        ("quadro_05.jpg", (200, 180, 160), "Figura\n& Luz"),
+        ("quadro_06.jpg", (60, 140, 80), "Memória\nVerde"),
+        ("quadro_07.jpg", (190, 150, 40), "Topologia\nDourada"),
+        ("quadro_08.jpg", (100, 60, 150), "Vórtice\nDados"),
+    ]
+
+    for fname, color, label in targets:
+        path = os.path.join(TEXTURE_DIR, fname)
+        if os.path.exists(path):
+            continue
+
+        img = np.zeros((768, 1024, 3), dtype=np.uint8)
+        img[:] = color
+
+        for i in range(0, img.shape[1], 24):
+            cv2.line(img, (i, 0), (img.shape[1] - i // 2, img.shape[0]), (255, 255, 255), 1)
+
+        cv2.rectangle(img, (40, 40), (img.shape[1] - 40, img.shape[0] - 40), (20, 20, 20), 14)
+        y = 280
+        for line in label.split("\n"):
+            cv2.putText(img, line, (150, y), cv2.FONT_HERSHEY_SIMPLEX, 2.4, (255, 255, 255), 6, cv2.LINE_AA)
+            y += 100
+
+        cv2.imwrite(path, img)
+
+###############################################################################
+# PARTE 7 — MAIN
+###############################################################################
 
 def main():
-    print("Iniciando Simulacro - Sala 3D com rastreamento ocular...")
-    print("Com base no pipeline de pupila/elipse do código-base enviado.")
-    print("Teclas: C calibrar | R gerar PDF | Q sair | Z/X zoom manual")
-    app = SimulacroApp(camera_index=0)
+    maybe_generate_placeholder_images()
+    app = EyeGallery3DApp()
     app.run()
-
 
 if __name__ == "__main__":
     main()
