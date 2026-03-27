@@ -1,18 +1,18 @@
-import subprocess
-import sys
+# REMOVIDO: import subprocess
+# REMOVIDO: import sys
 
-def install_system_deps():
-    try:
-        subprocess.run(
-            ["apt-get", "install", "-y",
-             "libgl1-mesa-glx",
-             "libglib2.0-0"],
-            capture_output=True
-        )
-    except Exception:
-        pass
+# REMOVIDO: def install_system_deps():
+# REMOVIDO:     try:
+# REMOVIDO:         subprocess.run(
+# REMOVIDO:             ["apt-get", "install", "-y",
+# REMOVIDO:              "libgl1-mesa-glx", # REMOVIDO
+# REMOVIDO:              "libglib2.0-0"],
+# REMOVIDO:             capture_output=True
+# REMOVIDO:         )
+# REMOVIDO:     except Exception:
+# REMOVIDO:         pass
 
-install_system_deps()
+# REMOVIDO: install_system_deps() # REMOVIDO
 
 import cv2
 import numpy as np
@@ -21,6 +21,7 @@ import time
 import math
 import random
 import tempfile
+import os # Adicionado para os.remove
 
 # ==========================================
 # GLOBALS
@@ -776,7 +777,7 @@ def main():
         while st.session_state.running:
             ret, raw = cap.read()
             if not ret:
-                status.info("📽️ Fim do vídeo.")
+                status.info("📽️ Fim do vídeo ou erro na leitura.")
                 break
 
             if flip_v:
@@ -789,7 +790,7 @@ def main():
                     mca, px, py
                 ) = process_single_frame(raw)
             except Exception as e:
-                status.error(f"Erro: {e}")
+                status.error(f"Erro no processamento: {e}")
                 break
 
             # Exibe frame
